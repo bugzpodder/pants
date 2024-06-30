@@ -37,11 +37,12 @@ class Platform(Enum):
     LINUX_X86_64 = "Linux-x86_64"
     LINUX_ARM64 = "Linux-ARM64"
     MACOS10_15_X86_64 = "macOS10-15-x86_64"
-    MACOS11_X86_64 = "macOS11-x86_64"
+    # the oldest version of macOS supported by GitHub self-hosted runners
+    MACOS12_X86_64 = "macOS12-x86_64"
     MACOS11_ARM64 = "macOS11-ARM64"
 
 
-GITHUB_HOSTED = {Platform.LINUX_X86_64, Platform.MACOS11_X86_64}
+GITHUB_HOSTED = {Platform.LINUX_X86_64, Platform.MACOS12_X86_64}
 SELF_HOSTED = {Platform.LINUX_ARM64, Platform.MACOS10_15_X86_64, Platform.MACOS11_ARM64}
 CARGO_AUDIT_IGNORED_ADVISORY_IDS = (
     "RUSTSEC-2020-0128",  # returns a false positive on the cache crate, which is a local crate not a 3rd party crate
@@ -109,6 +110,7 @@ def classify_changes() -> Jobs:
                 "rust": gha_expr("steps.classify.outputs.rust"),
                 "release": gha_expr("steps.classify.outputs.release"),
                 "ci_config": gha_expr("steps.classify.outputs.ci_config"),
+                "notes": gha_expr("steps.classify.outputs.notes"),
                 "other": gha_expr("steps.classify.outputs.other"),
             },
             "steps": [
@@ -131,7 +133,7 @@ def classify_changes() -> Jobs:
 
                         affected=$(git diff --name-only "$comparison_sha" HEAD | python build-support/bin/classify_changed_files.py)
                         echo "Affected:"
-                        if [[ "${affected}" == "docs" ]]; then
+                        if [[ "${affected}" == "docs" || "${affected}" == "docs notes" ]]; then
                           echo "docs_only=true" | tee -a $GITHUB_OUTPUT
                         fi
                         for i in ${affected}; do
@@ -165,6 +167,41 @@ def ensure_category_label() -> Sequence[Step]:
                 ),
             },
         }
+    ]
+
+
+def ensure_release_notes() -> Sequence[Step]:
+    """Check that a PR either has release notes, or a category:internal or release-notes:not-
+    required label."""
+    return [
+        {
+            # If there's release note changes, then we're good to go and no need to check for one of
+            # the opt-out labels. If there's not, then we should check to see if a human has opted
+            # out via a label.
+            "if": "github.event_name == 'pull_request' && !needs.classify_changes.outputs.notes",
+            "name": "Ensure appropriate label",
+            "uses": "mheap/github-action-required-labels@v4.0.0",
+            "env": {"GITHUB_TOKEN": gha_expr("secrets.GITHUB_TOKEN")},
+            "with": {
+                "mode": "minimum",
+                "count": 1,
+                "labels": "release-notes:not-required, category:internal",
+                "message": dedent(
+                    """
+                    Please do one of:
+
+                    - add release notes to the appropriate file in `docs/notes`
+
+                    - label this PR with `release-notes:not-required` if it does not need them (for
+                      instance, if this is fixing a minor typo in documentation)
+
+                    - label this PR with `category:internal` if it's an internal change
+
+                    Feel free to ask a maintainer for help if you are not sure what is appropriate!
+                    """
+                ),
+            },
+        },
     ]
 
 
@@ -364,8 +401,8 @@ class Helper:
         # any platform-specific labels, so we don't run on future GH-hosted
         # platforms without realizing it.
         ret = ["self-hosted"] if self.platform in SELF_HOSTED else []
-        if self.platform == Platform.MACOS11_X86_64:
-            ret += ["macos-11"]
+        if self.platform == Platform.MACOS12_X86_64:
+            ret += ["macos-12"]
         elif self.platform == Platform.MACOS11_ARM64:
             ret += ["macOS-11-ARM64"]
         elif self.platform == Platform.MACOS10_15_X86_64:
@@ -380,7 +417,7 @@ class Helper:
 
     def platform_env(self):
         ret = {}
-        if self.platform in {Platform.MACOS10_15_X86_64, Platform.MACOS11_X86_64}:
+        if self.platform in {Platform.MACOS10_15_X86_64, Platform.MACOS12_X86_64}:
             # Works around bad `-arch arm64` flag embedded in Xcode 12.x Python interpreters on
             # intel machines. See: https://github.com/giampaolo/psutil/issues/1832
             ret["ARCHFLAGS"] = "-arch x86_64"
@@ -773,8 +810,8 @@ def linux_arm64_test_jobs() -> Jobs:
     return jobs
 
 
-def macos11_x86_64_test_jobs() -> Jobs:
-    helper = Helper(Platform.MACOS11_X86_64)
+def macos12_x86_64_test_jobs() -> Jobs:
+    helper = Helper(Platform.MACOS12_X86_64)
     jobs = {
         helper.job_name("bootstrap_pants"): bootstrap_jobs(
             helper,
@@ -957,10 +994,17 @@ def test_workflow_jobs() -> Jobs:
             "if": IS_PANTS_OWNER,
             "steps": ensure_category_label(),
         },
+        "check_release_notes": {
+            "name": "Ensure PR has release notes",
+            "runs-on": linux_x86_64_helper.runs_on(),
+            "needs": ["classify_changes"],
+            "if": IS_PANTS_OWNER,
+            "steps": ensure_release_notes(),
+        },
     }
     jobs.update(**linux_x86_64_test_jobs())
     jobs.update(**linux_arm64_test_jobs())
-    jobs.update(**macos11_x86_64_test_jobs())
+    jobs.update(**macos12_x86_64_test_jobs())
     jobs.update(**build_wheels_jobs())
     jobs.update(
         {
@@ -1643,7 +1687,7 @@ def merge_ok(pr_jobs: list[str]) -> Jobs:
             # NB: This always() condition is critical, as it ensures that this job is run even if
             #   jobs it depends on are skipped.
             "if": "always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')",
-            "needs": ["classify_changes", "check_labels"] + sorted(pr_jobs),
+            "needs": ["classify_changes", "check_labels", "check_release_notes"] + sorted(pr_jobs),
             "outputs": {"merge_ok": f"{gha_expr('steps.set_merge_ok.outputs.merge_ok')}"},
             "steps": [
                 {
@@ -1685,7 +1729,7 @@ def generate() -> dict[Path, str]:
     pr_jobs = test_workflow_jobs()
     pr_jobs.update(**classify_changes())
     for key, val in pr_jobs.items():
-        if key in {"check_labels", "classify_changes"}:
+        if key in {"check_labels", "classify_changes", "check_release_notes"}:
             continue
         needs = val.get("needs", [])
         if isinstance(needs, str):
