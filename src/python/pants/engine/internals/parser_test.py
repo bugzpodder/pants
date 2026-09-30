@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from textwrap import dedent
 from typing import Any
@@ -31,22 +32,34 @@ from pants.util.strutil import softwrap
 @pytest.fixture
 def defaults_parser_state() -> BuildFileDefaultsParserState:
     return BuildFileDefaultsParserState.create(
-        "", BuildFileDefaults({}), RegisteredTargetTypes({}), UnionMembership({})
+        "", BuildFileDefaults({}), RegisteredTargetTypes({}), UnionMembership.empty()
     )
 
 
-def test_imports_banned(defaults_parser_state: BuildFileDefaultsParserState) -> None:
+@pytest.mark.parametrize(
+    "content, expected_line",
+    [
+        ("\nx = 'hello'\n\nimport os\n", 4),
+        ("\nfrom os import path\n", 2),
+        ("def f():\n    import os\n", 2),
+        ("import os\nfrom sys import argv\n", 1),
+    ],
+)
+def test_imports_banned(
+    content: str, expected_line: int, defaults_parser_state: BuildFileDefaultsParserState
+) -> None:
     parser = Parser(
         build_root="",
         registered_target_types=RegisteredTargetTypes({}),
-        union_membership=UnionMembership({}),
+        union_membership=UnionMembership.empty(),
         object_aliases=BuildFileAliases(),
         ignore_unrecognized_symbols=False,
     )
     with pytest.raises(ParseError) as exc:
         parser.parse(
             "dir/BUILD",
-            "\nx = 'hello'\n\nimport os\n",
+            content,
+            ast.parse(content),
             BuildFilePreludeSymbols(FrozenDict(), ()),
             EnvironmentVars({}),
             False,
@@ -54,7 +67,31 @@ def test_imports_banned(defaults_parser_state: BuildFileDefaultsParserState) -> 
             dependents_rules=None,
             dependencies_rules=None,
         )
-    assert "Import used in dir/BUILD at line 4" in str(exc.value)
+    assert f"Import used in dir/BUILD at line {expected_line}" in str(exc.value)
+
+
+def test_string_containing_import_is_allowed(
+    defaults_parser_state: BuildFileDefaultsParserState,
+) -> None:
+    parser = Parser(
+        build_root="",
+        registered_target_types=RegisteredTargetTypes({}),
+        union_membership=UnionMembership.empty(),
+        object_aliases=BuildFileAliases(),
+        ignore_unrecognized_symbols=False,
+    )
+    content = "x = 'please import this'\n"
+    parser.parse(
+        "dir/BUILD",
+        content,
+        ast.parse(content),
+        BuildFilePreludeSymbols(FrozenDict(), ()),
+        EnvironmentVars({}),
+        False,
+        defaults_parser_state,
+        dependents_rules=None,
+        dependencies_rules=None,
+    )
 
 
 def test_unrecognized_symbol(defaults_parser_state: BuildFileDefaultsParserState) -> None:
@@ -69,7 +106,7 @@ def test_unrecognized_symbol(defaults_parser_state: BuildFileDefaultsParserState
             registered_target_types=RegisteredTargetTypes(
                 {alias: GenericTarget for alias in ("tgt", *extra_targets)}
             ),
-            union_membership=UnionMembership({}),
+            union_membership=UnionMembership.empty(),
             object_aliases=build_file_aliases,
             ignore_unrecognized_symbols=False,
         )
@@ -79,6 +116,7 @@ def test_unrecognized_symbol(defaults_parser_state: BuildFileDefaultsParserState
             parser.parse(
                 "dir/BUILD",
                 "FAKE",
+                ast.parse("FAKE"),
                 prelude_symbols,
                 EnvironmentVars({}),
                 False,
@@ -91,7 +129,7 @@ def test_unrecognized_symbol(defaults_parser_state: BuildFileDefaultsParserState
             dir/BUILD:1: Name 'FAKE' is not defined.
 
             {dym}If you expect to see more symbols activated in the below list, refer to
-            {doc_url('docs/using-pants/key-concepts/backends')} for all available backends to activate.
+            {doc_url("docs/using-pants/key-concepts/backends")} for all available backends to activate.
 
             All registered symbols: [{fmt_extra_sym}'__defaults__', '__dependencies_rules__',
             '__dependents_rules__', 'build_file_dir', 'caof', 'env', 'obj', 'prelude', 'tgt']
@@ -104,13 +142,14 @@ def test_unrecognized_symbol(defaults_parser_state: BuildFileDefaultsParserState
                 registered_target_types=RegisteredTargetTypes(
                     {alias: GenericTarget for alias in ("tgt", *extra_targets)}
                 ),
-                union_membership=UnionMembership({}),
+                union_membership=UnionMembership.empty(),
                 object_aliases=build_file_aliases,
                 ignore_unrecognized_symbols=True,
             )
             parser.parse(
                 "dir/BUILD",
                 "FAKE",
+                ast.parse("FAKE"),
                 prelude_symbols,
                 EnvironmentVars({}),
                 False,
@@ -140,14 +179,16 @@ def test_unrecognized_symbol_during_bootstrap_issue_19156(
     parser = Parser(
         build_root="",
         registered_target_types=RegisteredTargetTypes({"tgt": GenericTarget}),
-        union_membership=UnionMembership({}),
+        union_membership=UnionMembership.empty(),
         object_aliases=build_file_aliases,
         ignore_unrecognized_symbols=True,
     )
     prelude_symbols = BuildFilePreludeSymbols.create({"prelude": 0}, ())
+    content = "tgt(field=fake(42,a=(), b='c'))"
     target_adaptors = parser.parse(
         "dir/BUILD",
-        "tgt(field=fake(42,a=(), b='c'))",
+        content,
+        ast.parse(content),
         prelude_symbols,
         EnvironmentVars({}),
         False,
@@ -177,13 +218,15 @@ def test_unknown_target_for_defaults_during_bootstrap_issue_19445(
     parser = Parser(
         build_root="",
         registered_target_types=RegisteredTargetTypes({}),
-        union_membership=UnionMembership({}),
+        union_membership=UnionMembership.empty(),
         object_aliases=BuildFileAliases(),
         ignore_unrecognized_symbols=True,
     )
+    content = "__defaults__({'type_1': dict(), type_2: dict()})"
     parser.parse(
         "BUILD",
-        "__defaults__({'type_1': dict(), type_2: dict()})",
+        content,
+        ast.parse(content),
         BuildFilePreludeSymbols.create({}, ()),
         EnvironmentVars({}),
         True,
@@ -208,7 +251,7 @@ def test_unrecognized_symbol_in_prelude(
     parser = Parser(
         build_root="",
         registered_target_types=RegisteredTargetTypes({}),
-        union_membership=UnionMembership({}),
+        union_membership=UnionMembership.empty(),
         object_aliases=build_file_aliases,
         ignore_unrecognized_symbols=False,
     )
@@ -235,6 +278,7 @@ def test_unrecognized_symbol_in_prelude(
         parser.parse(
             filepath="dir/BUILD",
             build_file_content="macro()",
+            tree=ast.parse("macro()"),
             extra_symbols=prelude_symbols,
             env_vars=EnvironmentVars({}),
             is_bootstrap=False,
@@ -249,7 +293,7 @@ def test_unrecognized_symbol_in_prelude(
         Did you mean macro?
 
         If you expect to see more symbols activated in the below list, refer to
-        {doc_url('docs/using-pants/key-concepts/backends')} for all available backends to activate.
+        {doc_url("docs/using-pants/key-concepts/backends")} for all available backends to activate.
 
         All registered symbols: ['__defaults__', '__dependencies_rules__', '__dependents_rules__',
         'build_file_dir', 'caof', 'env', 'macro', 'obj']

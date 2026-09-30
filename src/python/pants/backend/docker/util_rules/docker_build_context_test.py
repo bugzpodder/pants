@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import zipfile
+from platform import machine
 from textwrap import dedent
 from typing import Any, ContextManager
 
@@ -37,11 +38,11 @@ from pants.backend.python.target_types import PexBinary, PythonRequirementTarget
 from pants.backend.python.util_rules import pex_from_targets
 from pants.backend.shell.target_types import ShellSourcesGeneratorTarget, ShellSourceTarget
 from pants.backend.shell.target_types import rules as shell_target_types_rules
+from pants.core.environments.target_types import DockerEnvironmentTarget
 from pants.core.goals import package
 from pants.core.goals.package import BuiltPackage
-from pants.core.target_types import FilesGeneratorTarget
+from pants.core.target_types import FilesGeneratorTarget, FileTarget
 from pants.core.target_types import rules as core_target_types_rules
-from pants.core.util_rules.environments import DockerEnvironmentTarget
 from pants.engine.addresses import Address
 from pants.engine.fs import EMPTY_DIGEST, EMPTY_SNAPSHOT, Snapshot
 from pants.engine.internals.scheduler import ExecutionError
@@ -76,6 +77,7 @@ def create_rule_runner() -> RuleRunner:
             DockerEnvironmentTarget,
             DockerImageTarget,
             FilesGeneratorTarget,
+            FileTarget,
             PexBinary,
             ShellSourcesGeneratorTarget,
             ShellSourceTarget,
@@ -95,8 +97,9 @@ def assert_build_context(
     *,
     build_upstream_images: bool = False,
     expected_files: list[str],
-    expected_interpolation_context: dict[str, str | dict[str, str] | InterpolationValue]
-    | None = None,
+    expected_interpolation_context: (
+        dict[str, str | dict[str, str] | InterpolationValue] | None
+    ) = None,
     expected_num_upstream_images: int = 0,
     pants_args: list[str] | None = None,
     runner_options: dict[str, Any] | None = None,
@@ -334,6 +337,111 @@ def test_from_image_build_arg_not_in_repo_issue_15585(rule_runner: RuleRunner) -
     )
 
 
+def test_from_image_build_arg_unresolvable_address_does_not_misalign(
+    rule_runner: RuleRunner,
+) -> None:
+    rule_runner.write_files(
+        {
+            "src/upstream/BUILD": dedent(
+                """\
+                docker_image(
+                  name="image",
+                  repository="upstream/{name}",
+                  image_tags=["1.0"],
+                  instructions=["FROM alpine:3.16.1"],
+                )
+                """
+            ),
+            "src/downstream/BUILD": "docker_image(name='image')",
+            "src/downstream/Dockerfile": dedent(
+                """\
+                ARG AAA_VERSION="python:3.10.2-slim"
+                ARG BASE_IMAGE=src/upstream:image
+                FROM $AAA_VERSION
+                FROM $BASE_IMAGE
+                """
+            ),
+        }
+    )
+
+    assert_build_context(
+        rule_runner,
+        Address("src/downstream", target_name="image"),
+        expected_files=["src/downstream/Dockerfile", "src.upstream/image.docker-info.json"],
+        build_upstream_images=True,
+        expected_interpolation_context={
+            "tags": {
+                "baseimage": "3.10.2-slim",
+                "stage0": "3.10.2-slim",
+                "stage1": "1.0",
+            },
+            "build_args": {
+                "BASE_IMAGE": "upstream/image:1.0",
+            },
+        },
+        expected_num_upstream_images=1,
+    )
+
+
+def test_build_args_for_copy(rule_runner: RuleRunner) -> None:
+    rule_runner.write_files(
+        {
+            "testprojects/src/docker/BUILD": dedent(
+                """\
+            docker_image()
+            file(name="file", source="file.txt")
+            file(name="file_as_arg", source="file_as_arg.txt")
+            """
+            ),
+            "testprojects/src/docker/Dockerfile": dedent(
+                """\
+            FROM		python:3.9
+
+            ARG PEX_BIN="testprojects/src/python:hello"
+            ARG PEX_BIN_DOTTED_PATH="testprojects.src.python/hello_dotted.pex"
+            ARG FILE_AS_ARG="testprojects/src/docker/file_as_arg.txt"
+
+            COPY		${PEX_BIN} /app/pex_bin
+            COPY		$PEX_BIN_DOTTED_PATH /app/pex_var
+            COPY		testprojects.src.python/hello_inline.pex /app/pex_bin_dotted_path
+            COPY		${FILE_AS_ARG} /app/
+            COPY		testprojects/src/docker/file.txt /app/
+            """
+            ),
+            "testprojects/src/docker/file_as_arg.txt": "",
+            "testprojects/src/docker/file.txt": "",
+            "testprojects/src/python/BUILD": dedent(
+                """\
+            pex_binary(name="hello", entry_point="hello.py")
+            pex_binary(name="hello_dotted", entry_point="hello.py")
+            pex_binary(name="hello_inline", entry_point="hello.py")
+            """
+            ),
+            "testprojects/src/python/hello.py": "",
+        }
+    )
+
+    assert_build_context(
+        rule_runner,
+        Address("testprojects/src/docker", target_name="docker"),
+        expected_files=[
+            "testprojects/src/docker/Dockerfile",
+            "testprojects/src/docker/file.txt",
+            "testprojects/src/docker/file_as_arg.txt",
+            "testprojects.src.python/hello_inline.pex",
+            "testprojects.src.python/hello_dotted.pex",
+            "testprojects.src.python/hello.pex",
+        ],
+        expected_interpolation_context={
+            "build_args": {
+                "FILE_AS_ARG": "testprojects/src/docker/file_as_arg.txt",
+                "PEX_BIN": "testprojects.src.python/hello.pex",
+            },
+            "tags": {"baseimage": "3.9", "stage0": "3.9"},
+        },
+    )
+
+
 def test_files_out_of_tree(rule_runner: RuleRunner) -> None:
     # src/a:img_A -> res/static:files
     rule_runner.write_files(
@@ -387,33 +495,45 @@ def test_packaged_pex_path(rule_runner: RuleRunner) -> None:
 
 
 def test_packaged_pex_environment(rule_runner: RuleRunner) -> None:
+    image = (
+        "python:3.11-buster@sha256:3a19b4d6ce4402d11bb19aa11416e4a262a60a57707a5cda5787a81285df2666"
+    )
+    if machine() == "x86_64":
+        platform = "linux_x86_64"
+        expected_dist = "psutil-7.0.0-cp36-abi3-manylinux_2_12_x86_64.manylinux2010_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+    elif machine() == "aarch64":
+        platform = "linux_arm64"
+        expected_dist = "psutil-7.0.0-cp36-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
+    else:
+        pytest.skip("This test only runs on amd64 and arm64.")
+
     rule_runner.write_files(
         {
             "BUILD": dedent(
-                """
+                f"""
               docker_environment(
-                name="python_38",
-                image="python:3.8-buster@sha256:bc4b9fb034a871b285bea5418cedfcaa9d2ab5590fb5fb6f0c42aaebb2e2c911",
-                platform="linux_x86_64",
+                name="python_311",
+                image="{image}",
+                platform="{platform}",
                 python_bootstrap_search_path=["<PATH>"],
               )
 
-              python_requirement(name="psutil", requirements=["psutil==5.9.2"])
+              python_requirement(name="psutil", requirements=["psutil==7.0.0"])
               """
             ),
             "src/docker/BUILD": """docker_image(dependencies=["src/python/proj/cli:bin"])""",
-            "src/docker/Dockerfile": """FROM python:3.8""",
+            "src/docker/Dockerfile": """FROM python:3.11""",
             "src/python/proj/cli/BUILD": dedent(
                 """
               pex_binary(
                 name="bin",
                 entry_point="main.py",
-                environment="python_38",
+                environment="python_311",
                 dependencies=["//:psutil"],
               )
               """
             ),
-            "src/python/proj/cli/main.py": """import psutil; assert psutil.Process.is_running()""",
+            "src/python/proj/cli/main.py": """import psutil; assert psutil.Process().is_running()""",
         }
     )
 
@@ -421,7 +541,7 @@ def test_packaged_pex_environment(rule_runner: RuleRunner) -> None:
     context = assert_build_context(
         rule_runner,
         Address("src/docker", target_name="docker"),
-        pants_args=["--environments-preview-names={'python_38': '//:python_38'}"],
+        pants_args=["--environments-preview-names={'python_311': '//:python_311'}"],
         expected_files=["src/docker/Dockerfile", pex_file],
     )
 
@@ -429,8 +549,7 @@ def test_packaged_pex_environment(rule_runner: RuleRunner) -> None:
     rule_runner.write_digest(context.digest, path_prefix="contents")
     with zipfile.ZipFile(os.path.join(rule_runner.build_root, "contents", pex_file), "r") as zf:
         assert json.loads(zf.read("PEX-INFO"))["distributions"].keys() == {
-            "psutil-5.9.2-cp37-cp37m-manylinux_2_12_x86_64.manylinux2010_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-            "psutil-5.9.2-cp38-cp38-manylinux_2_12_x86_64.manylinux2010_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            expected_dist,
         }
 
 
@@ -726,8 +845,10 @@ def test_create_docker_build_context() -> None:
             source="test/Dockerfile",
             build_args=DockerBuildArgs.from_strings(),
             copy_source_paths=(),
+            copy_build_args=DockerBuildArgs.from_strings(),
             from_image_build_args=DockerBuildArgs.from_strings(),
-            version_tags=("base latest", "stage1 1.2", "dev 2.0", "prod 2.0"),
+            # Stage without tags tests regression of #22108
+            version_tags=("base latest", "stage1 1.2", "dev 2.0", "prod 2.0", "stage4"),
         ),
     )
     assert list(context.build_args) == ["ARGNAME=value1"]
@@ -735,6 +856,35 @@ def test_create_docker_build_context() -> None:
     assert context.upstream_image_ids == ("abc", "def")
     assert context.dockerfile == "test/Dockerfile"
     assert context.stages == ("base", "dev", "prod")
+    assert context.interpolation_context["tags"] == {
+        "baseimage": "latest",
+        "base": "latest",
+        "stage1": "1.2",
+        "dev": "2.0",
+        "prod": "2.0",
+    }
+
+
+def test_create_docker_build_context_digest_only() -> None:
+    context = DockerBuildContext.create(
+        build_args=DockerBuildArgs.from_strings("ARGNAME=value1"),
+        snapshot=EMPTY_SNAPSHOT,
+        build_env=DockerBuildEnvironment.create({"ENVNAME": "value2"}),
+        upstream_image_ids=["def", "abc"],
+        dockerfile_info=DockerfileInfo(
+            address=Address("test"),
+            digest=EMPTY_DIGEST,
+            source="test/Dockerfile",
+            build_args=DockerBuildArgs.from_strings(),
+            copy_source_paths=(),
+            copy_build_args=DockerBuildArgs.from_strings(),
+            from_image_build_args=DockerBuildArgs.from_strings(),
+            # Stage without tags tests regression of #22108
+            version_tags=("bydigest",),
+        ),
+    )
+    assert context.stages == ("bydigest",)
+    assert context.interpolation_context["tags"] == {}
 
 
 def test_pex_custom_output_path_issue14031(rule_runner: RuleRunner) -> None:

@@ -14,28 +14,27 @@ from pants.backend.go.target_types import (
     GoModTarget,
     GoOwningGoModAddressField,
     GoPackageSourcesField,
-    GoThirdPartyPackageDependenciesField,
+    GoThirdPartyDependenciesField,
 )
 from pants.backend.go.util_rules import binary
-from pants.backend.go.util_rules.binary import GoBinaryMainPackage, GoBinaryMainPackageRequest
 from pants.backend.go.util_rules.sdk import GoSdkProcess
 from pants.base.specs import AncestorGlobSpec, RawSpecs
 from pants.build_graph.address import Address, AddressInput
 from pants.engine.engine_aware import EngineAwareParameter
 from pants.engine.fs import Digest
-from pants.engine.process import ProcessResult
-from pants.engine.rules import Get, collect_rules, rule
+from pants.engine.internals.build_files import resolve_address
+from pants.engine.internals.graph import hydrate_sources, resolve_target, resolve_unexpanded_targets
+from pants.engine.process import fallible_to_exec_result_or_raise
+from pants.engine.rules import collect_rules, implicitly, rule
 from pants.engine.target import (
     AllUnexpandedTargets,
-    HydratedSources,
     HydrateSourcesRequest,
     InvalidTargetException,
     Targets,
-    UnexpandedTargets,
-    WrappedTarget,
     WrappedTargetRequest,
 )
 from pants.util.docutil import bin_name
+from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
 
 logger = logging.getLogger(__name__)
@@ -81,12 +80,13 @@ async def find_nearest_ancestor_go_mod(
     request: NearestAncestorGoModRequest,
 ) -> NearestAncestorGoModResult:
     # We don't expect `go_mod` targets to be generated, so we can use UnexpandedTargets.
-    candidate_targets = await Get(
-        UnexpandedTargets,
-        RawSpecs(
-            ancestor_globs=(AncestorGlobSpec(request.address.spec_path),),
-            description_of_origin="the `OwningGoMod` rule",
-        ),
+    candidate_targets = await resolve_unexpanded_targets(
+        **implicitly(
+            RawSpecs(
+                ancestor_globs=(AncestorGlobSpec(request.address.spec_path),),
+                description_of_origin="the `OwningGoMod` rule",
+            )
+        )
     )
 
     # Sort by address.spec_path in descending order so the nearest go_mod target is sorted first.
@@ -142,13 +142,13 @@ async def _find_explict_owning_go_mod_address(
         relative_to=address.spec_path,
         description_of_origin=f"the `{GoOwningGoModAddressField.alias}` field of target `{address}`",
     )
-    candidate_go_mod_address = await Get(Address, AddressInput, address_input)
-    wrapped_target = await Get(
-        WrappedTarget,
+    candidate_go_mod_address = await resolve_address(**implicitly({address_input: AddressInput}))
+    wrapped_target = await resolve_target(
         WrappedTargetRequest(
             candidate_go_mod_address,
             description_of_origin=f"the `{GoOwningGoModAddressField.alias}` field of target `{address}`",
         ),
+        **implicitly(),
     )
     if not wrapped_target.target.has_field(GoModDependenciesField):
         raise InvalidTargetException(
@@ -166,9 +166,9 @@ async def _find_explict_owning_go_mod_address(
 async def find_owning_go_mod(
     request: OwningGoModRequest, all_go_mod_targets: AllGoModTargets
 ) -> OwningGoMod:
-    wrapped_target = await Get(
-        WrappedTarget,
+    wrapped_target = await resolve_target(
         WrappedTargetRequest(request.address, description_of_origin="the `OwningGoMod` rule"),
+        **implicitly(),
     )
     target = wrapped_target.target
 
@@ -176,22 +176,31 @@ async def find_owning_go_mod(
         return OwningGoMod(request.address)
 
     if target.has_field(GoPackageSourcesField):
-        nearest_go_mod_result = await Get(
-            NearestAncestorGoModResult, NearestAncestorGoModRequest(request.address)
+        nearest_go_mod_result = await find_nearest_ancestor_go_mod(
+            NearestAncestorGoModRequest(request.address)
         )
         return OwningGoMod(nearest_go_mod_result.address)
 
-    if target.has_field(GoThirdPartyPackageDependenciesField):
-        # For `go_third_party_package` targets, use the generator which is the owning `go_mod` target.
+    if target.has_field(GoThirdPartyDependenciesField):
+        # For third-party targets, use the generator, which is the owning `go_mod` target.
         generator_address = target.address.maybe_convert_to_target_generator()
         return OwningGoMod(generator_address)
 
     if target.has_field(GoBinaryMainPackageField):
-        main_pkg = await Get(
-            GoBinaryMainPackage, GoBinaryMainPackageRequest(target.get(GoBinaryMainPackageField))
+        main_field = target.get(GoBinaryMainPackageField)
+        if main_field.value:
+            address_input = AddressInput.parse(
+                main_field.value,
+                relative_to=target.address.spec_path,
+                description_of_origin=f"the `{GoBinaryMainPackageField.alias}` field from the target {target.address}",
+            )
+            main_address = await resolve_address(**implicitly({address_input: AddressInput}))
+            return await find_owning_go_mod(OwningGoModRequest(main_address), **implicitly())
+        # Import-path and default mains resolve within the binary's own `go.mod`.
+        nearest_go_mod_result = await find_nearest_ancestor_go_mod(
+            NearestAncestorGoModRequest(request.address)
         )
-        owning_go_mod_for_main_pkg = await Get(OwningGoMod, OwningGoModRequest(main_pkg.address))
-        return owning_go_mod_for_main_pkg
+        return OwningGoMod(nearest_go_mod_result.address)
 
     if target.has_field(GoOwningGoModAddressField):
         # Otherwise, find any explicitly defined go_mod address (e.g., for `protobuf_sources` targets).
@@ -210,6 +219,18 @@ async def find_owning_go_mod(
     )
 
 
+def _is_directory_replacement(new_path: str) -> bool:
+    # Mirrors `modfile.IsDirectoryPath`: a `replace` directive whose target is a local
+    # directory (as opposed to a different module path) starts with `./`, `../`, `/`, or
+    # is `.`/`..` (or an absolute Windows path). Such replacements wire a `require`d module
+    # to a sibling first-party module on disk; module-path replacements do not.
+    return (
+        new_path in (".", "..")
+        or new_path.startswith(("./", "../", "/"))
+        or os.path.isabs(new_path)
+    )
+
+
 @dataclass(frozen=True)
 class GoModInfo:
     # Import path of the Go module, based on the `module` in `go.mod`.
@@ -217,6 +238,10 @@ class GoModInfo:
     digest: Digest
     mod_path: str
     minimum_go_version: str | None
+    # Maps the module path of each `replace`d module whose target is a local directory to
+    # that directory (relative to the build root). These are first-party modules referenced
+    # across `go.mod` boundaries; see `map_import_paths_to_packages` and issue #22097.
+    local_replace_module_dirs: FrozenDict[str, str] = FrozenDict()
 
 
 @dataclass(frozen=True)
@@ -235,9 +260,9 @@ async def determine_go_mod_info(
     request: GoModInfoRequest,
 ) -> GoModInfo:
     if isinstance(request.source, Address):
-        wrapped_target = await Get(
-            WrappedTarget,
+        wrapped_target = await resolve_target(
             WrappedTargetRequest(request.source, description_of_origin="<go mod info rule>"),
+            **implicitly(),
         )
         sources_field = wrapped_target.target[GoModSourcesField]
     else:
@@ -246,24 +271,43 @@ async def determine_go_mod_info(
     go_mod_dir = os.path.dirname(go_mod_path)
 
     # Get the `go.mod` (and `go.sum`) and strip so the file has no directory prefix.
-    hydrated_sources = await Get(HydratedSources, HydrateSourcesRequest(sources_field))
+    hydrated_sources = await hydrate_sources(HydrateSourcesRequest(sources_field), **implicitly())
     sources_digest = hydrated_sources.snapshot.digest
 
-    mod_json = await Get(
-        ProcessResult,
-        GoSdkProcess(
-            command=("mod", "edit", "-json"),
-            input_digest=sources_digest,
-            working_dir=go_mod_dir,
-            description=f"Parse {go_mod_path}",
-        ),
+    mod_json = await fallible_to_exec_result_or_raise(
+        **implicitly(
+            GoSdkProcess(
+                command=("mod", "edit", "-json"),
+                input_digest=sources_digest,
+                working_dir=go_mod_dir,
+                description=f"Parse {go_mod_path}",
+            )
+        )
     )
     module_metadata = json.loads(mod_json.stdout)
+
+    # Record `replace` directives that point a `require`d module at a local directory, so that
+    # dependency inference can resolve imports satisfied by sibling first-party modules. See #22097.
+    local_replace_module_dirs: dict[str, str] = {}
+    for replace in module_metadata.get("Replace") or []:
+        new = replace.get("New") or {}
+        new_path = new.get("Path")
+        # A directory replacement targets a filesystem path and carries no module version; a
+        # module-path replacement (path + version) is left to normal third-party resolution.
+        if not new_path or new.get("Version") or not _is_directory_replacement(new_path):
+            continue
+        old_path = (replace.get("Old") or {}).get("Path")
+        # Absolute on-disk paths cannot be mapped to in-repo `go_mod` targets, so skip them.
+        if not old_path or os.path.isabs(new_path):
+            continue
+        local_replace_module_dirs[old_path] = os.path.normpath(os.path.join(go_mod_dir, new_path))
+
     return GoModInfo(
         import_path=module_metadata["Module"]["Path"],
         digest=sources_digest,
         mod_path=go_mod_path,
         minimum_go_version=module_metadata.get("Go"),
+        local_replace_module_dirs=FrozenDict(local_replace_module_dirs),
     )
 
 

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from textwrap import dedent
-from typing import Iterable
 
 import pytest
 
@@ -27,7 +27,7 @@ from pants.engine.internals.native_engine import Snapshot
 from pants.engine.internals.scheduler import ExecutionError
 from pants.engine.rules import QueryRule
 from pants.engine.target import AllTargets
-from pants.testutil.rule_runner import RuleRunner
+from pants.testutil.rule_runner import RuleRunner, engine_error
 from pants.util.frozendict import FrozenDict
 
 
@@ -84,6 +84,18 @@ def test_parses_package_jsons(rule_runner: RuleRunner) -> None:
             snapshot=bar_package_snapshot,
         ),
     }
+
+
+def test_parse_package_json_without_name(rule_runner: RuleRunner) -> None:
+    rule_runner.write_files(
+        {
+            "src/js/BUILD": "package_json()",
+            # No name in package.json, should cause an error.
+            "src/js/package.json": json.dumps({"version": "0.0.1"}),
+        }
+    )
+    with engine_error(ValueError, contains="No package name found in package.json"):
+        rule_runner.request(AllPackageJson, [])
 
 
 def test_generates_third_party_node_package_targets(rule_runner: RuleRunner) -> None:
@@ -152,7 +164,7 @@ def test_generates_build_script_targets(
                 """\
                 package_json(
                     scripts=[
-                        node_build_script(entry_point="build", output_directories=["www/"])
+                        node_build_script(entry_point="build", output_directories=["www/"], description="builds the project", tags=["build"])
                     ]
                 )
                 """
@@ -164,6 +176,93 @@ def test_generates_build_script_targets(
     )
     addresses = sorted(str(tgt.address) for tgt in rule_runner.request(AllTargets, ()))
     assert addresses == ["src/js#build", "src/js#ham", "src/js#src/js/package.json"]
+
+
+def test_generates_run_script_targets(
+    rule_runner: RuleRunner,
+) -> None:
+    rule_runner.write_files(
+        {
+            "src/js/BUILD": dedent(
+                """\
+                package_json(
+                    scripts=[
+                        node_run_script(entry_point="start", extra_env_vars=["PORT=3000"])
+                    ]
+                )
+                """
+            ),
+            "src/js/package.json": json.dumps(
+                {"name": "ham", "version": "0.0.1", "scripts": {"start": "node server.js"}}
+            ),
+        }
+    )
+    addresses = sorted(str(tgt.address) for tgt in rule_runner.request(AllTargets, ()))
+    assert addresses == ["src/js#ham", "src/js#src/js/package.json", "src/js#start"]
+
+
+def test_run_script_missing_entry_point_error(
+    rule_runner: RuleRunner,
+) -> None:
+    rule_runner.write_files(
+        {
+            "src/js/BUILD": dedent(
+                """\
+                package_json(
+                    scripts=[
+                        node_run_script(entry_point="missing-script")
+                    ]
+                )
+                """
+            ),
+            "src/js/package.json": json.dumps(
+                {"name": "ham", "version": "0.0.1", "scripts": {"start": "node server.js"}}
+            ),
+        }
+    )
+    with engine_error(
+        ValueError, contains="missing-script was not found in package.json#scripts section"
+    ):
+        rule_runner.request(AllTargets, ())
+
+
+def test_generates_multiple_run_script_targets(
+    rule_runner: RuleRunner,
+) -> None:
+    rule_runner.write_files(
+        {
+            "src/js/BUILD": dedent(
+                """\
+                package_json(
+                    scripts=[
+                        node_run_script(entry_point="start"),
+                        node_run_script(entry_point="dev"),
+                        node_build_script(entry_point="build", output_directories=["dist/"]),
+                    ]
+                )
+                """
+            ),
+            "src/js/package.json": json.dumps(
+                {
+                    "name": "ham",
+                    "version": "0.0.1",
+                    "scripts": {
+                        "start": "node server.js",
+                        "dev": "nodemon server.js",
+                        "build": "tsc",
+                    },
+                }
+            ),
+        }
+    )
+    addresses = sorted(str(tgt.address) for tgt in rule_runner.request(AllTargets, ()))
+    assert addresses == [
+        "src/js#build",
+        "src/js#dev",
+        "src/js#ham",
+        "src/js#src/js/package.json",
+        "src/js#start",
+    ]
 
 
 def test_generates_default_test_script_field(

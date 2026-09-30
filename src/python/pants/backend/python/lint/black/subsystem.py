@@ -4,21 +4,26 @@
 from __future__ import annotations
 
 import os.path
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 from pants.backend.python.lint.black.skip_field import SkipBlackField
 from pants.backend.python.subsystems.python_tool_base import PythonToolBase
 from pants.backend.python.target_types import (
     ConsoleScript,
     InterpreterConstraintsField,
+    PythonResolveField,
     PythonSourceField,
 )
+from pants.core.goals.resolves import ExportableTool
 from pants.core.util_rules.config_files import ConfigFilesRequest
 from pants.engine.rules import collect_rules
 from pants.engine.target import FieldSet, Target
+from pants.engine.unions import UnionRule
 from pants.option.option_types import ArgsListOption, BoolOption, FileOption, SkipOption
 from pants.util.strutil import softwrap
+
+# pants: infer-dep(black.lock*)
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,7 @@ class BlackFieldSet(FieldSet):
 
     source: PythonSourceField
     interpreter_constraints: InterpreterConstraintsField
+    resolve: PythonResolveField
 
     @classmethod
     def opt_out(cls, tgt: Target) -> bool:
@@ -36,11 +42,11 @@ class BlackFieldSet(FieldSet):
 class Black(PythonToolBase):
     options_scope = "black"
     name = "Black"
-    help = "The Black Python code formatter (https://black.readthedocs.io/)."
+    help_short = "The Black Python code formatter (https://black.readthedocs.io/)."
 
     default_main = ConsoleScript("black")
     default_requirements = [
-        "black>=22.6.0,<24",
+        "black>=22.6.0,<25",
         'typing-extensions>=3.10.0.0; python_version < "3.10"',
     ]
 
@@ -89,4 +95,7 @@ class Black(PythonToolBase):
 
 
 def rules():
-    return collect_rules()
+    return [
+        *collect_rules(),
+        UnionRule(ExportableTool, Black),
+    ]

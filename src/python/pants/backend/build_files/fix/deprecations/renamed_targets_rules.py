@@ -10,17 +10,17 @@ from pants.backend.build_files.fix.base import FixBuildFilesRequest
 from pants.backend.build_files.fix.deprecations.base import FixBUILDFileRequest, FixedBUILDFile
 from pants.backend.build_files.fix.deprecations.subsystem import BUILDDeprecationsFixer
 from pants.core.goals.fix import FixResult
-from pants.engine.fs import CreateDigest, DigestContents, FileContent
-from pants.engine.internals.native_engine import Digest, Snapshot
-from pants.engine.internals.selectors import Get, MultiGet
-from pants.engine.rules import collect_rules, rule
+from pants.engine.fs import CreateDigest, FileContent
+from pants.engine.internals.selectors import concurrently
+from pants.engine.intrinsics import digest_to_snapshot, get_digest_contents
+from pants.engine.rules import collect_rules, implicitly, rule
 from pants.engine.target import RegisteredTargetTypes
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
 
 
 class RenameTargetsInFilesRequest(FixBuildFilesRequest):
-    tool_subsystem = BUILDDeprecationsFixer
+    tool_subsystem = BUILDDeprecationsFixer  # type: ignore[assignment]
 
 
 class RenameTargetsInFileRequest(FixBUILDFileRequest):
@@ -35,7 +35,7 @@ class RenamedTargetTypes:
 
 
 @rule
-def determine_renamed_target_types(
+async def determine_renamed_target_types(
     target_types: RegisteredTargetTypes,
 ) -> RenamedTargetTypes:
     return RenamedTargetTypes(
@@ -50,7 +50,7 @@ def determine_renamed_target_types(
 
 
 @rule
-def fix_single(
+async def fix_single(
     request: RenameTargetsInFileRequest,
     renamed_target_types: RenamedTargetTypes,
 ) -> FixedBUILDFile:
@@ -88,14 +88,17 @@ def fix_single(
 async def fix(
     request: RenameTargetsInFilesRequest.Batch,
 ) -> FixResult:
-    digest_contents = await Get(DigestContents, Digest, request.snapshot.digest)
-    fixed_contents = await MultiGet(
-        Get(FixedBUILDFile, RenameTargetsInFileRequest(file_content.path, file_content.content))
+    digest_contents = await get_digest_contents(request.snapshot.digest)
+    fixed_contents = await concurrently(
+        fix_single(
+            RenameTargetsInFileRequest(file_content.path, file_content.content), **implicitly()
+        )
         for file_content in digest_contents
     )
-    snapshot = await Get(
-        Snapshot,
-        CreateDigest(FileContent(content.path, content.content) for content in fixed_contents),
+    snapshot = await digest_to_snapshot(
+        **implicitly(
+            CreateDigest(FileContent(content.path, content.content) for content in fixed_contents)
+        )
     )
     return FixResult(
         request.snapshot, snapshot, "", "", tool_name=RenameTargetsInFilesRequest.tool_name

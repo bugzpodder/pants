@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from textwrap import dedent
-from typing import Iterable
 
 import pytest
+from toml import TomlDecodeError
 
 from pants.backend.python import target_types_rules
-from pants.backend.python.dependency_inference.rules import UnownedDependencyError, import_rules
+from pants.backend.python.dependency_inference.rules import import_rules
 from pants.backend.python.macros.python_artifact import PythonArtifact
 from pants.backend.python.target_types import (
     ConsoleScript,
@@ -22,24 +23,34 @@ from pants.backend.python.target_types import (
     PexExecutableField,
     PexScriptField,
     PythonDistribution,
+    PythonDistributionInterpreterConstraintsField,
     PythonRequirementsField,
     PythonRequirementTarget,
     PythonSourcesGeneratorTarget,
+    PythonSourceTarget,
     ResolvedPexEntryPoint,
     ResolvePexEntryPointRequest,
     ResolvePythonDistributionEntryPointsRequest,
     normalize_module_mapping,
 )
 from pants.backend.python.target_types_rules import (
+    DependencyValidationFieldSet,
     InferPexBinaryEntryPointDependency,
     InferPythonDistributionDependencies,
+    InvalidPyprojectRequiresPythonError,
     PexBinaryEntryPointDependencyInferenceFieldSet,
+    PyprojectRequiresPython,
+    PyprojectRequiresPythonRequest,
     PythonDistributionDependenciesInferenceFieldSet,
+    PythonValidateDependenciesRequest,
+    _pyproject_requires_python,
     resolve_pex_entry_point,
 )
 from pants.backend.python.util_rules import python_sources
+from pants.backend.python.util_rules.interpreter_constraints import InterpreterConstraints
 from pants.core.goals.generate_lockfiles import UnrecognizedResolveNamesError
-from pants.engine.addresses import Address
+from pants.core.util_rules.unowned_dependency_behavior import UnownedDependencyError
+from pants.engine.addresses import Address, Addresses
 from pants.engine.internals.graph import _TargetParametrizations, _TargetParametrizationsRequest
 from pants.engine.internals.scheduler import ExecutionError
 from pants.engine.target import (
@@ -48,6 +59,7 @@ from pants.engine.target import (
     InvalidFieldTypeException,
     InvalidTargetException,
     Tags,
+    ValidatedDependencies,
 )
 from pants.testutil.rule_runner import QueryRule, RuleRunner
 from pants.util.frozendict import FrozenDict
@@ -150,6 +162,562 @@ def test_resolve_pex_binary_entry_point() -> None:
     # Resolving >1 file is an error.
     with pytest.raises(ExecutionError):
         assert_resolved(entry_point="*.py", expected=EntryPoint("doesnt matter"), is_file=True)
+
+
+def _python_dependency_validation_rule_runner(*, options: Iterable[str] = ()) -> RuleRunner:
+    rule_runner = RuleRunner(
+        rules=[
+            *target_types_rules.rules(),
+            QueryRule(ValidatedDependencies, [PythonValidateDependenciesRequest]),
+            QueryRule(
+                InterpreterConstraints,
+                [PythonDistributionInterpreterConstraintsField],
+            ),
+            QueryRule(PyprojectRequiresPython, [PyprojectRequiresPythonRequest]),
+        ],
+        target_types=[PythonDistribution, PythonSourceTarget],
+        objects={"python_artifact": PythonArtifact},
+    )
+    if options:
+        rule_runner.set_options(list(options))
+    return rule_runner
+
+
+def _validate_python_dependencies(rule_runner: RuleRunner) -> ValidatedDependencies:
+    tgt = rule_runner.get_target(Address("project", target_name="app"))
+    return rule_runner.request(
+        ValidatedDependencies,
+        [
+            PythonValidateDependenciesRequest(
+                DependencyValidationFieldSet.create(tgt),
+                Addresses([Address("project", target_name="dep")]),
+            )
+        ],
+    )
+
+
+def test_validate_python_dependencies_with_manual_interpreter_constraints() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files(
+        {
+            "project/app.py": "",
+            "project/dep.py": "",
+            "project/BUILD": dedent(
+                """\
+                python_source(
+                    name="app",
+                    source="app.py",
+                    dependencies=[":dep"],
+                    interpreter_constraints=["==3.10.*"],
+                )
+                python_source(
+                    name="dep",
+                    source="dep.py",
+                    interpreter_constraints=[">=3.8,<4"],
+                )
+                """
+            ),
+        }
+    )
+
+    assert _validate_python_dependencies(rule_runner) == ValidatedDependencies()
+
+
+def test_validate_python_dependencies_with_matching_manual_interpreter_constraints() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files(
+        {
+            "project/app.py": "",
+            "project/dep.py": "",
+            "project/BUILD": dedent(
+                """\
+                python_source(
+                    name="app",
+                    source="app.py",
+                    dependencies=[":dep"],
+                    interpreter_constraints=["==3.10.*"],
+                )
+                python_source(
+                    name="dep",
+                    source="dep.py",
+                    interpreter_constraints=["==3.10.*"],
+                )
+                """
+            ),
+        }
+    )
+
+    assert _validate_python_dependencies(rule_runner) == ValidatedDependencies()
+
+
+def test_validate_python_dependencies_with_incompatible_manual_interpreter_constraints() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files(
+        {
+            "project/app.py": "",
+            "project/dep.py": "",
+            "project/BUILD": dedent(
+                """\
+                python_source(
+                    name="app",
+                    source="app.py",
+                    dependencies=[":dep"],
+                    interpreter_constraints=[">=3.8,<4"],
+                )
+                python_source(
+                    name="dep",
+                    source="dep.py",
+                    interpreter_constraints=["==3.10.*"],
+                )
+                """
+            ),
+        }
+    )
+
+    with pytest.raises(ExecutionError) as exc:
+        _validate_python_dependencies(rule_runner)
+    assert isinstance(exc.value.wrapped_exceptions[0], InvalidFieldException)
+
+
+def test_validate_python_dependencies_explicit_interpreter_constraints_ignore_resolve_default() -> (
+    None
+):
+    rule_runner = _python_dependency_validation_rule_runner(
+        options=[
+            "--python-enable-resolves",
+            "--python-default-to-resolve-interpreter-constraints",
+            "--python-default-resolve=myresolve",
+            "--python-resolves={'myresolve': 'myresolve.lock'}",
+            "--python-resolves-to-interpreter-constraints={'myresolve': ['==3.11.*']}",
+        ]
+    )
+    rule_runner.write_files(
+        {
+            "project/app.py": "",
+            "project/dep.py": "",
+            "project/BUILD": dedent(
+                """\
+                python_source(
+                    name="app",
+                    source="app.py",
+                    dependencies=[":dep"],
+                    resolve="myresolve",
+                    interpreter_constraints=["==3.10.*"],
+                )
+                python_source(
+                    name="dep",
+                    source="dep.py",
+                    interpreter_constraints=[">=3.8,<4"],
+                )
+                """
+            ),
+        }
+    )
+
+    assert _validate_python_dependencies(rule_runner) == ValidatedDependencies()
+
+
+def test_validate_python_dependencies_with_resolve_interpreter_constraints_default() -> None:
+    rule_runner = _python_dependency_validation_rule_runner(
+        options=[
+            "--python-enable-resolves",
+            "--python-default-to-resolve-interpreter-constraints",
+            "--python-default-resolve=myresolve",
+            "--python-resolves={'myresolve': 'myresolve.lock'}",
+            "--python-resolves-to-interpreter-constraints={'myresolve': ['==3.10.*']}",
+        ]
+    )
+    rule_runner.write_files(
+        {
+            "project/app.py": "",
+            "project/dep.py": "",
+            "project/BUILD": dedent(
+                """\
+                python_source(
+                    name="app",
+                    source="app.py",
+                    dependencies=[":dep"],
+                    resolve="myresolve",
+                )
+                python_source(
+                    name="dep",
+                    source="dep.py",
+                    resolve="myresolve",
+                )
+                """
+            ),
+        }
+    )
+
+    assert _validate_python_dependencies(rule_runner) == ValidatedDependencies()
+
+
+def test_validate_python_dependencies_without_python_resolve_field() -> None:
+    rule_runner = _python_dependency_validation_rule_runner(
+        options=[
+            "--python-enable-resolves",
+            "--python-default-to-resolve-interpreter-constraints",
+            "--python-resolves={'a': 'a.lock', 'b': 'b.lock'}",
+            "--python-resolves-to-interpreter-constraints={'a': ['==3.10.*'], 'b': ['==3.11.*']}",
+        ]
+    )
+    rule_runner.write_files(
+        {
+            "project/dep.py": "",
+            "project/BUILD": dedent(
+                """\
+                python_distribution(
+                    name="app",
+                    dependencies=[":dep"],
+                    provides=python_artifact(name="demo"),
+                )
+                python_source(
+                    name="dep",
+                    source="dep.py",
+                    resolve="a",
+                    interpreter_constraints=[">=3.8,<4"],
+                )
+                """
+            ),
+        }
+    )
+
+    assert _validate_python_dependencies(rule_runner) == ValidatedDependencies()
+
+
+def test_validate_python_distribution_dependencies_infers_interpreter_constraints_from_pyproject() -> (
+    None
+):
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files(
+        {
+            "project/pyproject.toml": '[project]\nrequires-python = ">=3.10"',
+            "project/dep.py": "",
+            "project/BUILD": dedent(
+                """\
+                python_distribution(
+                    name="app",
+                    dependencies=[":dep"],
+                    provides=python_artifact(name="demo"),
+                )
+                python_source(
+                    name="dep",
+                    source="dep.py",
+                    interpreter_constraints=[">=3.8,<4"],
+                )
+                """
+            ),
+        }
+    )
+
+    assert _validate_python_dependencies(rule_runner) == ValidatedDependencies()
+
+
+def test_validate_python_distribution_dependencies_prefers_explicit_interpreter_constraints() -> (
+    None
+):
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files(
+        {
+            "project/pyproject.toml": '[project]\nrequires-python = ">=3.11"',
+            "project/dep.py": "",
+            "project/BUILD": dedent(
+                """\
+                python_distribution(
+                    name="app",
+                    dependencies=[":dep"],
+                    interpreter_constraints=["==3.10.*"],
+                    provides=python_artifact(name="demo"),
+                )
+                python_source(
+                    name="dep",
+                    source="dep.py",
+                    interpreter_constraints=["==3.10.*"],
+                )
+                """
+            ),
+        }
+    )
+
+    assert _validate_python_dependencies(rule_runner) == ValidatedDependencies()
+
+
+def test_validate_python_distribution_dependencies_incompatible_inferred_interpreter_constraints() -> (
+    None
+):
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files(
+        {
+            "project/pyproject.toml": '[project]\nrequires-python = ">=3.11"',
+            "project/dep.py": "",
+            "project/BUILD": dedent(
+                """\
+                python_distribution(
+                    name="app",
+                    dependencies=[":dep"],
+                    provides=python_artifact(name="demo"),
+                )
+                python_source(
+                    name="dep",
+                    source="dep.py",
+                    interpreter_constraints=["==3.10.*"],
+                )
+                """
+            ),
+        }
+    )
+
+    with pytest.raises(ExecutionError) as exc:
+        _validate_python_dependencies(rule_runner)
+    assert isinstance(exc.value.wrapped_exceptions[0], InvalidFieldException)
+
+
+def test_validate_python_distribution_dependencies_invalid_pyproject_requires_python() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files(
+        {
+            "project/pyproject.toml": "[project]\nrequires-python = 42",
+            "project/dep.py": "",
+            "project/BUILD": dedent(
+                """\
+                python_distribution(
+                    name="app",
+                    dependencies=[":dep"],
+                    provides=python_artifact(name="demo"),
+                )
+                python_source(
+                    name="dep",
+                    source="dep.py",
+                    interpreter_constraints=[">=3.8,<4"],
+                )
+                """
+            ),
+        }
+    )
+
+    with pytest.raises(ExecutionError) as exc:
+        _validate_python_dependencies(rule_runner)
+    assert isinstance(exc.value.wrapped_exceptions[0], InvalidPyprojectRequiresPythonError)
+    assert "`[project].requires-python` field" in str(exc.value)
+
+
+def test_validate_python_distribution_dependencies_malformed_pyproject() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files(
+        {
+            "project/pyproject.toml": "[project\nrequires-python = ",
+            "project/dep.py": "",
+            "project/BUILD": dedent(
+                """\
+                python_distribution(
+                    name="app",
+                    dependencies=[":dep"],
+                    provides=python_artifact(name="demo"),
+                )
+                python_source(
+                    name="dep",
+                    source="dep.py",
+                    interpreter_constraints=[">=3.8,<4"],
+                )
+                """
+            ),
+        }
+    )
+
+    with pytest.raises(ExecutionError) as exc:
+        _validate_python_dependencies(rule_runner)
+    assert isinstance(exc.value.wrapped_exceptions[0], InvalidPyprojectRequiresPythonError)
+    assert "Failed to read `[project].requires-python`" in str(exc.value)
+
+
+def test_validate_python_distribution_dependencies_pyproject_without_requires_python() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files(
+        {
+            "project/pyproject.toml": "[build-system]\nrequires = ['setuptools']",
+            "project/dep.py": "",
+            "project/BUILD": dedent(
+                """\
+                python_distribution(
+                    name="app",
+                    dependencies=[":dep"],
+                    provides=python_artifact(name="demo"),
+                )
+                python_source(
+                    name="dep",
+                    source="dep.py",
+                )
+                """
+            ),
+        }
+    )
+
+    assert _validate_python_dependencies(rule_runner) == ValidatedDependencies()
+
+
+def test_pyproject_requires_python_extracts_value() -> None:
+    assert _pyproject_requires_python(b'[project]\nrequires-python = ">=3.10"') == ">=3.10"
+
+
+def test_pyproject_requires_python_without_project_table() -> None:
+    assert _pyproject_requires_python(b"[build-system]\nrequires = ['setuptools']") is None
+
+
+def test_pyproject_requires_python_without_requires_python() -> None:
+    assert _pyproject_requires_python(b'[project]\nname = "demo"') is None
+
+
+def test_pyproject_requires_python_non_string_raises() -> None:
+    with pytest.raises(ValueError):
+        _pyproject_requires_python(b"[project]\nrequires-python = 42")
+
+
+def test_pyproject_requires_python_malformed_toml_raises() -> None:
+    with pytest.raises(TomlDecodeError):
+        _pyproject_requires_python(b"[project\nrequires-python = ")
+
+
+def _find_pyproject_requires_python(rule_runner: RuleRunner) -> PyprojectRequiresPython:
+    return rule_runner.request(PyprojectRequiresPython, [PyprojectRequiresPythonRequest("project")])
+
+
+def test_find_pyproject_requires_python_reads_the_value() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files({"project/pyproject.toml": '[project]\nrequires-python = ">=3.10"'})
+    assert _find_pyproject_requires_python(rule_runner) == PyprojectRequiresPython(">=3.10")
+
+
+def test_find_pyproject_requires_python_without_project_table() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files({"project/pyproject.toml": "[build-system]\nrequires = ['setuptools']"})
+    assert _find_pyproject_requires_python(rule_runner) == PyprojectRequiresPython(None)
+
+
+def test_find_pyproject_requires_python_without_a_pyproject_toml() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files({"project/dep.py": ""})
+    assert _find_pyproject_requires_python(rule_runner) == PyprojectRequiresPython(None)
+
+
+def test_find_pyproject_requires_python_malformed_toml() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files({"project/pyproject.toml": "[project\nrequires-python = "})
+    with pytest.raises(ExecutionError) as exc:
+        _find_pyproject_requires_python(rule_runner)
+    assert isinstance(exc.value.wrapped_exceptions[0], InvalidPyprojectRequiresPythonError)
+
+
+def test_find_pyproject_requires_python_invalid_constraint() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files({"project/pyproject.toml": '[project]\nrequires-python = ">=3.10,<"'})
+    with pytest.raises(ExecutionError) as exc:
+        _find_pyproject_requires_python(rule_runner)
+    assert isinstance(exc.value.wrapped_exceptions[0], InvalidPyprojectRequiresPythonError)
+    assert "is not a valid interpreter constraint" in str(exc.value)
+
+
+def _effective_interpreter_constraints(rule_runner: RuleRunner) -> InterpreterConstraints:
+    tgt = rule_runner.get_target(Address("project", target_name="app"))
+    return rule_runner.request(
+        InterpreterConstraints,
+        [tgt[PythonDistributionInterpreterConstraintsField]],
+    )
+
+
+def test_python_distribution_effective_interpreter_constraints_inferred() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files(
+        {
+            "project/pyproject.toml": '[project]\nrequires-python = ">=3.10"',
+            "project/BUILD": dedent(
+                """\
+                python_distribution(
+                    name="app",
+                    provides=python_artifact(name="demo"),
+                )
+                """
+            ),
+        }
+    )
+    assert _effective_interpreter_constraints(rule_runner) == InterpreterConstraints([">=3.10"])
+
+
+def test_python_distribution_effective_interpreter_constraints_explicit_wins() -> None:
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.write_files(
+        {
+            "project/pyproject.toml": '[project]\nrequires-python = ">=3.10"',
+            "project/BUILD": dedent(
+                """\
+                python_distribution(
+                    name="app",
+                    interpreter_constraints=["==3.11.*"],
+                    provides=python_artifact(name="demo"),
+                )
+                """
+            ),
+        }
+    )
+    assert _effective_interpreter_constraints(rule_runner) == InterpreterConstraints(["==3.11.*"])
+
+
+def test_python_distribution_effective_interpreter_constraints_flag_overrides_inferred() -> None:
+    rule_runner = _python_dependency_validation_rule_runner(
+        options=["--python-interpreter-constraints=['==3.9.*']"]
+    )
+    rule_runner.write_files(
+        {
+            "project/pyproject.toml": '[project]\nrequires-python = ">=3.10"',
+            "project/BUILD": dedent(
+                """\
+                python_distribution(
+                    name="app",
+                    provides=python_artifact(name="demo"),
+                )
+                """
+            ),
+        }
+    )
+    assert _effective_interpreter_constraints(rule_runner) == InterpreterConstraints(["==3.9.*"])
+
+
+def test_python_distribution_effective_interpreter_constraints_falls_back_to_configured_default() -> (
+    None
+):
+    rule_runner = _python_dependency_validation_rule_runner()
+    rule_runner.set_options([], env={"PANTS_PYTHON_INTERPRETER_CONSTRAINTS": "['==3.9.*']"})
+    rule_runner.write_files(
+        {
+            "project/BUILD": dedent(
+                """\
+                python_distribution(
+                    name="app",
+                    provides=python_artifact(name="demo"),
+                )
+                """
+            ),
+        }
+    )
+    assert _effective_interpreter_constraints(rule_runner) == InterpreterConstraints(["==3.9.*"])
+
+
+def test_python_distribution_effective_interpreter_constraints_falls_back_to_default() -> None:
+    rule_runner = _python_dependency_validation_rule_runner(
+        options=["--python-interpreter-constraints=['==3.9.*']"]
+    )
+    rule_runner.write_files(
+        {
+            "project/BUILD": dedent(
+                """\
+                python_distribution(
+                    name="app",
+                    provides=python_artifact(name="demo"),
+                )
+                """
+            ),
+        }
+    )
+    assert _effective_interpreter_constraints(rule_runner) == InterpreterConstraints(["==3.9.*"])
 
 
 @pytest.mark.parametrize(
@@ -364,15 +932,12 @@ def test_requirements_field() -> None:
     # Give a nice error message if the requirement can't be parsed.
     with pytest.raises(InvalidFieldException) as exc:
         PythonRequirementsField(["not valid! === 3.1"], Address("demo"))
-    assert (
-        softwrap(
-            f"""
+    assert softwrap(
+        f"""
             Invalid requirement 'not valid! === 3.1' in the '{PythonRequirementsField.alias}'
             field for the target demo:
             """
-        )
-        in str(exc.value)
-    )
+    ) in str(exc.value)
 
 
 def test_resolve_python_distribution_entry_points_required_fields() -> None:
@@ -532,15 +1097,12 @@ def test_unrecognized_resolve_names_error(
         raise UnrecognizedResolveNamesError(
             unrecognized, ["valid1", "valid2", "valid3"], description_of_origin="foo"
         )
-    assert (
-        softwrap(
-            f"""
+    assert softwrap(
+        f"""
             Unrecognized resolve {name_str} from foo:
             {bad_entry_str}\n\nAll valid resolve names: ['valid1', 'valid2', 'valid3']
             """
-        )
-        in str(exc.value)
-    )
+    ) in str(exc.value)
 
 
 @pytest.mark.parametrize(

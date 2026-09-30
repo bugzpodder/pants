@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Union
 
 # Note: several of these types are re-exported as the public API of `engine/fs.py`.
-from pants.base.glob_match_error_behavior import GlobMatchErrorBehavior as GlobMatchErrorBehavior
+from pants.base.glob_match_error_behavior import (  # noqa: F401
+    GlobMatchErrorBehavior as GlobMatchErrorBehavior,
+)
 from pants.engine.collection import Collection
 from pants.engine.engine_aware import SideEffecting
 from pants.engine.internals.native_engine import EMPTY_DIGEST as EMPTY_DIGEST  # noqa: F401
@@ -20,9 +24,10 @@ from pants.engine.internals.native_engine import AddPrefix as AddPrefix
 from pants.engine.internals.native_engine import Digest as Digest
 from pants.engine.internals.native_engine import FileDigest as FileDigest
 from pants.engine.internals.native_engine import MergeDigests as MergeDigests
+from pants.engine.internals.native_engine import PathGlobs as PathGlobs
+from pants.engine.internals.native_engine import PathMetadata, PathNamespace
 from pants.engine.internals.native_engine import RemovePrefix as RemovePrefix
 from pants.engine.internals.native_engine import Snapshot as Snapshot
-from pants.engine.rules import QueryRule
 from pants.util.frozendict import FrozenDict
 
 if TYPE_CHECKING:
@@ -37,17 +42,13 @@ class Paths:
     or save them to the LMDB store.
     """
 
-    files: Tuple[str, ...]
-    dirs: Tuple[str, ...]
+    files: tuple[str, ...]
+    dirs: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class FileContent:
-    """The content of a file.
-
-    This can be used to create a new Digest with `Get(Digest, CreateDigest)`. You can also get back
-    a list of `FileContent` objects by using `Get(DigestContents, Digest)`.
-    """
+    """The content of a file."""
 
     path: str
     content: bytes
@@ -68,11 +69,7 @@ class FileContent:
 
 @dataclass(frozen=True)
 class FileEntry:
-    """An indirect reference to the content of a file by digest.
-
-    This can be used to create a new Digest with `Get(Digest, CreateDigest)`. You can also get back
-    a list of `FileEntry` objects by using `Get(DigestEntries, Digest)`.
-    """
+    """An indirect reference to the content of a file by digest."""
 
     path: str
     file_digest: FileDigest
@@ -99,10 +96,7 @@ class SymlinkEntry:
 
 @dataclass(frozen=True)
 class Directory:
-    """The path to a directory.
-
-    This can be used to create empty directories with `Get(Digest, CreateDigest)`.
-    """
+    """The path to a directory."""
 
     path: str
 
@@ -153,61 +147,6 @@ class GlobExpansionConjunction(Enum):
 
 
 @dataclass(frozen=True)
-class PathGlobs:
-    globs: Tuple[str, ...]
-    glob_match_error_behavior: GlobMatchErrorBehavior
-    conjunction: GlobExpansionConjunction
-    description_of_origin: str | None
-
-    def __init__(
-        self,
-        globs: Iterable[str],
-        glob_match_error_behavior: GlobMatchErrorBehavior = GlobMatchErrorBehavior.ignore,
-        conjunction: GlobExpansionConjunction = GlobExpansionConjunction.any_match,
-        description_of_origin: str | None = None,
-    ) -> None:
-        """A request to find files given a set of globs.
-
-        The syntax supported is roughly Git's glob syntax. Use `*` for globs, `**` for recursive
-        globs, and `!` for ignores.
-
-        :param globs: globs to match, e.g. `foo.txt` or `**/*.txt`. To exclude something, prefix it
-            with `!`, e.g. `!ignore.py`.
-        :param glob_match_error_behavior: whether to warn or error upon match failures
-        :param conjunction: whether all `globs` must match or only at least one must match
-        :param description_of_origin: a human-friendly description of where this PathGlobs request
-            is coming from, used to improve the error message for unmatched globs. For example,
-            this might be the text string "the option `--isort-config`".
-        """
-
-        # NB: this object is interpreted from within Snapshot::lift_path_globs() -- that method
-        # will need to be aware of any changes to this object's definition.
-        object.__setattr__(self, "globs", tuple(sorted(globs)))
-        object.__setattr__(self, "glob_match_error_behavior", glob_match_error_behavior)
-        object.__setattr__(self, "conjunction", conjunction)
-        object.__setattr__(self, "description_of_origin", description_of_origin)
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        if self.glob_match_error_behavior == GlobMatchErrorBehavior.ignore:
-            if self.description_of_origin:
-                raise ValueError(
-                    "You provided a `description_of_origin` value when `glob_match_error_behavior` "
-                    "is set to `ignore`. The `ignore` value means that the engine will never "
-                    "generate an error when the globs are generated, so `description_of_origin` "
-                    "won't end up ever being used. Please either change "
-                    "`glob_match_error_behavior` to `warn` or `error`, or remove "
-                    "`description_of_origin`."
-                )
-        else:
-            if not self.description_of_origin:
-                raise ValueError(
-                    "Please provide a `description_of_origin` so that the error message is more "
-                    "helpful to users when their globs fail to match."
-                )
-
-
-@dataclass(frozen=True)
 class PathGlobsAndRoot:
     """A set of PathGlobs to capture relative to some root (which may exist outside of the
     buildroot).
@@ -220,7 +159,7 @@ class PathGlobsAndRoot:
 
     path_globs: PathGlobs
     root: str
-    digest_hint: Optional[Digest] = None
+    digest_hint: Digest | None = None
 
 
 @dataclass(frozen=True)
@@ -228,12 +167,8 @@ class DigestSubset:
     """A request to get a subset of a digest.
 
     The digest will be traversed symlink-oblivious to match the provided globs. If you require a
-    symlink-aware subset, you can access the digest's entries `Get(DigestEntries, Digest, digest)`,
-    filter them out, and create a new digest: `Get(Digest, CreateDigest(...))`.
-
-    Example:
-
-        result = await Get(Digest, DigestSubset(original_digest, PathGlobs(["subdir1", "f.txt"]))
+    symlink-aware subset, you can access the digest's DigestEntries, filter them out, and create a
+    new digest.
     """
 
     digest: Digest
@@ -272,12 +207,22 @@ class NativeDownloadFile:
     # authorization.
     auth_headers: FrozenDict[str, str]
 
+    retry_error_duration: timedelta
+    max_attempts: int
+
     def __init__(
-        self, url: str, expected_digest: FileDigest, auth_headers: Mapping[str, str] | None = None
+        self,
+        url: str,
+        expected_digest: FileDigest,
+        auth_headers: Mapping[str, str] | None = None,
+        retry_delay_duration: timedelta = timedelta(milliseconds=10),
+        max_attempts: int = 4,
     ) -> None:
         object.__setattr__(self, "url", url)
         object.__setattr__(self, "expected_digest", expected_digest)
         object.__setattr__(self, "auth_headers", FrozenDict(auth_headers or {}))
+        object.__setattr__(self, "retry_error_duration", retry_delay_duration)
+        object.__setattr__(self, "max_attempts", max_attempts)
 
 
 @dataclass(frozen=True)
@@ -291,14 +236,14 @@ class Workspace(SideEffecting):
         self,
         digest: Digest,
         *,
-        path_prefix: Optional[str] = None,
+        path_prefix: str | None = None,
         clear_paths: Sequence[str] = (),
         side_effecting: bool = True,
     ) -> None:
         """Write a digest to disk, relative to the build root.
 
-        You should not use this in a `for` loop due to slow performance. Instead, call `await
-        Get(Digest, MergeDigests)` beforehand.
+        You should not use this in a `for` loop due to slow performance. Instead, first merge
+        digests and then write the single merged digest.
 
         As an advanced use-case, if the digest is known to be written to a temporary or idempotent
         location, side_effecting=False may be passed to avoid tracking this write as a side effect.
@@ -330,7 +275,35 @@ class SnapshotDiff:
         return cls(*ours._diff(theirs))
 
 
+@dataclass(frozen=True)
+class PathMetadataRequest:
+    """Request the full metadata of a single path in the filesystem.
+
+    Note: By default this API is symlink-aware and will distinguish between symlinks and regular
+    files/directories. Set `follow_symlinks=True` to follow symlinks and report the metadata of
+    the symlink target instead.
+    """
+
+    path: str
+    namespace: PathNamespace = PathNamespace.WORKSPACE
+    follow_symlinks: bool = False
+
+
+@dataclass(frozen=True)
+class PathMetadataResult:
+    """Result of requesting the metadata for a path in the filesystem.
+
+    The `metadata` field will contain the metadata for the requested path, or else `None` if the
+    path does not exist.
+    """
+
+    metadata: PathMetadata | None
+
+
 def rules():
+    # Avoids an import cycle.
+    from pants.engine.rules import QueryRule
+
     return (
         QueryRule(Digest, (CreateDigest,)),
         QueryRule(Digest, (PathGlobs,)),

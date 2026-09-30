@@ -2,15 +2,17 @@
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 import logging
-from typing import cast
+from typing import Iterable, cast
 
 from pants.base.glob_match_error_behavior import GlobMatchErrorBehavior
 from pants.base.specs import AddressLiteralSpec, FileLiteralSpec, RawSpecs, Specs
 from pants.base.specs_parser import SpecsParser
-from pants.core.util_rules.environments import determine_bootstrap_environment
+from pants.core.environments.rules import determine_bootstrap_environment
 from pants.core.util_rules.system_binaries import GitBinary
 from pants.engine.addresses import AddressInput
 from pants.engine.environment import EnvironmentName
+from pants.engine.internals.build_files import DELETED_ADDRESS
+from pants.engine.internals.graph import FilesWithSourceBlocks
 from pants.engine.internals.scheduler import SchedulerSession
 from pants.engine.internals.selectors import Params
 from pants.engine.rules import QueryRule
@@ -19,6 +21,7 @@ from pants.option.options_bootstrapper import OptionsBootstrapper
 from pants.util.frozendict import FrozenDict
 from pants.vcs.changed import ChangedAddresses, ChangedOptions, ChangedRequest
 from pants.vcs.git import GitWorktreeRequest, MaybeGitWorktree
+from pants.vcs.hunk import TextBlocks
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,7 @@ class InvalidSpecConstraint(Exception):
 
 
 def calculate_specs(
+    specs_strs: Iterable[str],
     options_bootstrapper: OptionsBootstrapper,
     options: Options,
     session: SchedulerSession,
@@ -37,7 +41,7 @@ def calculate_specs(
     global_options = options.for_global_scope()
     unmatched_cli_globs = global_options.unmatched_cli_globs
     specs = SpecsParser(working_dir=working_dir).parse_specs(
-        options.specs,
+        specs_strs,
         description_of_origin="CLI arguments",
         unmatched_glob_behavior=unmatched_cli_globs,
     )
@@ -60,36 +64,65 @@ def calculate_specs(
 
     bootstrap_environment = determine_bootstrap_environment(session)
 
-    (git_binary,) = session.product_request(GitBinary, [Params(bootstrap_environment)])
+    (git_binary,) = session.product_request(GitBinary, Params(bootstrap_environment))
     (maybe_git_worktree,) = session.product_request(
-        MaybeGitWorktree, [Params(GitWorktreeRequest(), git_binary, bootstrap_environment)]
+        MaybeGitWorktree, Params(GitWorktreeRequest(), git_binary, bootstrap_environment)
     )
     if not maybe_git_worktree.git_worktree:
         raise InvalidSpecConstraint(
             "The `--changed-*` options are only available if Git is used for the repository."
         )
 
-    changed_files = tuple(changed_options.changed_files(maybe_git_worktree.git_worktree))
+    (files_with_sources_blocks,) = session.product_request(
+        FilesWithSourceBlocks, Params(bootstrap_environment)
+    )
+    changed_files = tuple(
+        file
+        for file in changed_options.changed_files(maybe_git_worktree.git_worktree)
+        # We want to exclude the file from the normal processing flow if it has associated
+        # targets with text blocks. These files are handled with special logic.
+        if file not in files_with_sources_blocks
+    )
     file_literal_specs = tuple(FileLiteralSpec(f) for f in changed_files)
 
-    changed_request = ChangedRequest(changed_files, changed_options.dependents)
+    sources_blocks = FrozenDict(
+        (
+            path,
+            # Hunk stores information about the old block and the new block.
+            # Here we only care about the final state, so we take `hunk.right`.
+            TextBlocks(hunk.right for hunk in hunks if hunk.right is not None),
+        )
+        for path, hunks in changed_options.diff_hunks(
+            maybe_git_worktree.git_worktree,
+            files_with_sources_blocks,
+        ).items()
+    )
+    logger.debug("changed text blocks: %s", sources_blocks)
+
+    changed_request = ChangedRequest(
+        sources=changed_files,
+        dependents=changed_options.dependents,
+        sources_blocks=sources_blocks,
+    )
     (changed_addresses,) = session.product_request(
         ChangedAddresses,
-        [Params(changed_request, options_bootstrapper, bootstrap_environment)],
+        Params(changed_request, options_bootstrapper, bootstrap_environment),
     )
     logger.debug("changed addresses: %s", changed_addresses)
 
     address_literal_specs = []
     for address in cast(ChangedAddresses, changed_addresses):
         address_input = AddressInput.parse(address.spec, description_of_origin="`--changed-since`")
-        address_literal_specs.append(
-            AddressLiteralSpec(
-                path_component=address_input.path_component,
-                target_component=address_input.target_component,
-                generated_component=address_input.generated_component,
-                parameters=FrozenDict(address_input.parameters),
+        # The pseudo-target has done its job, but we don't want to actually see it downstream.
+        if address != DELETED_ADDRESS:
+            address_literal_specs.append(
+                AddressLiteralSpec(
+                    path_component=address_input.path_component,
+                    target_component=address_input.target_component,
+                    generated_component=address_input.generated_component,
+                    parameters=FrozenDict(address_input.parameters),
+                )
             )
-        )
 
     return Specs(
         includes=RawSpecs(
@@ -115,4 +148,5 @@ def rules():
         QueryRule(ChangedAddresses, [ChangedRequest, EnvironmentName]),
         QueryRule(GitBinary, [EnvironmentName]),
         QueryRule(MaybeGitWorktree, [GitWorktreeRequest, GitBinary, EnvironmentName]),
+        QueryRule(FilesWithSourceBlocks, [EnvironmentName]),
     ]

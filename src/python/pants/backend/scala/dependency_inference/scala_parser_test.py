@@ -256,39 +256,39 @@ def test_parser_simple(rule_runner: RuleRunner) -> None:
             "org.pantsbuild.example.OuterObject": FrozenOrderedSet(["Foo"]),
             "org.pantsbuild.example.Functions": FrozenOrderedSet(
                 [
-                    "TupleTypeArg2",
-                    "foo",
-                    "TupleTypeArg1",
-                    "LambdaReturnType",
                     "+",
-                    "Unit",
-                    "Integer",
-                    "LambdaTypeArg2",
                     "AParameterType",
+                    "Integer",
+                    "LambdaReturnType",
                     "LambdaTypeArg1",
+                    "LambdaTypeArg2",
                     "OuterObject",
-                    "bar",
                     "OuterObject.NestedVal",
+                    "TupleTypeArg1",
+                    "TupleTypeArg2",
+                    "Unit",
+                    "bar",
+                    "foo",
                 ]
             ),
             "org.pantsbuild.example.HasPrimaryConstructor": FrozenOrderedSet(
-                ["bar", "SomeTypeInSecondaryConstructor"]
+                ["SomeTypeInSecondaryConstructor", "bar"]
             ),
             "org.pantsbuild.example.OuterClass": FrozenOrderedSet(["Foo"]),
             "org.pantsbuild.example.ApplyQualifier": FrozenOrderedSet(
-                ["Integer", "a", "toInt", "calc.calcFunc", "calc"]
+                ["Integer", "a", "calc", "calc.calcFunc", "toInt"]
             ),
             "org.pantsbuild.example.OuterTrait": FrozenOrderedSet(
-                ["Integer", "TraitConsumedType", "Foo"]
+                ["Foo", "Integer", "TraitConsumedType"]
             ),
             "org.pantsbuild.example": FrozenOrderedSet(
                 [
                     "ABaseClass",
                     "ATrait1",
-                    "SomeTypeInPrimaryConstructor",
-                    "foo",
                     "ATrait2.Nested",
                     "BaseWithConstructor",
+                    "SomeTypeInPrimaryConstructor",
+                    "foo",
                 ]
             ),
         }
@@ -435,6 +435,31 @@ def test_relative_import(rule_runner: RuleRunner) -> None:
     }
 
 
+def test_import_root_pacjage(rule_runner: RuleRunner) -> None:
+    analysis = _analyze(
+        rule_runner,
+        textwrap.dedent(
+            """
+            package foo
+
+            import _root_.io.circe.syntax._
+
+            object Foo {
+                val foo: _root_.foo.Bar = ???
+            }
+            """
+        ),
+    )
+
+    assert analysis.imports_by_scope == FrozenDict(
+        {"foo": (ScalaImport(name="io.circe.syntax", alias=None, is_wildcard=True),)}
+    )
+
+    assert sorted(analysis.fully_qualified_consumed_symbols()) == [
+        "foo.Bar",
+    ]
+
+
 def test_package_object(rule_runner: RuleRunner) -> None:
     analysis = _analyze(
         rule_runner,
@@ -453,12 +478,34 @@ def test_package_object(rule_runner: RuleRunner) -> None:
     ]
 
 
-def test_source3(rule_runner: RuleRunner) -> None:
+def test_scala_2_13_source3(rule_runner: RuleRunner) -> None:
     rule_runner.set_options(
         args=[
             "-ldebug",
             "--scala-version-for-resolve={'jvm-default':'2.13.8'}",
-            "--scalac-args=['-Xsource:3']",
+            "--scalac-args-for-resolve={'jvm-default':['-Xsource:3']}",
+        ],
+        env_inherit=PYTHON_BOOTSTRAP_ENV,
+    )
+    analysis = _analyze(
+        rule_runner,
+        textwrap.dedent(
+            """
+            package foo
+
+            import bar.*
+            """
+        ),
+    )
+    assert analysis.imports_by_scope.get("foo") == (ScalaImport("bar", None, True),)
+
+
+def test_scala_3_default_args(rule_runner: RuleRunner) -> None:
+    rule_runner.set_options(
+        args=[
+            "-ldebug",
+            "--scala-version-for-resolve={'jvm-default':'3.3.0'}",
+            "--scalac-args=['']",
         ],
         env_inherit=PYTHON_BOOTSTRAP_ENV,
     )
@@ -734,4 +781,99 @@ def test_type_context_bounds(rule_runner: RuleRunner) -> None:
     assert sorted(analysis.fully_qualified_consumed_symbols()) == [
         "foo.Applicative",
         "foo.Functor",
+    ]
+
+
+def test_self_types_on_same_package(rule_runner: RuleRunner) -> None:
+    analysis = _analyze(
+        rule_runner,
+        textwrap.dedent(
+            """\
+            package foo
+
+            trait Bar { self: Foo =>
+            }
+            """
+        ),
+    )
+
+    assert sorted(analysis.fully_qualified_consumed_symbols()) == [
+        "foo.Foo",
+    ]
+
+
+def test_typed_pattern_on_same_package(rule_runner: RuleRunner) -> None:
+    analysis = _analyze(
+        rule_runner,
+        textwrap.dedent(
+            """\
+            package foo
+            class A
+            object B {
+                def fn(v: Any) = v match {
+                    case _: A =>
+                }
+            }
+            """
+        ),
+    )
+
+    assert sorted(analysis.fully_qualified_consumed_symbols()) == [
+        "foo.A",
+        "foo.Any",
+        "foo.v",
+    ]
+
+
+def test_applied_types_to_terms(rule_runner: RuleRunner) -> None:
+    analysis = _analyze(
+        rule_runner,
+        textwrap.dedent(
+            """\
+            package foo
+            object B {
+                val valDef = bar(applied[List[Foo]])
+            }
+            """
+        ),
+    )
+
+    assert sorted(analysis.fully_qualified_consumed_symbols()) == [
+        "foo.Foo",
+        "foo.List",
+        "foo.applied",
+        "foo.bar",
+    ]
+
+
+def test_new_given_syntax_sip64(rule_runner: RuleRunner) -> None:
+    # https://docs.scala-lang.org/sips/sips/typeclasses-syntax.html#7-cleanup-of-given-syntax
+    rule_runner.set_options(
+        args=[
+            "-ldebug",
+            "--scala-version-for-resolve={'jvm-default':'3.3.0'}",
+        ],
+        env_inherit=PYTHON_BOOTSTRAP_ENV,
+    )
+    analysis = _analyze(
+        rule_runner,
+        textwrap.dedent(
+            """\
+            package foo
+
+            trait Ord[T]:
+                def compare(a: T, b: T): Int
+
+            given intOrd: Ord[Int]:
+                def compare(a: Int, b: Int) = 0
+            """
+        ),
+    )
+
+    assert sorted(analysis.fully_qualified_consumed_symbols()) == [
+        "foo.Int",
+        "foo.Int",
+        "foo.Ord",
+        "foo.T",
+        "foo.intOrd",
     ]

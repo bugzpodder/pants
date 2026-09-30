@@ -1,17 +1,23 @@
 Created as part of the release process.
 
++ 0xG0nz0
 + A. Alonso Dominguez
 + APL
 + Aaron Mitchell
 + Adam Chainz
 + Adam Retter
 + Aditya Raj Verma
++ Affan Amir Mir
 + Alan Paulin
 + Alan Velasco
++ Aleksandr Artemenkov
 + Alex Bancroft
 + Alex Schmitt
++ Alex Tremblay
++ Alexander Heldt
 + Alexander Johnson
 + Alexander Kuhn-Regnier
++ Alexandre Viau
 + Alexey Tereshenkov
 + Alisha Parveen
 + Andreas Stenius
@@ -27,6 +33,8 @@ Created as part of the release process.
 + Bardur Arantsson
 + Bastian Wegge
 + Ben Limmer
++ Ben Wilen
++ Benjamin Dabelow
 + Benjy Weinberger
 + Berkay Öztürk
 + Bill Farner
@@ -35,6 +43,7 @@ Created as part of the release process.
 + Bob Gregory
 + Borja Lorente
 + Brandon Milton
++ Brandon Novick
 + Brian Larson
 + Brian Wickman
 + Bruno Bieth
@@ -42,7 +51,9 @@ Created as part of the release process.
 + Caitie McCaffrey
 + Caleb Lloyd
 + Carina C. Zona
++ Casey
 + Caspar Krieger
++ Chiara
 + Chris Aniszczyk
 + Chris Borckholder
 + Chris Burroughs
@@ -62,19 +73,24 @@ Created as part of the release process.
 + Constantin Ponfick
 + Craig Schertz
 + Cristian Matache
++ D. Luke Nelson
 + Damon Revoe
 + Dan Davydov
 + Dan Fabulich
 + Dan Harrison
 + Daniel Anderson
++ Daniel Beck
 + Daniel Bentley
++ Daniel Cavazos
 + Daniel Goldman
 + Daniel Moran
 + Daniel Peebles
 + Daniel Wagner-Hall
 + Danny McClanahan
++ Darren Clark
 + Dave Brewster
 + David Katz
++ David Singleton
 + David Taylor
 + David Turner
 + Derek Young
@@ -103,17 +119,20 @@ Created as part of the release process.
 + Facetoe
 + Fatin H
 + Fedor Korotkov
++ Felix Scherz
 + Filip Nikolovski
 + Fiona Condone
 + Flo
 + Florian Leibert
 + Fredrik Ekholdt
++ Fredrik Wärnsberg
 + Gabriel Gonzalez
 + Garrett Malmquist
 + Gary M. Josack
 + Gautham Nair
 + Gerald Spencer
 + Gordon Cassie
++ Greg Fast
 + Greg Niemann
 + Greg Shuflin
 + Gregory Borodin
@@ -121,9 +140,11 @@ Created as part of the release process.
 + Guy Marom
 + Harley Cooper
 + HeetVekariya
++ Henri Parfait
 + Henry Fuller
 + Herbert Rusznak
 + Huon Wilson
++ Hussein Awala
 + Hwasung Lee
 + Ian Tabolt
 + Idan Attias
@@ -135,9 +156,11 @@ Created as part of the release process.
 + Ity Kaul
 + JC (Jonathan Chen)
 + Jack Evans
++ Jack Jennings
 + Jack Zhao
 + Jackson Davis
 + Jacob Floyd
++ Jake
 + Jake Donham
 + Jake Zerrer
 + Jakub Bujny
@@ -147,6 +170,7 @@ Created as part of the release process.
 + Jan Berkel
 + Jan Paul Erkelens
 + Jason Barnett
++ Jason D'Amour
 + Jason Jackson
 + Jason Song
 + Jay Crumb
@@ -163,14 +187,17 @@ Created as part of the release process.
 + John Basila
 + John Chee
 + John Gallagher
++ John Granström
 + John Ioannidis
 + John Sirois
 + John Townsend
 + Jon Boulle
++ Jonas Rauber
 + Jonas Stendahl
 + Jonathan Coveney
 + Jonathan D. Simms
 + Jonathan Sokolowski
++ Joseph Bylund
 + Joseph Tilahun
 + Josh Reed
 + Josh Soref
@@ -181,6 +208,8 @@ Created as part of the release process.
 + Jovial Joe Jayarson
 + Julio Batista Silva
 + Justin Trobec
++ Kacper
++ Kacper Krylowicz
 + KadenAgrey
 + Karin Lundberg
 + Kaushik Srenevasan
@@ -191,9 +220,12 @@ Created as part of the release process.
 + Kevin Sweeney
 + Koki Nishihara
 + Kris Wilson
++ Krishna Vudata
 + Krishnan Chandra
++ Kristian Tashkov
 + Kushal Dave
 + Kyle Derr
++ Kyle Purdon
 + Kyujin Cho
 + Larry Hosken
 + Lasse Alm
@@ -202,6 +234,7 @@ Created as part of the release process.
 + Lei Wang
 + Leo Kim
 + Lex Spoon
++ Li Li
 + Liam Deacon
 + Liam Wilson
 + Luc Cary
@@ -225,6 +258,7 @@ Created as part of the release process.
 + Mateo Rodriguez
 + Mathew Jennings
 + Mathieu Sabourin
++ Matt Alexander
 + Matt Dee
 + Matt Landis
 + Matt Olsen
@@ -233,6 +267,7 @@ Created as part of the release process.
 + Maxim Khutornenko
 + Maxim Popenko
 + Michael Doherty
++ Michael Fairley
 + Michael Glass
 + Michal Bryc
 + Mikael Souza
@@ -244,6 +279,7 @@ Created as part of the release process.
 + Mohamed Abdi
 + Morten Hauge
 + Moses Nakamura
++ Muhammad Tsany Qudsi
 + Nadav Samet
 + Nathan Levesque
 + Navneeth Jayendran
@@ -251,6 +287,7 @@ Created as part of the release process.
 + Neil Sanchala
 + Nicholas Gustafson
 + Nicholas Santos
++ Nick Dell'Osa
 + Nick Dellosa
 + Nik Shkrob
 + Nimrod Shlagman
@@ -276,17 +313,21 @@ Created as part of the release process.
 + Pierre Chevalier
 + Pierre DAL-PRA
 + Qicheng Ma
++ Rahul Mehta
 + Ramon Buckland
 + Raph Estrada
 + Raúl Cuza
 + Rhuan Barreto
 + Rhys Madigan
++ Robert Pickering
 + Robert Stapenhurst
 + Roger Jiang
 + Roman Andriadi
 + Rushal Verma
++ Rutger de Knijf
 + Ryan Despain
 + Ryan King
++ Ryan Loader
 + Ryan Scott Brown
 + Ryan Williams
 + Sameer Arora
@@ -298,29 +339,38 @@ Created as part of the release process.
 + SergeKireev
 + Sergey Serebryakov
 + Seve Martinez
++ Shaked Kaplan
 + Shane Delmore
 + Shantanu Kumar
++ Shunsuke Kirino
 + Shuo Li
 + Simeon Franklin
 + Simon Biggs
 + Sion Kang
 + Srikanth Kotagiri
++ Sriram Viswanathan
 + Stefan Sauer
 + Stephan Erb
++ Stephen Hopper
 + Stu Hood
 + Subin Kim
 + Suresh Joshi
++ Sven Widén
 + Tal Amuyal
 + Tansy Arron-Walker
++ Tarek Rached
 + Ted Dziuba
 + Tejal Desai
 + Thales Menato
++ Thani Ath Nain Khurshid
 + Theo Ribeiro
++ Thiago Riemma Carbonera
 + Tianshuo Deng
 + Tien Nguyen
 + Tim Gates
 + Tim Nielens
 + Tim Treptow
++ Tim Werner
 + Timur Abishev
 + Tina Huang
 + Tobias Nilsson
@@ -328,16 +378,20 @@ Created as part of the release process.
 + Tom Dimiduk
 + Tom Dyas
 + Tom Howland
++ Tom Most
 + Tom Solberg
 + Tomasz Godzik
 + Tomasz Pasternak
++ Tony Sherman
 + Travis Crawford
 + Troy Howard
 + Tushar Singh
++ Tyler Rhodes
 + Ugo Di Girolamo
 + Ulugbek Adilbekov
 + Viktor Kleen
 + Vincent Tavernier
++ Vito Laurenza
 + Walter Scheper
 + Wei An
 + Wilhelmina Drengwitz
@@ -351,24 +405,35 @@ Created as part of the release process.
 + Yoav Alon
 + Yuhan GUO
 + Yujie Chen
++ Yusuf Jabri
++ achrafmam2
 + andreaimprovised
 + azban
 + bianca rosa
 + billybecker
++ creeser-nvidia
 + csqzhang
 + csteiner
 + eugene yokota
++ fabric-peter
 + gyudoza
 + hephex
 + jgartdele/del
++ lukevmorris
++ mattalbr
++ nikhila-dwarakanath-zocdoc
 + offsetcyan
 + okcleary
 + olivercoleman-switchdin
++ peter-woyzbun
 + philipp-sontag-by
 + purajit
 + ravi2024sk
++ seungwoo-ji (jeus)
 + sww
 + twunderlich-grapl
++ vladislav doster
 + wimax-grapl
 + yjabri
++ Éric Jacob
 + Ólafur Páll Geirsson

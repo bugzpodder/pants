@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os.path
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import PurePath
-from typing import Iterable, cast
+from typing import cast
 
 from pants.backend.scala.lint.scalafix.extra_fields import SkipScalafixField
 from pants.backend.scala.lint.scalafix.subsystem import ScalafixSubsystem
@@ -15,31 +16,34 @@ from pants.backend.scala.subsystems.scalac import Scalac
 from pants.backend.scala.target_types import ScalaSourceField
 from pants.backend.scala.util_rules.versions import ScalaVersion
 from pants.core.goals.fix import FixResult, FixTargetsRequest, Partitions
-from pants.core.goals.generate_lockfiles import GenerateToolLockfileSentinel
 from pants.core.goals.lint import LintResult, LintTargetsRequest
+from pants.core.goals.resolves import ExportableTool
 from pants.core.util_rules.config_files import (
     GatherConfigFilesByDirectoriesRequest,
-    GatheredConfigFilesByDirectories,
+    gather_config_files_by_workspace_dir,
 )
 from pants.core.util_rules.partitions import Partition
-from pants.core.util_rules.source_files import SourceFiles
-from pants.core.util_rules.stripped_source_files import StrippedSourceFiles
 from pants.engine.addresses import Addresses, UnparsedAddressInputs
-from pants.engine.fs import AddPrefix, Digest, DigestSubset, MergeDigests, PathGlobs, Snapshot
+from pants.engine.fs import Digest, DigestSubset, MergeDigests, PathGlobs, Snapshot
+from pants.engine.intrinsics import (
+    digest_to_snapshot,
+    execute_process,
+    merge_digests,
+)
 from pants.engine.process import FallibleProcessResult
-from pants.engine.rules import Get, MultiGet, collect_rules, rule
+from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import FieldSet, Target
 from pants.engine.unions import UnionRule
 from pants.jvm.classpath import Classpath
+from pants.jvm.classpath import classpath as classpath_get
 from pants.jvm.compile import ClasspathEntry
 from pants.jvm.goals import lockfile
 from pants.jvm.jdk_rules import InternalJdk, JvmProcess
-from pants.jvm.resolve.coursier_fetch import ToolClasspath, ToolClasspathRequest
-from pants.jvm.resolve.jvm_tool import GenerateJvmLockfileFromTool, GenerateJvmToolLockfileSentinel
+from pants.jvm.resolve.coursier_fetch import ToolClasspathRequest, materialize_classpath_for_tool
+from pants.jvm.resolve.jvm_tool import GenerateJvmLockfileFromTool
 from pants.jvm.resolve.key import CoursierResolveKey
 from pants.jvm.subsystems import JvmSubsystem
 from pants.jvm.target_types import JvmResolveField
-from pants.source.source_root import SourceRootsRequest, SourceRootsResult
 from pants.util.dirutil import group_by_dir
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
@@ -68,12 +72,12 @@ class ScalafixFieldSet(FieldSet):
 
 class ScalafixFixRequest(FixTargetsRequest):
     field_set_type = ScalafixFieldSet
-    tool_subsystem = ScalafixSubsystem
+    tool_subsystem = ScalafixSubsystem  # type: ignore[assignment]
 
 
 class ScalafixLintRequest(LintTargetsRequest):
     field_set_type = ScalafixFieldSet
-    tool_subsystem = ScalafixSubsystem
+    tool_subsystem = ScalafixSubsystem  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -84,14 +88,11 @@ class ScalafixPartitionInfo:
     compile_classpath_entries: tuple[str, ...]
     rule_classpath_entries: tuple[str, ...]
     extra_immutable_input_digests: FrozenDict[str, Digest]
+    resolve_name: str
 
     @property
     def description(self) -> str:
         return self.config_snapshot.files[0]
-
-
-class ScalafixToolLockfileSentinel(GenerateJvmToolLockfileSentinel):
-    resolve_name = ScalafixSubsystem.options_scope
 
 
 @dataclass(frozen=True)
@@ -117,7 +118,7 @@ async def _resolve_scalafix_rule_classpath(
     if not scalafix.rule_targets:
         return _MaybeClasspath(classpath=None)
 
-    classpath = await Get(Classpath, UnparsedAddressInputs, scalafix.rule_targets)
+    classpath = await classpath_get(**implicitly({scalafix.rule_targets: UnparsedAddressInputs}))
     return _MaybeClasspath(classpath)
 
 
@@ -142,24 +143,24 @@ async def _partition_scalafix(
 
     classpaths: Iterable[Classpath] = ()
     if scalafix.semantic_rules:
-        classpaths = await MultiGet(
-            Get(Classpath, Addresses([field_set.address])) for field_set in request.field_sets
+        classpaths = await concurrently(
+            classpath_get(**implicitly(Addresses([field_set.address])))
+            for field_set in request.field_sets
         )
     rule_classpath = await _resolve_scalafix_rule_classpath(scalafix)
 
     filepaths = tuple(field_set.source.file_path for field_set in request.field_sets)
     classpath_by_filepath = dict(zip(filepaths, classpaths))
-    lockfile_request = await Get(GenerateJvmLockfileFromTool, ScalafixToolLockfileSentinel())
-    tool_runtime_classpath, config_files = await MultiGet(
-        Get(ToolClasspath, ToolClasspathRequest(lockfile=lockfile_request)),
-        Get(
-            GatheredConfigFilesByDirectories,
+    lockfile_request = GenerateJvmLockfileFromTool.create(scalafix)
+    tool_runtime_classpath, config_files = await concurrently(
+        materialize_classpath_for_tool(ToolClasspathRequest(lockfile=lockfile_request)),
+        gather_config_files_by_workspace_dir(
             GatherConfigFilesByDirectoriesRequest(
                 tool_name="scalafix",
                 config_filename=scalafix.config_file_name,
                 filepaths=filepaths,
                 orphan_filepath_behavior=scalafix.orphan_files_behavior,
-            ),
+            )
         ),
     )
 
@@ -183,8 +184,10 @@ async def _partition_scalafix(
             scala_version = sorted(scala_versions_by_filepath[filename])[0]
             partitioned_source_files[(config_file, scala_version)].add(filename)
 
-    config_file_snapshots = await MultiGet(
-        Get(Snapshot, DigestSubset(config_files.snapshot.digest, PathGlobs([config_file])))
+    config_file_snapshots = await concurrently(
+        digest_to_snapshot(
+            **implicitly(DigestSubset(config_files.snapshot.digest, PathGlobs([config_file])))
+        )
         for (config_file, _) in partitioned_source_files
     )
 
@@ -234,6 +237,9 @@ async def _partition_scalafix(
                     **dict(rule_classpath.immutable_inputs(prefix=rulecp_relpath)),
                 }
             ),
+            resolve_name=classpath.classpath.resolve.name
+            if classpath.classpath
+            else jvm.default_resolve,
         )
 
     return Partitions(
@@ -248,34 +254,19 @@ async def _partition_scalafix(
 
 
 @rule
-def _scalafix_fix_partitions(
+async def _scalafix_fix_partitions(
     request: ScalafixFixRequest.PartitionRequest[ScalafixFieldSet],
-) -> _ScalafixPartitionRequest:
-    return _ScalafixPartitionRequest(request.field_sets)
+) -> Partitions:
+    ret = await _partition_scalafix(_ScalafixPartitionRequest(request.field_sets), **implicitly())
+    return ret
 
 
 @rule
 async def _scalafix_lint_partitions(
     request: ScalafixLintRequest.PartitionRequest[ScalafixFieldSet],
-) -> _ScalafixPartitionRequest:
-    return _ScalafixPartitionRequest(request.field_sets)
-
-
-async def _restore_source_roots(source_roots_result: SourceRootsResult, digest: Digest) -> Snapshot:
-    source_roots_to_files = defaultdict(set)
-    for file, root in source_roots_result.path_to_root.items():
-        source_roots_to_files[root.path].add(str(file.relative_to(root.path)))
-
-    digest_subsets = await MultiGet(
-        Get(Digest, DigestSubset(digest, PathGlobs(files)))
-        for files in source_roots_to_files.values()
-    )
-
-    restored_digests = await MultiGet(
-        Get(Digest, AddPrefix(digest, source_root))
-        for digest, source_root in zip(digest_subsets, source_roots_to_files.keys())
-    )
-    return await Get(Snapshot, MergeDigests(restored_digests))
+) -> Partitions:
+    ret = await _partition_scalafix(_ScalafixPartitionRequest(request.field_sets), **implicitly())
+    return ret
 
 
 @dataclass(frozen=True)
@@ -291,64 +282,64 @@ async def _run_scalafix_process(
 ) -> FallibleProcessResult:
     partition_info = request.partition_info
 
-    merged_digest = await Get(
-        Digest, MergeDigests([partition_info.config_snapshot.digest, request.snapshot.digest])
+    merged_digest = await merge_digests(
+        MergeDigests([partition_info.config_snapshot.digest, request.snapshot.digest])
     )
-
-    return await Get(
-        FallibleProcessResult,
-        JvmProcess(
-            jdk=jdk,
-            argv=[
-                "scalafix.cli.Cli",
-                f"--config={partition_info.config_snapshot.files[0]}",
-                f"--scala-version={partition_info.scala_version}",
-                *(
-                    (f"--classpath={':'.join(partition_info.compile_classpath_entries)}",)
-                    if partition_info.compile_classpath_entries
-                    else ()
-                ),
-                *(
-                    (f"--tool-classpath={':'.join(partition_info.rule_classpath_entries)}",)
-                    if partition_info.rule_classpath_entries
-                    else ()
-                ),
-                *(("--check",) if request.check_only else ()),
-                *((f"--scalac-options={arg}" for arg in scalac.args) if scalac.args else ()),
-                *(f"--files={file}" for file in request.snapshot.files),
-            ],
-            classpath_entries=partition_info.runtime_classpath_entries,
-            input_digest=merged_digest,
-            output_files=request.snapshot.files,
-            extra_jvm_options=scalafix.jvm_options,
-            extra_immutable_input_digests=partition_info.extra_immutable_input_digests,
-            use_nailgun=False,
-            description=f"Run `scalafix` on {pluralize(len(request.snapshot.files), 'file')}.",
-            level=LogLevel.DEBUG,
-        ),
+    return await execute_process(
+        **implicitly(
+            JvmProcess(
+                jdk=jdk,
+                argv=[
+                    "scalafix.cli.Cli",
+                    f"--config={partition_info.config_snapshot.files[0]}",
+                    f"--scala-version={partition_info.scala_version}",
+                    *(
+                        (f"--classpath={':'.join(partition_info.compile_classpath_entries)}",)
+                        if partition_info.compile_classpath_entries
+                        else ()
+                    ),
+                    *(
+                        (f"--tool-classpath={':'.join(partition_info.rule_classpath_entries)}",)
+                        if partition_info.rule_classpath_entries
+                        else ()
+                    ),
+                    *(("--check",) if request.check_only else ()),
+                    *(
+                        f"--scalac-options={arg}"
+                        for arg in (
+                            scalac.parsed_args_for_resolve(partition_info.resolve_name) or ()
+                        )
+                    ),
+                    *(f"--files={file}" for file in request.snapshot.files),
+                ],
+                classpath_entries=partition_info.runtime_classpath_entries,
+                input_digest=merged_digest,
+                output_files=request.snapshot.files,
+                extra_jvm_options=scalafix.jvm_options,
+                extra_immutable_input_digests=partition_info.extra_immutable_input_digests,
+                use_nailgun=False,
+                description=f"Run `scalafix` on {pluralize(len(request.snapshot.files), 'file')}.",
+                level=LogLevel.DEBUG,
+            )
+        )
     )
 
 
 @rule
 async def scalafix_fix(request: ScalafixFixRequest.Batch) -> FixResult:
-    source_roots = await Get(
-        SourceRootsResult, SourceRootsRequest, SourceRootsRequest.for_files(request.snapshot.files)
-    )
-
-    # We need to strip the source files to get semantic rules find SemanticDB metadata in the classpath
-    stripped_source_files = await Get(StrippedSourceFiles, SourceFiles(request.snapshot, ()))
-
-    process_result = await Get(
-        FallibleProcessResult,
+    # scalafix CLI is given workspace-relative source paths; the compile
+    # classpath embeds SemanticDB at matching workspace-relative paths
+    # (see `compile_scala_source`), so scalafix's lookup resolves naturally.
+    process_result = await _run_scalafix_process(
         _ScalafixProcess(
-            snapshot=stripped_source_files.snapshot,
+            snapshot=request.snapshot,
             partition_info=cast(ScalafixPartitionInfo, request.partition_metadata),
             check_only=False,
         ),
+        **implicitly(),
     )
 
-    # We need now to restore the source roots
-    result_snapshot = await _restore_source_roots(source_roots, process_result.output_digest)
+    result_snapshot = await digest_to_snapshot(**implicitly(process_result.output_digest))
     output_simplifier = Simplifier()
 
     return FixResult(
@@ -362,27 +353,18 @@ async def scalafix_fix(request: ScalafixFixRequest.Batch) -> FixResult:
 
 @rule
 async def scalafix_lint(request: ScalafixLintRequest.Batch) -> LintResult:
-    # We need to strip the source files to get semantic rules find SemanticDB metadata in the classpath
-    source_snapshot = await Get(Snapshot, PathGlobs(request.elements))
-    stripped_source_files = await Get(StrippedSourceFiles, SourceFiles(source_snapshot, ()))
+    source_snapshot = await digest_to_snapshot(**implicitly(PathGlobs(request.elements)))
 
-    process_result = await Get(
-        FallibleProcessResult,
+    process_result = await _run_scalafix_process(
         _ScalafixProcess(
-            snapshot=stripped_source_files.snapshot,
+            snapshot=source_snapshot,
             partition_info=cast(ScalafixPartitionInfo, request.partition_metadata),
             check_only=True,
         ),
+        **implicitly(),
     )
 
     return LintResult.create(request, process_result)
-
-
-@rule
-async def generate_scalafix_lockfile_request(
-    _: ScalafixToolLockfileSentinel, tool: ScalafixSubsystem
-) -> GenerateJvmLockfileFromTool:
-    return GenerateJvmLockfileFromTool.create(tool)
 
 
 def rules():
@@ -391,5 +373,5 @@ def rules():
         *lockfile.rules(),
         *ScalafixFixRequest.rules(),
         *ScalafixLintRequest.rules(),
-        UnionRule(GenerateToolLockfileSentinel, ScalafixToolLockfileSentinel),
+        UnionRule(ExportableTool, ScalafixSubsystem),
     ]

@@ -83,7 +83,10 @@ def rule_runner() -> RuleRunner:
     )
     source_root_patterns = ("src/*",)
     rule_runner.set_options(
-        [f"--source-root-patterns={repr(source_root_patterns)}"],
+        [
+            f"--source-root-patterns={repr(source_root_patterns)}",
+            "--helm-infer-external-docker-images=['busybox']",
+        ],
         env_inherit=PYTHON_BOOTSTRAP_ENV,
     )
     return rule_runner
@@ -119,10 +122,28 @@ def test_can_prepare_post_renderer(rule_runner: RuleRunner) -> None:
             "src/mychart/values.yaml": dedent(
                 """\
                 pods: []
+                conditionalPodEnabled: false
                 """
             ),
             "src/mychart/templates/_helpers.tpl": HELM_TEMPLATE_HELPERS_FILE,
             "src/mychart/templates/configmap.yaml": _TEST_GIVEN_CONFIGMAP_FILE,
+            "src/mychart/templates/conditional-pod.yaml": dedent(
+                """\
+                # Conditional pod that should not break dependency inference when
+                # it is not enabled. When not enabled, this manifest will consist
+                # of _only_ these comment lines, which will not be parsable.
+                {{- if .Values.conditionalPodEnabled }}
+                apiVersion: v1
+                kind: Pod
+                metadata:
+                  name: conditional-pod
+                spec:
+                  containers:
+                    - name: busy
+                      image: busybox:1.29
+                {{- end }}
+                """
+            ),
             "src/mychart/templates/pod.yaml": dedent(
                 """\
                 {{- $root := . -}}

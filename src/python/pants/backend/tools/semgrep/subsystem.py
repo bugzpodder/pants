@@ -3,16 +3,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 from pants.backend.python.subsystems.python_tool_base import PythonToolBase
 from pants.backend.python.target_types import ConsoleScript
+from pants.core.goals.resolves import ExportableTool
 from pants.engine.rules import Rule, collect_rules
 from pants.engine.target import Dependencies, FieldSet, SingleSourceField, Target
 from pants.engine.unions import UnionRule
-from pants.option.option_types import ArgsListOption, BoolOption, SkipOption
+from pants.option.option_types import ArgsListOption, BoolOption, SkipOption, StrOption
 from pants.util.strutil import softwrap
+
+# pants: infer-dep(semgrep.lock*)
 
 
 @dataclass(frozen=True)
@@ -30,7 +33,7 @@ class SemgrepFieldSet(FieldSet):
 class SemgrepSubsystem(PythonToolBase):
     name = "Semgrep"
     options_scope = "semgrep"
-    help = softwrap(
+    help_short = softwrap(
         """
         Lightweight static analysis for many languages. Find bug variants with patterns that look
         like source code. (https://semgrep.dev/)
@@ -42,12 +45,34 @@ class SemgrepSubsystem(PythonToolBase):
     )
 
     default_main = ConsoleScript("semgrep")
-    default_requirements = ["semgrep>=1.20.0,<2"]
+    default_requirements = [
+        "semgrep>=1.20.0,<2",
+        # As of version 1.79.0, semgrep depends on outdated opentelemetry packages, that
+        # themselves depend on the deprecated pkg_resources API, leading to warnings.
+        # When semgrep updates its own requirements appropriately, we can remove these pins.
+        # See https://github.com/semgrep/semgrep/issues/11069.
+        "opentelemetry-api~=1.34.1",
+        "opentelemetry-sdk~=1.34.1",
+        "opentelemetry-exporter-otlp-proto-http~=1.34.1",
+        "opentelemetry-instrumentation-requests~=0.55b1",
+    ]
 
     register_interpreter_constraints = True
 
     register_lockfile = True
     default_lockfile_resource = ("pants.backend.tools.semgrep", "semgrep.lock")
+
+    config_name = StrOption(
+        default=None,
+        help=softwrap(
+            """
+            The name of the semgrep config file or directory, which will be discovered and used
+            hierarchically. If using a file, it must have the extension `.yaml` or `.yml`.
+
+            URLs and registry names are not supported.
+            """
+        ),
+    )
 
     args = ArgsListOption(
         example="--verbose",
@@ -73,4 +98,7 @@ class SemgrepSubsystem(PythonToolBase):
 
 
 def rules() -> Iterable[Rule | UnionRule]:
-    return collect_rules()
+    return [
+        *collect_rules(),
+        UnionRule(ExportableTool, SemgrepSubsystem),
+    ]

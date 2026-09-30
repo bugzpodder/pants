@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
+import re
 from textwrap import dedent
 
 from pants.testutil.pants_integration_test import PantsResult, run_pants, setup_tmpdir
-from pants.testutil.python_interpreter_selection import skip_unless_python39_present
+from pants.testutil.python_interpreter_selection import skip_unless_python310_present
 
 SOURCES = {
     # NB: This uses recursive globs for the `python_sources` and `python_tests` target generators,
@@ -54,12 +55,17 @@ SOURCES = {
 }
 
 
+def _assert_succeeded(test_result: str, target: str) -> None:
+    pattern = re.escape(target) + r" \([^)]+\) - succeeded\."
+    assert re.search(pattern, test_result), f"Expected '{target}' succeeded in output"
+
+
 def run(args: list[str]) -> PantsResult:
     result = run_pants(
         [
             "--backend-packages=pants.backend.python",
             "--backend-packages=pants.backend.experimental.go",
-            "--python-interpreter-constraints=['==3.9.*']",
+            "--python-interpreter-constraints=['==3.10.*']",
             "--pants-ignore=__pycache__",
             *args,
         ]
@@ -68,7 +74,7 @@ def run(args: list[str]) -> PantsResult:
     return result
 
 
-@skip_unless_python39_present
+@skip_unless_python310_present
 def test_address_literal() -> None:
     """Semantics:
 
@@ -80,12 +86,12 @@ def test_address_literal() -> None:
         assert run(["list", *list_specs]).stdout.splitlines() == list_specs
 
         test_result = run(["test", f"{tmpdir}/py:tests"]).stderr
-        assert f"{tmpdir}/py/utils/strutil_test.py:../tests - succeeded." in test_result
-        assert f"{tmpdir}/py/base/common_test.py:../tests - succeeded." in test_result
+        _assert_succeeded(test_result, f"{tmpdir}/py/utils/strutil_test.py:../tests")
+        _assert_succeeded(test_result, f"{tmpdir}/py/base/common_test.py:../tests")
         assert f"{tmpdir}/py:tests" not in test_result
 
 
-@skip_unless_python39_present
+@skip_unless_python310_present
 def test_sibling_addresses() -> None:
     """Semantics:
 
@@ -109,19 +115,19 @@ def test_sibling_addresses() -> None:
         # Even though no `python_test` targets are explicitly defined in `util/`, a generated
         # target is resident there.
         test_result = run(["test", f"{tmpdir}/py/utils:"]).stderr
-        assert f"{tmpdir}/py/utils/strutil_test.py:../tests - succeeded." in test_result
+        _assert_succeeded(test_result, f"{tmpdir}/py/utils/strutil_test.py:../tests")
         assert f"{tmpdir}/py/base/common_test.py:../tests" not in test_result
         assert f"{tmpdir}/py:tests" not in test_result
 
         # Even though no `_test.py` files live in this dir, we match the `python_tests` target
         # and replace it with its generated targets.
         test_result = run(["test", f"{tmpdir}/py:"]).stderr
-        assert f"{tmpdir}/py/utils/strutil_test.py:../tests - succeeded." in test_result
+        _assert_succeeded(test_result, f"{tmpdir}/py/utils/strutil_test.py:../tests")
         assert f"{tmpdir}/py/base/common_test.py:../tests" in test_result
         assert f"{tmpdir}/py:tests" not in test_result
 
 
-@skip_unless_python39_present
+@skip_unless_python310_present
 def test_descendent_addresses() -> None:
     """Semantics are the same as sibling addresses, only recursive."""
     with setup_tmpdir(SOURCES) as tmpdir:
@@ -137,12 +143,12 @@ def test_descendent_addresses() -> None:
         ]
 
         test_result = run(["test", f"{tmpdir}/py::"]).stderr
-        assert f"{tmpdir}/py/utils/strutil_test.py:../tests - succeeded." in test_result
+        _assert_succeeded(test_result, f"{tmpdir}/py/utils/strutil_test.py:../tests")
         assert f"{tmpdir}/py/base/common_test.py:../tests" in test_result
         assert f"{tmpdir}/py:tests" not in test_result
 
 
-@skip_unless_python39_present
+@skip_unless_python310_present
 def test_file_arg() -> None:
     """Semantics: find the 'owning' target, using generated target rather than target generator
     when possible (regardless of project introspection vs. "build" goal).
@@ -154,3 +160,31 @@ def test_file_arg() -> None:
             f"{tmpdir}/py/app.py:lib",
             f"{tmpdir}/py/utils/strutil_test.py:../tests",
         ]
+
+
+def test_build_ignore_list() -> None:
+    with setup_tmpdir({"dir/BUILD": "target()"}) as tmpdir:
+        ignore_result = run_pants([f"--build-ignore={tmpdir}/dir", "list", f"{tmpdir}/dir:dir"])
+        no_ignore_result = run_pants(["list", f"{tmpdir}/dir:dir"])
+    ignore_result.assert_failure()
+    assert f"{tmpdir}/dir" in ignore_result.stderr
+    no_ignore_result.assert_success()
+    assert f"{tmpdir}/dir" in no_ignore_result.stdout
+
+
+def test_build_ignore_dependency() -> None:
+    sources = {
+        "dir1/f.txt": "",
+        "dir1/BUILD": "files(sources=['*.txt'])",
+        "dir2/f.txt": "",
+        "dir2/BUILD": "files(sources=['*.txt'], dependencies=['{tmpdir}/dir1'])",
+    }
+    with setup_tmpdir(sources) as tmpdir:
+        ignore_result = run_pants(
+            [f"--build-ignore={tmpdir}/dir1", "dependencies", f"{tmpdir}/dir2/f.txt"]
+        )
+        no_ignore_result = run_pants(["dependencies", f"{tmpdir}/dir2/f.txt"])
+    ignore_result.assert_failure()
+    assert f"{tmpdir}/dir1" in ignore_result.stderr
+    no_ignore_result.assert_success()
+    assert f"{tmpdir}/dir1" in no_ignore_result.stdout

@@ -5,9 +5,10 @@
 #  https://www.python.org/dev/peps/pep-0503/#normalized-names.
 
 import re
+from collections.abc import Callable
 from enum import Enum
 from functools import partial
-from typing import Callable, Dict, List, Match, Tuple
+from re import Match
 
 
 class PackageSeparator(Enum):
@@ -83,7 +84,7 @@ the replacement. see re.sub for more information
 then if an import in the python code is google.cloud.foo, then the package of
 google-cloud-foo will be used.
 """
-DEFAULT_MODULE_PATTERN_MAPPING: Dict[re.Pattern, List[Callable[[Match[str]], str]]] = {
+DEFAULT_MODULE_PATTERN_MAPPING: dict[re.Pattern, list[Callable[[Match[str]], str]]] = {
     re.compile(r"""^azure-.+"""): [all_hyphen_to_dot],
     re.compile(r"""^django-((.+(-.+)?))"""): [first_group_hyphen_to_underscore],
     # See https://github.com/googleapis/google-cloud-python#libraries for all Google cloud
@@ -100,41 +101,58 @@ DEFAULT_MODULE_PATTERN_MAPPING: Dict[re.Pattern, List[Callable[[Match[str]], str
     ],
     re.compile(r"""^oslo-.+"""): [all_hyphen_to_underscore],
     re.compile(r"""^python-(.+)"""): [first_group_hyphen_to_underscore],
+    re.compile(r"""^apache-(airflow-providers-.+)"""): [first_group_hyphen_to_dot],
 }
 
-DEFAULT_MODULE_MAPPING: Dict[str, Tuple[str, ...]] = {
+DEFAULT_MODULE_MAPPING: dict[str, tuple[str, ...]] = {
     "absl-py": ("absl",),
     "acryl-datahub": ("datahub",),
+    "amplitude-analytics": ("amplitude",),
     "ansicolors": ("colors",),
     "antlr4-python3-runtime": ("antlr4",),
     "apache-airflow": ("airflow",),
+    "apache-airflow-client": ("airflow_client",),
+    "apache-airflow-mypy": ("airflow_mypy",),
     "atlassian-python-api": ("atlassian",),
     "attrs": ("attr", "attrs"),
     "auth0-python": ("auth0",),
+    "bandwidth-sdk": ("bandwidth",),
     "beautifulsoup4": ("bs4",),
     "biopython": ("Bio", "BioSQL"),
     "bitvector": ("BitVector",),
     "cattrs": ("cattr", "cattrs"),
     "cloud-sql-python-connector": ("google.cloud.sql.connector",),
+    "confluent-kafka": ("confluent_kafka",),
     "coolprop": ("CoolProp",),
+    "databricks-connect": ("databricks.connect",),
     "databricks-sdk": ("databricks.sdk",),
     "databricks-sql-connector": (
         "databricks.sql",
         "databricks.sqlalchemy",
     ),
+    "databricks-vectorsearch": ("databricks.vector_search",),
+    "dbt-core": ("dbt",),
+    "dbt-databricks": ("dbt.adapters.databricks",),
+    "drf-openapi-tester": ("openapi_tester",),
     "delta-spark": ("delta",),
+    "discord-py": ("discord",),
     "django-activity-stream": ("actstream",),
     "django-cors-headers": ("corsheaders",),
     "django-countries": ("django_countries",),
+    "django-extensions": ("django_extensions",),
+    "django-fernet-fields-v2": ("fernet_fields",),
     "django-filter": ("django_filters",),
     "django-fsm": ("django_fsm",),
+    "django-money": ("djmoney",),
     "django-notifications-hq": ("notifications",),
     "django-oauth-toolkit": ("oauth2_provider",),
     "django-object-actions": ("django_object_actions",),
     "django-postgres-extra": ("psqlextra",),
+    "django-pylibmc": ("django_pylibmc",),
     "django-redis": ("django_redis",),
     "django-scim2": ("django_scim",),
     "django-two-factor-auth": ("two_factor",),
+    "django-user-agents": ("django_user_agents",),
     "djangorestframework": ("rest_framework",),
     "djangorestframework-api-key": ("rest_framework_api_key",),
     "djangorestframework-dataclasses": ("rest_framework_dataclasses",),
@@ -150,7 +168,11 @@ DEFAULT_MODULE_MAPPING: Dict[str, Tuple[str, ...]] = {
     "faiss-gpu": ("faiss",),
     "fluent-logger": ("fluent",),
     "fonttools": ("fontTools",),
+    "fpdf2": ("fpdf",),
     "gitpython": ("git",),
+    "google-ads": ("google.ads.googleads",),
+    "google-analytics-data": ("google.analytics.data_v1beta",),
+    "google-api-core": ("google.api_core",),
     "google-api-python-client": ("googleapiclient",),
     "google-auth": (
         "google.auth",
@@ -158,20 +180,24 @@ DEFAULT_MODULE_MAPPING: Dict[str, Tuple[str, ...]] = {
     ),
     "graphql-core": ("graphql",),
     "grpcio": ("grpc",),
+    "grpcio-channelz": ("grpcio_channelz",),
     "grpcio-health-checking": ("grpc_health",),
     "grpcio-reflection": ("grpc_reflection",),
     "grpcio-status": ("grpc_status",),
     "grpcio-testing": ("grpc_testing",),
+    "hdrhistogram": ("hdrh",),
     "honeycomb-opentelemetry": ("honeycomb.opentelemetry",),
     "ipython": ("IPython",),
     "jack-client": ("jack",),
     "kafka-python": ("kafka",),
     "lark-parser": ("lark",),
     "launchdarkly-server-sdk": ("ldclient",),
+    "lingua-language-detector": ("lingua",),
     "mail-parser": ("mailparser",),
     "matplotlib": ("matplotlib", "mpl_toolkits"),
     "matrix-nio": ("nio",),
     "mysql-connector-python": ("mysql.connector",),
+    "mysqlclient": ("MySQLdb",),
     "netcdf4": ("netCDF4",),
     "o365": ("O365",),
     "opencv-python": ("cv2",),
@@ -195,6 +221,7 @@ DEFAULT_MODULE_MAPPING: Dict[str, Tuple[str, ...]] = {
     "opentelemetry-exporter-otlp-proto-grpc": ("opentelemetry.exporter.otlp.proto.grpc",),
     "opentelemetry-exporter-otlp-proto-http": ("opentelemetry.exporter.otlp.proto.http",),
     "opentelemetry-instrumentation-kafka-python": ("opentelemetry.instrumentation.kafka",),
+    "opentelemetry-proto": ("opentelemetry.proto",),
     "opentelemetry-sdk": ("opentelemetry.sdk",),
     "opentelemetry-semantic-conventions": ("opentelemetry.semconv",),
     "opentelemetry-test-utils": ("opentelemetry.test",),
@@ -212,10 +239,11 @@ DEFAULT_MODULE_MAPPING: Dict[str, Tuple[str, ...]] = {
     "pygithub": ("github",),
     "pygobject": ("gi",),
     "pyhamcrest": ("hamcrest",),
+    "pyicu": ("icu",),
     "pyjwt": ("jwt",),
     "pykube-ng": ("pykube",),
     "pymongo": ("bson", "gridfs", "pymongo"),
-    "pymupdf": ("fitz",),
+    "pymupdf": ("fitz", "pymupdf"),
     "pynacl": ("nacl",),
     "pyopenssl": ("OpenSSL",),
     "pypdf2": ("PyPDF2",),
@@ -236,30 +264,42 @@ DEFAULT_MODULE_MAPPING: Dict[str, Tuple[str, ...]] = {
     "scikit-image": ("skimage",),
     "scikit-learn": ("sklearn",),
     "scikit-video": ("skvideo",),
+    "segment-analytics-python": ("segment.analytics",),
     "sisl": ("sisl", "sisl_toolbox"),
     "setuptools": ("easy_install", "pkg_resources", "setuptools"),
     "snowflake-connector-python": ("snowflake.connector",),
     "snowflake-snowpark-python": ("snowflake.snowpark",),
     "snowflake-sqlalchemy": ("snowflake.sqlalchemy",),
+    "social-auth-app-django": ("social_django",),
+    "social-auth-core": ("social_core",),
     "sseclient-py": ("sseclient",),
     "strawberry-graphql": ("strawberry",),
     "streamlit-aggrid": ("st_aggrid",),
+    "testcontainers-opensearch": ("testcontainers.opensearch",),
+    "umap-learn": ("umap",),
+    "unittest-xml-reporting": ("xmlrunner",),
     "unleashclient": ("UnleashClient",),
+    "uuid7": ("uuid_extensions",),
     "websocket-client": ("websocket",),
 }
 
-DEFAULT_TYPE_STUB_MODULE_PATTERN_MAPPING: Dict[re.Pattern, List[Callable[[Match[str]], str]]] = {
+DEFAULT_TYPE_STUB_MODULE_PATTERN_MAPPING: dict[re.Pattern, list[Callable[[Match[str]], str]]] = {
     re.compile(r"""^stubs[_-](.+)"""): [first_group_hyphen_to_underscore],
     re.compile(r"""^types[_-](.+)"""): [first_group_hyphen_to_underscore],
     re.compile(r"""^(.+)[_-]stubs"""): [first_group_hyphen_to_underscore],
     re.compile(r"""^(.+)[_-]types"""): [first_group_hyphen_to_underscore],
 }
 
-DEFAULT_TYPE_STUB_MODULE_MAPPING: Dict[str, Tuple[str, ...]] = {
+DEFAULT_TYPE_STUB_MODULE_MAPPING: dict[str, tuple[str, ...]] = {
     "djangorestframework-types": ("rest_framework",),
     "lark-stubs": ("lark",),
     "types-beautifulsoup4": ("bs4",),
     "types-enum34": ("enum34",),
+    "types-grpcio": ("grpc",),
+    "types-grpcio-channelz": ("grpcio_channelz",),
+    "types-grpcio-health-checking": ("grpc_health",),
+    "types-grpcio-reflection": ("grpc_reflection",),
+    "types-grpcio-status": ("grpc_status",),
     "types-pillow": ("PIL",),
     "types-protobuf": ("google.protobuf",),
     "types-pycrypto": ("Crypto",),

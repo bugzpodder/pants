@@ -6,22 +6,28 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import textwrap
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, cast
+from typing import cast
 
 from pants.backend.python.subsystems.python_tool_base import PythonToolBase
 from pants.backend.python.subsystems.setup import PythonSetup
-from pants.backend.python.target_types import PexLayout
+from pants.backend.python.target_types import PexLayout, PythonResolveField, PythonSourceField
 from pants.backend.python.util_rules.interpreter_constraints import InterpreterConstraints
 from pants.backend.python.util_rules.local_dists_pep660 import (
-    EditableLocalDists,
     EditableLocalDistsRequest,
+    build_editable_local_dists,
 )
-from pants.backend.python.util_rules.pex import Pex, PexProcess, PexRequest, VenvPex, VenvPexProcess
+from pants.backend.python.util_rules.pex import (
+    PexRequest,
+    create_pex,
+    create_venv_pex,
+    find_interpreter,
+)
 from pants.backend.python.util_rules.pex_cli import PexPEX
-from pants.backend.python.util_rules.pex_environment import PexEnvironment
+from pants.backend.python.util_rules.pex_environment import PexEnvironment, PythonExecutable
 from pants.backend.python.util_rules.pex_requirements import EntireLockfile, Lockfile
 from pants.core.goals.export import (
     Export,
@@ -33,13 +39,19 @@ from pants.core.goals.export import (
     PostProcessingCommand,
 )
 from pants.core.goals.resolves import ExportableTool
+from pants.core.util_rules.source_files import SourceFiles
+from pants.core.util_rules.stripped_source_files import strip_source_roots
 from pants.engine.engine_aware import EngineAwareParameter
-from pants.engine.internals.native_engine import AddPrefix, Digest, MergeDigests, Snapshot
-from pants.engine.internals.selectors import Get, MultiGet
-from pants.engine.process import ProcessCacheScope, ProcessResult
-from pants.engine.rules import collect_rules, rule
+from pants.engine.fs import CreateDigest, FileContent
+from pants.engine.internals.graph import hydrate_sources
+from pants.engine.internals.native_engine import EMPTY_DIGEST, AddPrefix, Digest, MergeDigests
+from pants.engine.internals.selectors import concurrently
+from pants.engine.intrinsics import add_prefix, create_digest, digest_to_snapshot, merge_digests
+from pants.engine.process import Process, ProcessCacheScope, execute_process_or_raise
+from pants.engine.rules import collect_rules, implicitly, rule
+from pants.engine.target import AllTargets, HydrateSourcesRequest, SourcesField
 from pants.engine.unions import UnionMembership, UnionRule
-from pants.option.option_types import BoolOption, EnumOption, StrListOption
+from pants.option.option_types import EnumOption, StrListOption
 from pants.util.strutil import path_safe, softwrap
 
 logger = logging.getLogger(__name__)
@@ -84,39 +96,38 @@ class ExportPluginOptions:
         help=softwrap(
             """
             When exporting a mutable virtualenv for a resolve, do PEP-660 editable installs
-            of all 'python_distribution' targets that own code in the exported resolve.
+            of all `python_distribution` targets that own code in the exported resolve.
 
-            If a resolve name is not in this list, 'python_distribution' targets will not
+            If a resolve name is not in this list, `python_distribution` targets will not
             be installed in the virtualenv. This defaults to an empty list for backwards
             compatibility and to prevent unnecessary work to generate and install the
             PEP-660 editable wheels.
 
-            This only applies when '[python].enable_resolves' is true and when exporting a
-            'mutable_virtualenv' ('symlinked_immutable_virtualenv' exports are not "full"
-            virtualenvs because they must not be edited, and do not include 'pip').
+            This only applies when `[python].enable_resolves` is true and when exporting a
+            `mutable_virtualenv` (`symlinked_immutable_virtualenv` exports are not "full"
+            virtualenvs because they must not be edited, and do not include `pip`).
             """
         ),
         advanced=True,
     )
 
-    py_hermetic_scripts = BoolOption(
-        default=True,
+    py_non_hermetic_scripts_in_resolve = StrListOption(
         help=softwrap(
             """
-            When exporting a mutable virtualenv for a resolve, by default
-            modify console script shebang lines to make them "hermetic".
-            The shebang of hermetic console scripts uses the python args: `-sE`:
+            When exporting a mutable virtualenv for a resolve listed in this option, by default
+            console script shebang lines will be made "hermetic". Specifically, the shebang of
+            hermetic console scripts will uses the python args `-sE` where:
 
-            - `-s` skips inclusion of the user site-packages directoy,
-            - `-E` ignores all `PYTHON*` env vars like `PYTHONPATH`.
+              - `-s` skips inclusion of the user site-packages directory,
+              - `-E` ignores all `PYTHON*` env vars like `PYTHONPATH`.
 
-            Set this to false if you need non-hermetic scripts with
-            simple python shebangs that respect vars like `PYTHONPATH`,
-            to, for example, allow IDEs like PyCharm to inject its debugger,
+            If you need "non-hermetic" scripts for a partcular resolve, then add that resolve's name
+            to this option. This will allow simple python shebangs that respect vars like
+            `PYTHONPATH`, which, for example, will allow IDEs like PyCharm to inject its debugger,
             coverage, or other IDE-specific libs when running a script.
 
-            This only applies when when exporting a 'mutable_virtualenv'
-            ('symlinked_immutable_virtualenv' exports are not "full"
+            This only applies when when exporting a `mutable_virtualenv`
+            (`symlinked_immutable_virtualenv` exports are not "full"
             virtualenvs because they are used internally by pants itself.
             Pants requires hermetic scripts to provide its reproduciblity
             guarantee, fine-grained caching, and other features).
@@ -125,29 +136,49 @@ class ExportPluginOptions:
         advanced=True,
     )
 
-
-async def _get_full_python_version(pex_or_venv_pex: Pex | VenvPex) -> str:
-    # Get the full python version (including patch #).
-    is_venv_pex = isinstance(pex_or_venv_pex, VenvPex)
-    kwargs: dict[str, Any] = dict(
-        description="Get interpreter version",
-        argv=[
-            "-c",
-            "import sys; print('.'.join(str(x) for x in sys.version_info[0:3]))",
-        ],
-        extra_env={"PEX_INTERPRETER": "1"},
+    py_generated_sources_in_resolve = StrListOption(
+        help=softwrap(
+            """
+            When exporting a mutable virtualenv for a resolve listed in this option, generate sources which result from
+            code generation (for example, the `protobuf_sources` and `thrift_sources` target types) into the mutable
+            virtualenv exported for that resolve. Generated sources will be placed in the appropriate location within
+            the site-packages directory of the mutable virtualenv.
+            """
+        ),
+        advanced=True,
     )
-    if is_venv_pex:
-        kwargs["venv_pex"] = pex_or_venv_pex
-        res = await Get(ProcessResult, VenvPexProcess(**kwargs))
-    else:
-        kwargs["pex"] = pex_or_venv_pex
-        res = await Get(ProcessResult, PexProcess(**kwargs))
+
+
+async def _get_full_python_version(python: PythonExecutable) -> str:
+    # Get the full python version (including patch #).
+    argv = [
+        python.path,
+        "-c",
+        "import sys; print('.'.join(str(x) for x in sys.version_info[0:3]))",
+    ]
+    res = await execute_process_or_raise(
+        **implicitly(Process(argv, description="Get interpreter version"))
+    )
+    return res.stdout.strip().decode()
+
+
+async def _get_abi_thread_suffix(python: PythonExecutable) -> str:
+    # The suffix (e.g. "t" for a free-threaded build, else "") that venvs append to their
+    # `lib/pythonX.Y{suffix}/site-packages` directory name.
+    argv = [
+        python.path,
+        "-c",
+        "import sysconfig; print(sysconfig.get_config_var('abi_thread') or '')",
+    ]
+    res = await execute_process_or_raise(
+        **implicitly(Process(argv, description="Get interpreter ABI thread suffix"))
+    )
     return res.stdout.strip().decode()
 
 
 @dataclass(frozen=True)
 class VenvExportRequest:
+    py_version: str
     pex_request: PexRequest
     dest_prefix: str
     resolve_name: str
@@ -185,18 +216,16 @@ async def do_export(
         #  (or a memoized rule) we force the process to rerun per-session.
         #  This does mean re-running the process superfluously when the named cache is intact, but
         #  that is generally fast, since all wheels are already cached, and it's best to be safe.
-        requirements_venv_pex = await Get(
-            VenvPex,
-            PexRequest,
-            dataclasses.replace(req.pex_request, cache_scope=ProcessCacheScope.PER_SESSION),
+        session_request = dataclasses.replace(
+            req.pex_request, cache_scope=ProcessCacheScope.PER_SESSION
         )
-        py_version = await _get_full_python_version(requirements_venv_pex)
+        requirements_venv_pex = await create_venv_pex(**implicitly({session_request: PexRequest}))
         # Note that for symlinking we ignore qualify_path_with_python_version and always qualify,
         # since we need some name for the symlink anyway.
-        dest = f"{dest_prefix}/{py_version}"
+        dest = f"{dest_prefix}/{req.py_version}"
         description = (
             f"symlink to immutable virtualenv for {req.resolve_name or 'requirements'} "
-            f"(using Python {py_version})"
+            f"(using Python {req.py_version})"
         )
         venv_abspath = os.path.join(complete_pex_env.pex_root, requirements_venv_pex.venv_rel_dir)
         return ExportResult(
@@ -213,24 +242,23 @@ async def do_export(
     elif export_format == PythonResolveExportFormat.mutable_virtualenv:
         # Note that an internal-only pex will always have the `python` field set.
         # See the build_pex() rule and _determine_pex_python_and_platforms() helper in pex.py.
-        requirements_pex = await Get(Pex, PexRequest, req.pex_request)
+        requirements_pex = await create_pex(req.pex_request)
         assert requirements_pex.python is not None
-        py_version = await _get_full_python_version(requirements_pex)
         if req.qualify_path_with_python_version:
-            dest = f"{dest_prefix}/{py_version}"
+            dest = f"{dest_prefix}/{req.py_version}"
         else:
             dest = dest_prefix
         description = (
             f"mutable virtualenv for {req.resolve_name or 'requirements'} "
-            f"(using Python {py_version})"
+            f"(using Python {req.py_version})"
         )
 
-        merged_digest = await Get(Digest, MergeDigests([pex_pex.digest, requirements_pex.digest]))
+        merged_digest = await merge_digests(MergeDigests([pex_pex.digest, requirements_pex.digest]))
         tmpdir_prefix = f".{uuid.uuid4().hex}.tmp"
         tmpdir_under_digest_root = os.path.join("{digest_root}", tmpdir_prefix)
-        merged_digest_under_tmpdir = await Get(Digest, AddPrefix(merged_digest, tmpdir_prefix))
+        merged_digest_under_tmpdir = await add_prefix(AddPrefix(merged_digest, tmpdir_prefix))
 
-        venv_prompt = f"{req.resolve_name}/{py_version}" if req.resolve_name else py_version
+        venv_prompt = f"{req.resolve_name}/{req.py_version}" if req.resolve_name else req.py_version
 
         pex_args = [
             os.path.join(tmpdir_under_digest_root, requirements_pex.name),
@@ -240,7 +268,7 @@ async def do_export(
             f"--prompt={venv_prompt}",
             output_path,
         ]
-        if not export_subsys.options.py_hermetic_scripts:
+        if req.resolve_name in export_subsys.options.py_non_hermetic_scripts_in_resolve:
             pex_args.insert(-1, "--non-hermetic-scripts")
 
         post_processing_cmds = [
@@ -248,10 +276,11 @@ async def do_export(
                 complete_pex_env.create_argv(
                     os.path.join(tmpdir_under_digest_root, pex_pex.exe),
                     *pex_args,
+                    python=requirements_pex.python,
                 ),
                 {
-                    **complete_pex_env.environment_dict(python=requirements_pex.python),
-                    "PEX_MODULE": "pex.tools",
+                    **complete_pex_env.environment_dict(python_configured=True),
+                    "PEX_SCRIPT": "pex-tools",
                 },
             ),
             # Remove the requirements and pex pexes, to avoid confusion.
@@ -262,11 +291,15 @@ async def do_export(
         if req.editable_local_dists_digest is not None:
             # We need the snapshot to get the wheel file names which are something like:
             #   - pkg_name-1.2.3-0.editable-py3-none-any.whl
-            wheels_snapshot = await Get(Snapshot, Digest, req.editable_local_dists_digest)
+            wheels_snapshot = await digest_to_snapshot(req.editable_local_dists_digest)
             # We need the paths to the installed .dist-info directories to finish installation.
-            py_major_minor_version = ".".join(py_version.split(".", 2)[:2])
+            py_major_minor_version = ".".join(req.py_version.split(".", 2)[:2])
+            abi_thread_suffix = await _get_abi_thread_suffix(requirements_pex.python)
             lib_dir = os.path.join(
-                output_path, "lib", f"python{py_major_minor_version}", "site-packages"
+                output_path,
+                "lib",
+                f"python{py_major_minor_version}{abi_thread_suffix}",
+                "site-packages",
             )
             dist_info_dirs = [
                 # This builds: dist/.../resolve/3.8.9/lib/python3.8/site-packages/pkg_name-1.2.3.dist-info
@@ -334,12 +367,154 @@ class MaybeExportResult:
     result: ExportResult | None
 
 
+@dataclass(frozen=True)
+class _ExportPythonCodegenRequest:
+    resolve: str
+
+
+@dataclass(frozen=True)
+class _ExportPythonCodegenResult:
+    digest: Digest
+
+
+@dataclass(frozen=True)
+class _ExportPythonCodegenSetup:
+    PKG_DIR = "__pants_codegen__"
+    SCRIPT_NAME = "codegen_setup.py"
+
+    setup_script_digest: Digest
+
+
+@rule
+async def python_codegen_export_setup() -> _ExportPythonCodegenSetup:
+    codegen_setup_script_digest = await create_digest(
+        CreateDigest(
+            [
+                FileContent(
+                    path=f"{_ExportPythonCodegenSetup.PKG_DIR}/{_ExportPythonCodegenSetup.SCRIPT_NAME}",
+                    is_executable=True,
+                    content=textwrap.dedent(
+                        f"""\
+                        import os
+                        import shutil
+                        import site
+                        import sys
+
+                        site_packages_dirs = site.getsitepackages()
+                        if not site_packages_dirs:
+                            raise Exception("Unable to determine location of site-packages directory in venv.")
+                        site_packages_dir = site_packages_dirs[0]
+
+                        codegen_dir = sys.argv[1]
+
+                        for item in os.listdir(codegen_dir):
+                            if item == "{_ExportPythonCodegenSetup.SCRIPT_NAME}":
+                                continue
+                            src = os.path.join(codegen_dir, item)
+                            dest = os.path.join(site_packages_dir, item)
+                            shutil.copytree(src, dest, dirs_exist_ok=True)
+                            shutil.rmtree(src)
+                        """
+                    ).encode(),
+                )
+            ]
+        )
+    )
+
+    return _ExportPythonCodegenSetup(codegen_setup_script_digest)
+
+
+@rule
+async def export_python_codegen(
+    request: _ExportPythonCodegenRequest, python_setup: PythonSetup, all_targets: AllTargets
+) -> _ExportPythonCodegenResult:
+    non_python_sources_in_python_resolve = [
+        tgt.get(SourcesField)
+        for tgt in all_targets
+        if tgt.has_field(PythonResolveField)
+        and tgt[PythonResolveField].normalized_value(python_setup) == request.resolve
+        and tgt.has_field(SourcesField)
+        and not tgt.has_field(PythonSourceField)
+    ]
+
+    if not non_python_sources_in_python_resolve:
+        return _ExportPythonCodegenResult(EMPTY_DIGEST)
+
+    hydrated_non_python_sources = await concurrently(
+        hydrate_sources(
+            HydrateSourcesRequest(
+                sources,
+                for_sources_types=(PythonSourceField,),
+                enable_codegen=True,
+            ),
+            **implicitly(),
+        )
+        for sources in non_python_sources_in_python_resolve
+    )
+
+    merged_snapshot = await digest_to_snapshot(
+        **implicitly(
+            MergeDigests(
+                hydrated_sources.snapshot.digest for hydrated_sources in hydrated_non_python_sources
+            )
+        )
+    )
+
+    stripped_source_files = await strip_source_roots(SourceFiles(merged_snapshot, ()))
+
+    return _ExportPythonCodegenResult(stripped_source_files.snapshot.digest)
+
+
+# Generate codegen Python sources and add them to the virtualenv to be exported.
+async def add_codegen_to_export_result(
+    resolve: str, export_result: ExportResult, codegen_setup: _ExportPythonCodegenSetup
+) -> ExportResult:
+    # Generate Python sources from codegen targets in this resolve.
+    codegen_result = await export_python_codegen(
+        _ExportPythonCodegenRequest(resolve=resolve), **implicitly()
+    )
+    if codegen_result.digest == EMPTY_DIGEST:
+        return export_result
+
+    codegen_digest = await add_prefix(
+        AddPrefix(codegen_result.digest, _ExportPythonCodegenSetup.PKG_DIR)
+    )
+    export_digest_with_codegen = await merge_digests(
+        MergeDigests([export_result.digest, codegen_digest, codegen_setup.setup_script_digest])
+    )
+
+    pkg_dir_path = os.path.join(
+        "{digest_root}",
+        _ExportPythonCodegenSetup.PKG_DIR,
+    )
+    script_path = os.path.join(pkg_dir_path, _ExportPythonCodegenSetup.SCRIPT_NAME)
+
+    codegen_post_processing_cmds = (
+        PostProcessingCommand(
+            [
+                os.path.join("{digest_root}", "bin", "python"),
+                script_path,
+                pkg_dir_path,
+            ]
+        ),
+        PostProcessingCommand(["rm", script_path]),
+        PostProcessingCommand(["rmdir", pkg_dir_path]),
+    )
+
+    return dataclasses.replace(
+        export_result,
+        digest=export_digest_with_codegen,
+        post_processing_cmds=export_result.post_processing_cmds + codegen_post_processing_cmds,
+    )
+
+
 @rule
 async def export_virtualenv_for_resolve(
     request: _ExportVenvForResolveRequest,
     python_setup: PythonSetup,
     export_subsys: ExportSubsystem,
     union_membership: UnionMembership,
+    codegen_setup: _ExportPythonCodegenSetup,
 ) -> MaybeExportResult:
     resolve = request.resolve
     lockfile_path = python_setup.resolves.get(resolve)
@@ -361,9 +536,7 @@ async def export_virtualenv_for_resolve(
             lockfile = None
 
     if not lockfile:
-        raise ExportError(
-            f"No resolve named {resolve} found in [{python_setup.options_scope}].resolves."
-        )
+        return MaybeExportResult(None)
 
     interpreter_constraints = InterpreterConstraints(
         python_setup.resolves_to_interpreter_constraints.get(
@@ -371,9 +544,12 @@ async def export_virtualenv_for_resolve(
         )
     )
 
+    python = await find_interpreter(interpreter_constraints, **implicitly())
+    py_version = await _get_full_python_version(python)
+
     if resolve in export_subsys.options.py_editable_in_resolve:
-        editable_local_dists = await Get(
-            EditableLocalDists, EditableLocalDistsRequest(resolve=resolve)
+        editable_local_dists = await build_editable_local_dists(
+            EditableLocalDistsRequest(resolve=resolve), **implicitly()
         )
         editable_local_dists_digest = editable_local_dists.optional_digest
     else:
@@ -385,22 +561,33 @@ async def export_virtualenv_for_resolve(
         internal_only=True,
         requirements=EntireLockfile(lockfile),
         sources=editable_local_dists_digest,
-        interpreter_constraints=interpreter_constraints,
+        python=python,
         # Packed layout should lead to the best performance in this use case.
         layout=PexLayout.PACKED,
     )
 
     dest_prefix = os.path.join("python", "virtualenvs")
-    export_result = await Get(
-        ExportResult,
+    export_result = await do_export(
         VenvExportRequest(
+            py_version,
             pex_request,
             dest_prefix,
             resolve,
             qualify_path_with_python_version=True,
             editable_local_dists_digest=editable_local_dists_digest,
         ),
+        **implicitly(),
     )
+
+    # Add generated Python sources from codegen targets to the mutable virtualenv.
+    if (
+        resolve in export_subsys.options.py_generated_sources_in_resolve
+        and export_subsys.options.py_resolve_format == PythonResolveExportFormat.mutable_virtualenv
+    ):
+        export_result = await add_codegen_to_export_result(
+            request.resolve, export_result, codegen_setup
+        )
+
     return MaybeExportResult(export_result)
 
 
@@ -409,12 +596,8 @@ async def export_virtualenvs(
     request: ExportVenvsRequest,
     export_subsys: ExportSubsystem,
 ) -> ExportResults:
-    if not export_subsys.options.resolve:
-        raise ExportError("Must specify at least one --resolve to export")
-    if request.targets:
-        raise ExportError("The `export` goal does not take target specs.")
-    maybe_venvs = await MultiGet(
-        Get(MaybeExportResult, _ExportVenvForResolveRequest(resolve))
+    maybe_venvs = await concurrently(
+        export_virtualenv_for_resolve(_ExportVenvForResolveRequest(resolve), **implicitly())
         for resolve in export_subsys.options.resolve
     )
     return ExportResults(mv.result for mv in maybe_venvs if mv.result is not None)

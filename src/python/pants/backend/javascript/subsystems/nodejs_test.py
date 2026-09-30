@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
 import stat
-from asyncio import Future
 from pathlib import Path
 from textwrap import dedent
 from typing import NoReturn
@@ -14,30 +14,44 @@ import pytest
 
 from pants.backend.javascript.subsystems import nodejs
 from pants.backend.javascript.subsystems.nodejs import (
+    CorepackToolDigest,
+    CorepackToolRequest,
     NodeJS,
     NodeJSBinaries,
+    NodeJSProcessEnvironment,
     _BinaryPathsPerVersion,
     _get_nvm_root,
     determine_nodejs_binaries,
+    node_process_environment,
 )
 from pants.backend.javascript.target_types import JSSourcesGeneratorTarget
 from pants.backend.python import target_types_rules
 from pants.core.util_rules import config_files, source_files
-from pants.core.util_rules.external_tool import (
-    DownloadedExternalTool,
-    ExternalToolRequest,
-    ExternalToolVersion,
-)
+from pants.core.util_rules.external_tool import DownloadedExternalTool, ExternalToolVersion
 from pants.core.util_rules.search_paths import (
     VersionManagerSearchPaths,
     VersionManagerSearchPathsRequest,
 )
-from pants.core.util_rules.system_binaries import BinaryNotFoundError, BinaryPath
+from pants.core.util_rules.system_binaries import (
+    BinaryNotFoundError,
+    BinaryPath,
+    BinaryPathRequest,
+    BinaryPaths,
+    BinaryShims,
+    BinaryShimsRequest,
+)
 from pants.engine.env_vars import EnvironmentVars, EnvironmentVarsRequest
-from pants.engine.internals.native_engine import EMPTY_DIGEST
+from pants.engine.fs import CreateDigest, Digest, MergeDigests, Snapshot
+from pants.engine.internals.native_engine import EMPTY_DIGEST, EMPTY_FILE_DIGEST
 from pants.engine.platform import Platform
-from pants.engine.process import ProcessResult
-from pants.testutil.rule_runner import MockGet, QueryRule, RuleRunner, run_rule_with_mocks
+from pants.engine.process import (
+    Process,
+    ProcessExecutionEnvironment,
+    ProcessResult,
+    ProcessResultMetadata,
+)
+from pants.testutil.option_util import create_subsystem
+from pants.testutil.rule_runner import QueryRule, RuleRunner, run_rule_with_mocks
 from pants.util.contextutil import temporary_dir
 
 
@@ -52,11 +66,41 @@ def rule_runner() -> RuleRunner:
             QueryRule(ProcessResult, [nodejs.NodeJSToolProcess]),
             QueryRule(NodeJSBinaries, ()),
             QueryRule(VersionManagerSearchPaths, (VersionManagerSearchPathsRequest,)),
+            QueryRule(CorepackToolDigest, (CorepackToolRequest,)),
         ],
         target_types=[JSSourcesGeneratorTarget],
     )
     rule_runner.set_options([], env_inherit={"PATH"})
     return rule_runner
+
+
+def get_snapshot(rule_runner: RuleRunner, digest: Digest) -> Snapshot:
+    return rule_runner.request(Snapshot, [digest])
+
+
+@pytest.mark.parametrize("package_manager", ["npm", "pnpm", "yarn"])
+def test_corepack_without_explicit_version_contains_installation(
+    rule_runner: RuleRunner, package_manager: str
+):
+    result = rule_runner.request(
+        CorepackToolDigest, [CorepackToolRequest(package_manager, version=None)]
+    )
+
+    snapshot = get_snapshot(rule_runner, result.digest)
+
+    assert f"._corepack_home/v1/{package_manager}" in snapshot.dirs
+
+
+@pytest.mark.parametrize("package_manager", ["npm@7.0.0", "pnpm@2.0.0", "yarn@1.0.0"])
+def test_corepack_with_explicit_version_contains_requested_installation(
+    rule_runner: RuleRunner, package_manager: str
+):
+    binary, version = package_manager.split("@")
+
+    result = rule_runner.request(CorepackToolDigest, [CorepackToolRequest(binary, version)])
+    snapshot = get_snapshot(rule_runner, result.digest)
+
+    assert f"._corepack_home/v1/{binary}/{version}" in snapshot.dirs
 
 
 def test_npm_process(rule_runner: RuleRunner):
@@ -117,11 +161,12 @@ def given_known_version(version: str) -> str:
 
 @pytest.fixture
 def mock_nodejs_subsystem() -> Mock:
-    nodejs_subsystem = Mock(spec=NodeJS)
-    future: Future[DownloadedExternalTool] = Future()
-    future.set_result(DownloadedExternalTool(EMPTY_DIGEST, ""))
-    nodejs_subsystem.download_known_version = MagicMock(return_value=future)
-    return nodejs_subsystem
+    with asyncio.Runner():
+        nodejs_subsystem = Mock(spec=NodeJS)
+        future: asyncio.Future[DownloadedExternalTool] = asyncio.Future()
+        future.set_result(DownloadedExternalTool(EMPTY_DIGEST, ""))
+        nodejs_subsystem.download_known_version = MagicMock(return_value=future)
+        return nodejs_subsystem
 
 
 _SEMVER_1_1_0 = given_known_version("1.1.0")
@@ -161,13 +206,6 @@ def test_node_version_from_semver_download(
     run_rule_with_mocks(
         determine_nodejs_binaries,
         rule_args=(nodejs_subsystem, Platform.linux_x86_64, _BinaryPathsPerVersion()),
-        mock_gets=[
-            MockGet(
-                DownloadedExternalTool,
-                (ExternalToolRequest,),
-                mock=lambda *_: DownloadedExternalTool(EMPTY_DIGEST, "myexe"),
-            ),
-        ],
     )
 
     nodejs_subsystem.download_known_version.assert_called_once_with(
@@ -212,9 +250,6 @@ def test_node_version_from_semver_bootstrap(
     result = run_rule_with_mocks(
         determine_nodejs_binaries,
         rule_args=(nodejs_subsystem, Platform.linux_x86_64, discoverable_versions),
-        mock_gets=[
-            MockGet(DownloadedExternalTool, (ExternalToolRequest,), mock=mock_download),
-        ],
     )
 
     assert result.binary_dir == expected_path
@@ -233,9 +268,6 @@ def test_finding_no_node_version_is_an_error(mock_nodejs_subsystem: Mock) -> Non
         run_rule_with_mocks(
             determine_nodejs_binaries,
             rule_args=(nodejs_subsystem, Platform.linux_x86_64, discoverable_versions),
-            mock_gets=[
-                MockGet(DownloadedExternalTool, (ExternalToolRequest,), mock=mock_download),
-            ],
         )
 
 
@@ -292,6 +324,164 @@ def test_get_nvm_root(env: dict[str, str], expected_directory: str | None) -> No
 
     result = run_rule_with_mocks(
         _get_nvm_root,
-        mock_gets=[MockGet(EnvironmentVars, (EnvironmentVarsRequest,), mock_environment_vars)],
+        mock_calls={
+            "pants.core.util_rules.env_vars.environment_vars_subset": mock_environment_vars,
+        },
     )
     assert result == expected_directory
+
+
+@pytest.mark.parametrize(
+    "extra_environment, expected",
+    [
+        pytest.param(
+            None,
+            {
+                "COREPACK_HOME": "{chroot}/._corepack_home",
+                "PATH": "{chroot}/shim_cache:._corepack:__node/v18",
+                "npm_config_cache": "npm_cache",
+            },
+            id="no_extra_environment",
+        ),
+        pytest.param(
+            {},
+            {
+                "COREPACK_HOME": "{chroot}/._corepack_home",
+                "PATH": "{chroot}/shim_cache:._corepack:__node/v18",
+                "npm_config_cache": "npm_cache",
+            },
+            id="empty_extra_environment",
+        ),
+        pytest.param(
+            {"PATH": "/usr/bin/"},
+            {
+                "COREPACK_HOME": "{chroot}/._corepack_home",
+                "PATH": "{chroot}/shim_cache:._corepack:__node/v18:/usr/bin/",
+                "npm_config_cache": "npm_cache",
+            },
+            id="extra_environment_extends_path",
+        ),
+        pytest.param(
+            {"PATH": "/usr/bin/", "SOME_VAR": "VAR"},
+            {
+                "COREPACK_HOME": "{chroot}/._corepack_home",
+                "PATH": "{chroot}/shim_cache:._corepack:__node/v18:/usr/bin/",
+                "npm_config_cache": "npm_cache",
+                "SOME_VAR": "VAR",
+            },
+            id="extra_environment_adds_to_environment",
+        ),
+        pytest.param(
+            {"npm_config_cache": "I am ignored"},
+            {
+                "COREPACK_HOME": "{chroot}/._corepack_home",
+                "PATH": "{chroot}/shim_cache:._corepack:__node/v18",
+                "npm_config_cache": "npm_cache",
+            },
+            id="extra_environment_cannot_override_some_vars",
+        ),
+    ],
+)
+def test_node_process_environment_variables_are_merged(
+    extra_environment: dict[str, str] | None, expected: dict[str, str]
+) -> None:
+    environment = NodeJSProcessEnvironment(
+        NodeJSBinaries("__node/v18"),
+        "npm_cache",
+        BinaryShims(EMPTY_DIGEST, "shim_cache"),
+        "._corepack_home",
+        "._corepack",
+        EnvironmentVars(),
+    )
+
+    assert environment.to_env_dict(extra_environment) == expected
+
+
+def test_node_process_environment_with_tools(rule_runner: RuleRunner) -> None:
+    def mock_get_binary_path(request: BinaryPathRequest) -> BinaryPaths:
+        # These are the tools that are required by default for any nodejs process to work.
+        default_required_tools = [
+            "sh",
+            "bash",
+            "mkdir",
+            "rm",
+            "touch",
+            "which",
+            "sed",
+            "dirname",
+            "uname",
+        ]
+        if request.binary_name in default_required_tools:
+            return BinaryPaths(
+                request.binary_name, paths=[BinaryPath(f"/bin/{request.binary_name}")]
+            )
+
+        if request.binary_name == "real-tool":
+            return BinaryPaths("real-tool", paths=[BinaryPath("/bin/a-real-tool")])
+
+        return BinaryPaths(request.binary_name, ())
+
+    def mock_get_binary_shims(request: BinaryShimsRequest) -> BinaryShims:
+        return BinaryShims(EMPTY_DIGEST, "cache_name")
+
+    def mock_environment_vars(request: EnvironmentVarsRequest) -> EnvironmentVars:
+        return EnvironmentVars({})
+
+    def mock_create_digest(request: CreateDigest) -> Digest:
+        return EMPTY_DIGEST
+
+    def mock_merge_digests(request: MergeDigests) -> Digest:
+        return EMPTY_DIGEST
+
+    def mock_enable_corepack_process_result(request: Process) -> ProcessResult:
+        return ProcessResult(
+            stdout=b"",
+            stdout_digest=EMPTY_FILE_DIGEST,
+            stderr=b"",
+            stderr_digest=EMPTY_FILE_DIGEST,
+            output_digest=EMPTY_DIGEST,
+            metadata=ProcessResultMetadata(
+                0,
+                ProcessExecutionEnvironment(
+                    environment_name=None,
+                    platform=Platform.create_for_localhost().value,
+                    docker_image=None,
+                    remote_execution=False,
+                    remote_execution_extra_platform_properties=[],
+                    execute_in_workspace=False,
+                    keep_sandboxes="never",
+                ),
+                "ran_locally",
+                0,
+            ),
+        )
+
+    def run(tools: list[str], optional_tools: list[str]) -> None:
+        nodejs_binaries = NodeJSBinaries("__node/v18")
+        nodejs_options = create_subsystem(
+            NodeJS,
+            tools=tools,
+            optional_tools=optional_tools,
+        )
+        nodejs_options_env_aware = MagicMock(spec=NodeJS.EnvironmentAware)
+
+        run_rule_with_mocks(
+            node_process_environment,
+            rule_args=[nodejs_binaries, nodejs_options, nodejs_options_env_aware],
+            mock_calls={
+                "pants.core.util_rules.env_vars.environment_vars_subset": mock_environment_vars,
+                "pants.core.util_rules.system_binaries.create_binary_shims": mock_get_binary_shims,
+                "pants.core.util_rules.system_binaries.find_binary": mock_get_binary_path,
+                "pants.engine.intrinsics.create_digest": mock_create_digest,
+                "pants.engine.intrinsics.merge_digests": mock_merge_digests,
+                "pants.engine.process.fallible_to_exec_result_or_raise": mock_enable_corepack_process_result,
+            },
+        )
+
+    run(tools=["real-tool"], optional_tools=[])
+
+    with pytest.raises(BinaryNotFoundError, match="Cannot find `nonexistent-tool`"):
+        run(tools=["real-tool", "nonexistent-tool"], optional_tools=[])
+
+    # Optional non-existent tool should still succeed.
+    run(tools=[], optional_tools=["real-tool", "nonexistent-tool"])

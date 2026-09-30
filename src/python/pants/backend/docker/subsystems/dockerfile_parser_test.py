@@ -11,8 +11,6 @@ from pants.backend.docker.subsystems.dockerfile_parser import rules as parser_ru
 from pants.backend.docker.target_types import DockerImageTarget
 from pants.backend.docker.util_rules.docker_build_args import DockerBuildArgs
 from pants.backend.docker.util_rules.dockerfile import rules as dockerfile_rules
-from pants.backend.python.target_types import PexBinary
-from pants.backend.python.util_rules.pex import rules as pex_rules
 from pants.engine.addresses import Address
 from pants.engine.internals.scheduler import ExecutionError
 from pants.testutil.pants_integration_test import run_pants
@@ -25,13 +23,12 @@ def rule_runner() -> RuleRunner:
         rules=[
             *dockerfile_rules(),
             *parser_rules(),
-            *pex_rules(),
             QueryRule(DockerfileInfo, (DockerfileInfoRequest,)),
         ],
-        target_types=[DockerImageTarget, PexBinary],
+        target_types=[DockerImageTarget],
     )
     rule_runner.set_options(
-        [],
+        args=[],
         env_inherit={"PATH", "PYENV_ROOT", "HOME"},
     )
     return rule_runner
@@ -59,10 +56,16 @@ def test_parsed_injectables(files: list[tuple[str, str]], rule_runner: RuleRunne
     dockerfile_content = dedent(
         """\
         ARG BASE_IMAGE=:base
+        ARG PEX_BIN=:hello
+        ARG PEX_BIN_DOTTED_PATH=dotted.path.as.arg/dpaa.pex
+        ARG OTHER_FILE=other/file
+        ARG NO_DEFAULT
         FROM $BASE_IMAGE
         COPY some.target/binary.pex some.target/tool.pex /bin
         COPY --from=scratch this.is/ignored.pex /opt
         COPY binary another/cli.pex tool /bin
+        COPY $NO_DEFAULT /app/not_references
+        COPY $OTHER_FILE ${PEX_BIN} ${PEX_BIN_DOTTED_PATH} :technically_a_file /app/hello.pex
         """
     )
 
@@ -73,12 +76,31 @@ def test_parsed_injectables(files: list[tuple[str, str]], rule_runner: RuleRunne
     addr = Address("test")
     info = rule_runner.request(DockerfileInfo, [DockerfileInfoRequest(addr)])
     assert info.from_image_build_args.to_dict() == {"BASE_IMAGE": ":base"}
-    assert info.copy_source_paths == (
-        "some.target/binary.pex",
-        "some.target/tool.pex",
-        "binary",
-        "another/cli.pex",
-        "tool",
+
+    # copy args
+    docker_copy_build_args = info.copy_build_args.to_dict()
+    assert docker_copy_build_args == {
+        "PEX_BIN": ":hello",
+        "PEX_BIN_DOTTED_PATH": "dotted.path.as.arg/dpaa.pex",
+        "OTHER_FILE": "other/file",
+    }
+    assert "NO_DEFAULT" not in docker_copy_build_args, (
+        "ARG with no value should not be included as it cannot be a reference to a target"
+    )
+    assert docker_copy_build_args.get("OTHER_FILE") == "other/file", (
+        "A file reference should still be copied even if it isn't an output path or an obvious target"
+    )
+
+    assert (
+        info.copy_source_paths
+        == (
+            "some.target/binary.pex",
+            "some.target/tool.pex",
+            "binary",
+            "another/cli.pex",
+            "tool",
+            ":technically_a_file",  # we don't resolve inline targets, since we'd need to rewrite the Dockerfile
+        )
     )
 
 
@@ -159,7 +181,7 @@ def test_copy_source_references(rule_runner: RuleRunner) -> None:
                 FROM base
                 COPY a b /
                 COPY --option c/d e/f/g /h
-                ADD ignored
+                ADD ignored ignored
                 COPY j k /
                 COPY
                 """
@@ -182,6 +204,12 @@ def test_baseimage_tags(rule_runner: RuleRunner) -> None:
                 "FROM gcr.io/tekton-releases/github.com/tektoncd/operator/cmd/kubernetes/operator:"
                 "v0.54.0@sha256:d1f0463b35135852308ea815c2ae54c1734b876d90288ce35828aeeff9899f9d\n"
                 "FROM $PYTHON_VERSION AS python\n"
+                "FROM python:$VERSION\n"
+                "FROM $MIRROR/dperson/samba@sha256:"
+                "e1d2a7366690749a7be06f72bdbf6a5a7d15726fc84e4e4f41e967214516edfd\n"
+                "FROM $REGISTRY/$IMAGE\n"
+                "FROM registry/$IMAGE\n"
+                "FROM $IMAGE@sha256:d1f0463b35135852308ea815c2ae54c1734b876d90288ce35828aeeff9899f9d\n"
             ),
         }
     )
@@ -190,12 +218,18 @@ def test_baseimage_tags(rule_runner: RuleRunner) -> None:
     assert info.version_tags == (
         "stage0 latest",
         "stage1 v1.2",
-        # Stage 2 is not pinned with a tag.
+        "stage2",  # Stage 2 is not pinned with a tag.
         "stage3 v0.54.0",
         "python build-arg:PYTHON_VERSION",  # Parse tag from build arg.
+        "stage5 $VERSION",
+        "stage6",
+        "stage7 build-arg:IMAGE",
+        "stage8 build-arg:IMAGE",
+        "stage9",
     )
 
 
+# TODO: Ensure this passes before deleting it
 def test_generate_lockfile_without_python_backend() -> None:
     """Regression test for https://github.com/pantsbuild/pants/issues/14876."""
     run_pants(

@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import logging
 import os
+from enum import Enum
 
 from pants.core.util_rules.asdf import AsdfPathString
-from pants.option.option_types import BoolOption, StrListOption, StrOption
+from pants.option.option_types import BoolOption, EnumOption, StrListOption, StrOption
 from pants.option.subsystem import Subsystem
 from pants.util.memo import memoized_property
 from pants.util.ordered_set import OrderedSet
@@ -17,6 +18,11 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_COMPILER_FLAGS = ("-g", "-O2")
+
+
+class ThirdPartyTargetGranularity(Enum):
+    PACKAGE = "package"
+    MODULE = "module"
 
 
 class GolangSubsystem(Subsystem):
@@ -30,7 +36,7 @@ class GolangSubsystem(Subsystem):
             default=["<PATH>"],
             help=softwrap(
                 f"""
-                A list of paths to search for Go.
+                A list of paths to search for Go and extra tools needed by go.
 
                 Specify absolute paths to directories with the `go` binary, e.g. `/usr/bin`.
                 Earlier entries will be searched first.
@@ -69,6 +75,18 @@ class GolangSubsystem(Subsystem):
                 * `<PATH>`, the contents of the PATH environment variable
                 """
             ),
+        )
+
+        _extra_tools = StrListOption(
+            default=[],
+            help=softwrap(
+                """
+                List any additional executable tools required for the `go` tool to work.
+                The paths to these tools will be included in the PATH used in the execution sandbox.
+                E.g. `go mod download` may require the `git` tool to download private modules.
+                """
+            ),
+            advanced=True,
         )
 
         cgo_gcc_binary_name = StrOption(
@@ -184,6 +202,10 @@ class GolangSubsystem(Subsystem):
 
             return tuple(OrderedSet(iter_path_entries()))
 
+        @property
+        def extra_tools(self) -> tuple[str, ...]:
+            return tuple(sorted(set(self._extra_tools)))
+
     minimum_expected_version = StrOption(
         default="1.17",
         help=softwrap(
@@ -199,6 +221,23 @@ class GolangSubsystem(Subsystem):
             Do not include the patch version.
             """
         ),
+    )
+    third_party_target_granularity = EnumOption(
+        default=ThirdPartyTargetGranularity.PACKAGE,
+        help=softwrap(
+            """
+            The granularity at which third-party targets are generated from a `go_mod` target.
+
+            `package`: one `go_third_party_package` target per third-party Go package (the
+            historical behavior).
+
+            `module`: one `go_third_party_module` target per third-party Go module. First-party
+            targets depend on the modules they import; `go.mod`/`go.sum` owns transitive
+            resolution. Use `go_binary`'s `main_import_path` field to build a specific
+            third-party package.
+            """
+        ),
+        advanced=True,
     )
     tailor_go_mod_targets = BoolOption(
         default=True,
@@ -241,6 +280,25 @@ class GolangSubsystem(Subsystem):
             See https://go.dev/blog/cgo and https://pkg.go.dev/cmd/cgo for additional information about Cgo.
             """
         ),
+    )
+
+    use_prebuilt_stdlib_archives = BoolOption(
+        default=True,
+        help=softwrap(
+            """
+            If true, pre-compile the entire Go standard library once per Go toolchain configuration
+            (via `go install std`) and link against those archives, instead of compiling each
+            standard library package as a separate build action.
+
+            This is usually significantly faster. Pants automatically falls back to compiling the
+            standard library from source for build configurations that are incompatible with the
+            pre-built archives, such as when using the race detector or other sanitizers, code
+            coverage, or custom compiler/assembler flags.
+
+            Set this to false to always compile standard library packages from source.
+            """
+        ),
+        advanced=True,
     )
 
     asdf_tool_name = StrOption(

@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 from textwrap import dedent
-from typing import Iterator
 
 import pytest
 
@@ -28,6 +28,7 @@ def repo() -> Iterator[str]:
         _run_git(["init"])
         _run_git(["config", "user.email", "you@example.com"])
         _run_git(["config", "user.name", "Your Name"])
+        _run_git(["config", "commit.gpgsign", "false"])
 
         project = {
             ".gitignore": dedent(
@@ -105,7 +106,10 @@ def _run_pants_goal(
             goal,
         ],
         workdir=workdir,
-        config={"GLOBAL": {"backend_packages": ["pants.backend.shell"]}},
+        config={
+            "GLOBAL": {"backend_packages": ["pants.backend.python", "pants.backend.shell"]},
+            "python": {"interpreter_constraints": ["==3.14.*"]},
+        },
     )
 
 
@@ -213,20 +217,23 @@ def test_delete_atom_target(repo: str) -> None:
 
 
 def test_change_build_file(repo: str) -> None:
-    """Every target in a BUILD file is changed when it's edited.
+    """Testing BUILD file invalidation with and without block-level tracking.
 
-    This is because we don't know what the target was like before-hand, so we're overly
-    conservative.
+    By default, we are overly conservative and assume any BUILD file change affects all targets.
+    With --enable-target-origin-sources-blocks=True, we use AST block tracking to precisely map changes.
     """
     append_to_file("BUILD", "# foo")
+
+    # Default behavior: Overly conservative (Flag is False)
     # Note that the target generator `//:lib` does not show up.
     assert_list_stdout(
         repo, ["//app.sh:lib", "//dep.sh:lib", "//transitive.sh:lib", "//:standalone"]
     )
-
-    # This is because the BUILD file gets expanded with all its targets, then their sources are
-    # used. This might not be desirable behavior.
     assert_count_loc(repo, expected_num_files=4)
+
+    # Smart Behavior: Block-level tracking (Flag is True)
+    # Since we only added a comment, no targets are invalidated.
+    assert_list_stdout(repo, [], extra_args=["--enable-target-origin-sources-blocks=True"])
 
 
 def test_different_build_file_changed(repo: str) -> None:
@@ -292,3 +299,48 @@ def test_pants_ignored_file(repo: str) -> None:
     for dependents in (DependentsOption.NONE, DependentsOption.DIRECT):
         assert_list_stdout(repo, [], dependents)
         assert_count_loc(repo, dependents, expected_num_files=0)
+
+
+def test_deleted_file() -> None:
+    with temporary_dir(root_dir=get_buildroot()) as worktree:
+        _run_git(["init"])
+        _run_git(["config", "user.email", "you@example.com"])
+        _run_git(["config", "user.name", "Your Name"])
+        _run_git(["config", "commit.gpgsign", "false"])
+
+        # Currently only the python backend supports deleted file deps properly,
+        # so we use a python example.
+        project = {
+            ".gitignore": dedent(
+                f"""\
+                {Path(worktree).relative_to(get_buildroot())}
+                .pants.d/pids
+                __pycache__
+                .coverage.*  # For some reason, CI adds these files
+                """
+            ),
+            "src/python/top/foo.py": "",
+            "src/python/top/bar.py": "import top.foo",
+            "src/python/top/bar_test.py": "import top.bar",
+            "src/python/top/BUILD": dedent(
+                """\
+                python_sources()
+                python_tests(name="tests")
+                """
+            ),
+        }
+        for fp, content in project.items():
+            create_file(fp, content)
+
+        _run_git(["add", "."])
+        _run_git(["commit", "-m", "blah"])
+
+        delete_file("src/python/top/foo.py")
+        result = _run_pants_goal(worktree, "list", DependentsOption.TRANSITIVE)
+        result.assert_success()
+        assert sorted(result.stdout.strip().splitlines()) == [
+            "src/python/top/bar.py",
+            "src/python/top/bar_test.py:tests",
+            "src/python/top:tests",
+            "src/python/top:top",
+        ]

@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass
 
 from pants.backend.awslambda.python.target_types import (
+    AWSLambdaArchitectureField,
     PythonAWSLambda,
     PythonAwsLambdaHandlerField,
     PythonAwsLambdaIncludeRequirements,
@@ -17,14 +18,18 @@ from pants.backend.awslambda.python.target_types import (
 )
 from pants.backend.python.util_rules.faas import (
     BuildPythonFaaSRequest,
+    FaaSArchitecture,
     PythonFaaSCompletePlatforms,
     PythonFaaSLayoutField,
     PythonFaaSPex3VenvCreateExtraArgsField,
+    PythonFaaSPexBuildExtraArgs,
+    PythonFaaSUvPlatforms,
+    build_python_faas,
 )
 from pants.backend.python.util_rules.faas import rules as faas_rules
+from pants.core.environments.target_types import EnvironmentField
 from pants.core.goals.package import BuiltPackage, OutputPathField, PackageFieldSet
-from pants.core.util_rules.environments import EnvironmentField
-from pants.engine.rules import Get, collect_rules, rule
+from pants.engine.rules import collect_rules, implicitly, rule
 from pants.engine.unions import UnionRule
 from pants.util.logging import LogLevel
 
@@ -35,8 +40,11 @@ logger = logging.getLogger(__name__)
 class _BaseFieldSet(PackageFieldSet):
     include_requirements: PythonAwsLambdaIncludeRequirements
     runtime: PythonAwsLambdaRuntime
+    architecture: AWSLambdaArchitectureField
     complete_platforms: PythonFaaSCompletePlatforms
+    uv_platforms: PythonFaaSUvPlatforms
     pex3_venv_create_extra_args: PythonFaaSPex3VenvCreateExtraArgsField
+    pex_build_extra_args: PythonFaaSPexBuildExtraArgs
     layout: PythonFaaSLayoutField
     output_path: OutputPathField
     environment: EnvironmentField
@@ -61,21 +69,25 @@ class PythonAwsLambdaLayerFieldSet(_BaseFieldSet):
 async def package_python_aws_lambda_function(
     field_set: PythonAwsLambdaFieldSet,
 ) -> BuiltPackage:
-    return await Get(
-        BuiltPackage,
+    assert field_set.architecture.value is not None  # Has default, never None
+    return await build_python_faas(
         BuildPythonFaaSRequest(
             address=field_set.address,
             target_name=PythonAWSLambda.alias,
             complete_platforms=field_set.complete_platforms,
+            uv_platforms=field_set.uv_platforms,
             runtime=field_set.runtime,
+            architecture=FaaSArchitecture(field_set.architecture.value),
             handler=field_set.handler,
             output_path=field_set.output_path,
             include_requirements=field_set.include_requirements.value,
             include_sources=True,
             pex3_venv_create_extra_args=field_set.pex3_venv_create_extra_args,
+            pex_build_extra_args=field_set.pex_build_extra_args,
             layout=field_set.layout,
             reexported_handler_module=PythonAwsLambdaHandlerField.reexported_handler_module,
         ),
+        **implicitly(),
     )
 
 
@@ -83,17 +95,20 @@ async def package_python_aws_lambda_function(
 async def package_python_aws_lambda_layer(
     field_set: PythonAwsLambdaLayerFieldSet,
 ) -> BuiltPackage:
-    return await Get(
-        BuiltPackage,
+    assert field_set.architecture.value is not None  # Has default, never None
+    return await build_python_faas(
         BuildPythonFaaSRequest(
             address=field_set.address,
             target_name=PythonAWSLambdaLayer.alias,
             complete_platforms=field_set.complete_platforms,
+            uv_platforms=field_set.uv_platforms,
             runtime=field_set.runtime,
+            architecture=FaaSArchitecture(field_set.architecture.value),
             output_path=field_set.output_path,
             include_requirements=field_set.include_requirements.value,
             include_sources=field_set.include_sources.value,
             pex3_venv_create_extra_args=field_set.pex3_venv_create_extra_args,
+            pex_build_extra_args=field_set.pex_build_extra_args,
             layout=field_set.layout,
             # See
             # https://docs.aws.amazon.com/lambda/latest/dg/configuration-layers.html#configuration-layers-path
@@ -110,6 +125,7 @@ async def package_python_aws_lambda_layer(
             handler=None,
             reexported_handler_module=None,
         ),
+        **implicitly(),
     )
 
 

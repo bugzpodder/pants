@@ -1,9 +1,8 @@
 // Copyright 2017 Pants project contributors (see CONTRIBUTORS.md).
 // Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
-use crate::intrinsics::Intrinsics;
 use crate::python::{Function, TypeId};
 
 use deepsize::DeepSizeOf;
@@ -13,59 +12,47 @@ use log::Level;
 use rule_graph::{DependencyKey, DisplayForGraph, DisplayForGraphArgs, Query, RuleId};
 
 #[derive(DeepSizeOf, Eq, Hash, PartialEq, Clone, Debug)]
-pub enum Rule {
-    // Intrinsic rules are implemented in rust.
-    Intrinsic(Intern<Intrinsic>),
-    // Task rules are implemented in python.
-    Task(Intern<Task>),
-}
+pub struct Rule(pub Intern<Task>);
 
 impl DisplayForGraph for Rule {
     fn fmt_for_graph(&self, display_args: DisplayForGraphArgs) -> String {
-        match self {
-            Rule::Task(ref task) => {
-                let task_name = task.func.full_name();
-                let product = format!("{}", task.product);
+        let task = &self.0;
 
-                let clause_portion = Self::formatted_positional_arguments(
-                    task.args.iter().map(|(_name, dk)| dk),
-                    display_args,
-                );
+        let task_name = task.func.full_name();
+        let product = format!("{}", task.product);
 
-                let get_clauses = task
-                    .gets
-                    .iter()
-                    .map(::std::string::ToString::to_string)
-                    .collect::<Vec<_>>();
+        let clause_portion = Self::formatted_positional_arguments(
+            task.args.iter().map(|(_name, dk)| dk),
+            display_args,
+        );
 
-                let get_portion = if get_clauses.is_empty() {
-                    "".to_string()
-                } else if get_clauses.len() > 1 {
-                    format!(
-                        ",{}gets=[{}{}{}]",
-                        display_args.line_separator(),
-                        display_args.optional_line_separator(),
-                        get_clauses.join(&format!(",{}", display_args.line_separator())),
-                        display_args.optional_line_separator(),
-                    )
-                } else {
-                    format!(", gets=[{}]", get_clauses.join(", "))
-                };
+        let get_clauses = task
+            .gets
+            .iter()
+            .map(::std::string::ToString::to_string)
+            .collect::<Vec<_>>();
 
-                let rule_type = if task.cacheable {
-                    "rule".to_string()
-                } else {
-                    "goal_rule".to_string()
-                };
+        let get_portion = if get_clauses.is_empty() {
+            "".to_string()
+        } else if get_clauses.len() > 1 {
+            format!(
+                ",{}gets=[{}{}{}]",
+                display_args.line_separator(),
+                display_args.optional_line_separator(),
+                get_clauses.join(&format!(",{}", display_args.line_separator())),
+                display_args.optional_line_separator(),
+            )
+        } else {
+            format!(", gets=[{}]", get_clauses.join(", "))
+        };
 
-                format!("@{rule_type}({task_name}({clause_portion}) -> {product}{get_portion})",)
-            }
-            Rule::Intrinsic(ref intrinsic) => format!(
-                "@rule(<intrinsic>({}) -> {})",
-                Self::formatted_positional_arguments(&intrinsic.inputs, display_args),
-                intrinsic.product,
-            ),
-        }
+        let rule_type = if task.cacheable {
+            "rule".to_string()
+        } else {
+            "goal_rule".to_string()
+        };
+
+        format!("@{rule_type}({task_name}({clause_portion}) -> {product}{get_portion})",)
     }
 }
 
@@ -73,51 +60,33 @@ impl rule_graph::Rule for Rule {
     type TypeId = TypeId;
 
     fn id(&self) -> &RuleId {
-        match self {
-            Rule::Task(task) => &task.id,
-            Rule::Intrinsic(intrinsic) => &intrinsic.id,
-        }
+        &self.0.id
     }
 
     fn product(&self) -> TypeId {
-        match self {
-            Rule::Task(t) => t.product,
-            Rule::Intrinsic(i) => i.product,
-        }
+        self.0.product
     }
 
     fn dependency_keys(&self, explicit_args_arity: u16) -> Vec<&DependencyKey<Self::TypeId>> {
-        match self {
-            Rule::Task(task) => task
-                .args
-                .iter()
-                .skip(explicit_args_arity.into())
-                .map(|(_name, dk)| dk)
-                .chain(task.gets.iter())
-                .collect(),
-            Rule::Intrinsic(intrinsic) => intrinsic.inputs.iter().collect(),
-        }
+        self.0
+            .args
+            .iter()
+            .skip(explicit_args_arity.into())
+            .map(|(_name, dk)| dk)
+            .chain(self.0.gets.iter())
+            .collect()
     }
 
     fn masked_params(&self) -> Vec<Self::TypeId> {
-        match self {
-            Rule::Task(task) => task.masked_types.clone(),
-            Rule::Intrinsic(_) => vec![],
-        }
+        self.0.masked_types.clone()
     }
 
     fn require_reachable(&self) -> bool {
-        match self {
-            Rule::Task(_) => true,
-            Rule::Intrinsic(_) => false,
-        }
+        true
     }
 
     fn color(&self) -> Option<rule_graph::Palette> {
-        match self {
-            Rule::Task(_) => None,
-            Rule::Intrinsic(_) => Some(rule_graph::Palette::Gray),
-        }
+        None
     }
 }
 
@@ -175,33 +144,17 @@ pub struct DisplayInfo {
     pub level: Level,
 }
 
-#[derive(DeepSizeOf, Eq, Hash, PartialEq, Clone, Debug)]
-pub struct Intrinsic {
-    pub id: RuleId,
-    pub product: TypeId,
-    pub inputs: Vec<DependencyKey<TypeId>>,
-}
-
-impl Intrinsic {
-    pub fn new(name: &str, product: TypeId, input: TypeId) -> Self {
-        // TODO: Python rule code that calls an intrinsic by name will need to be
-        //  able to import that name, so we'll need to create stubs representing the
-        //  intrinsics, in pants.engine.intrinsics.py.
-        Self {
-            id: RuleId::from_string(format!("pants.engine.intrinsics:{}", name)),
-            product,
-            inputs: vec![DependencyKey::new(input)],
-        }
-    }
-}
+// Map of base rule -> map of derived type to derived rule for that type.
+type VTable = HashMap<RuleId, HashMap<TypeId, RuleId>>;
 
 ///
-/// Registry of native (rust) Intrinsic tasks and user (python) Tasks.
+/// Registry of user Tasks.
 ///
 #[derive(Clone, Debug)]
 pub struct Tasks {
     rules: IndexSet<Rule>,
     queries: IndexSet<Query<TypeId>>,
+    vtable: VTable,
     // Used during the construction of a rule.
     preparing: Option<Task>,
 }
@@ -220,8 +173,9 @@ impl Tasks {
     pub fn new() -> Tasks {
         Tasks {
             rules: IndexSet::default(),
-            preparing: None,
             queries: IndexSet::default(),
+            vtable: VTable::default(),
+            preparing: None,
         }
     }
 
@@ -233,11 +187,8 @@ impl Tasks {
         &self.queries
     }
 
-    pub fn intrinsics_set(&mut self, intrinsics: &Intrinsics) {
-        for intrinsic in intrinsics.keys() {
-            self.rules
-                .insert(Rule::Intrinsic(Intern::new(intrinsic.clone())));
-        }
+    pub fn vtable(&self) -> &VTable {
+        &self.vtable
     }
 
     ///
@@ -283,43 +234,63 @@ impl Tasks {
         &mut self,
         output: TypeId,
         inputs: Vec<TypeId>,
-        rule_id: String,
+        rule_id: RuleId,
         explicit_args_arity: u16,
+        vtable_entries: Option<HashMap<TypeId, RuleId>>,
+        in_scope_types: Option<Vec<TypeId>>,
     ) {
-        let gets = &mut self
+        let calls = &mut self
             .preparing
             .as_mut()
             .expect("Must `begin()` a task creation before adding calls!")
             .gets;
-        gets.push(
-            DependencyKey::for_known_rule(
-                RuleId::from_string(rule_id),
-                output,
-                explicit_args_arity,
-            )
-            .provided_params(inputs),
-        )
-    }
 
-    pub fn add_get(&mut self, output: TypeId, inputs: Vec<TypeId>) {
-        let gets = &mut self
-            .preparing
-            .as_mut()
-            .expect("Must `begin()` a task creation before adding gets!")
-            .gets;
-        gets.push(DependencyKey::new(output).provided_params(inputs));
-    }
+        if let Some(vtable_entries) = vtable_entries {
+            // This is a polymorphic call, so in_scope_types must be provided by the caller.
+            // TODO: We would like to deprecate the in_scope_types argument to the @union decorator,
+            // and instead let the in-scope types be defined by the signature of the polymorphic
+            // rule (i.e., they would be the explicit params in the signature other than the union
+            // type). However this would require access to the rule's signature (which is distinct
+            // from the call's signature) both here and in gen_call() in task.rs. So for now we
+            // continue to use the legacy in_scope_types @union arg, and we can revisit once we're
+            // fully call-by-name.
+            // See https://github.com/pantsbuild/pants/issues/22483
+            let in_scope_types = in_scope_types.unwrap_or_else(|| {
+                panic!("No in_scope_types passed in for a polymorphic call");
+            });
 
-    pub fn add_get_union(&mut self, output: TypeId, inputs: Vec<TypeId>, in_scope: Vec<TypeId>) {
-        self.preparing
-            .as_mut()
-            .expect("Must `begin()` a task creation before adding a union get!")
-            .gets
-            .push(
-                DependencyKey::new(output)
+            // Note that the Python code calling this function has already verified that there
+            // is a relevant union type in the inputs, so this should never panic in practice.
+            let union_type = inputs.iter().find(|t| t.is_union()).unwrap_or_else(|| {
+                panic!("No union argument found in inputs of call to {rule_id}")
+            });
+            // Add calls for each vtable member. At runtime we'll select the relevant one.
+            for (member_type, member_rule) in vtable_entries.iter() {
+                let member_rule_inputs = inputs
+                    .iter()
+                    .map(|t| if t == union_type { member_type } else { t })
+                    .map(TypeId::clone)
+                    .collect::<Vec<TypeId>>();
+                calls.push(
+                    DependencyKey::for_known_rule(member_rule.clone(), output, explicit_args_arity)
+                        .provided_params(member_rule_inputs)
+                        .in_scope_params(in_scope_types.clone()),
+                );
+            }
+            self.vtable.insert(rule_id.clone(), vtable_entries);
+
+            // Add the polymorphic call itself.
+            calls.push(
+                DependencyKey::for_known_rule(rule_id, output, explicit_args_arity)
                     .provided_params(inputs)
-                    .in_scope_params(in_scope),
+                    .in_scope_params(in_scope_types.clone()),
             );
+        } else {
+            calls.push(
+                DependencyKey::for_known_rule(rule_id, output, explicit_args_arity)
+                    .provided_params(inputs),
+            );
+        }
     }
 
     pub fn task_end(&mut self) {
@@ -328,7 +299,7 @@ impl Tasks {
             .preparing
             .take()
             .expect("Must `begin()` a task creation before ending it!");
-        self.rules.insert(Rule::Task(Intern::new(task)));
+        self.rules.insert(Rule(Intern::new(task)));
     }
 
     pub fn query_add(&mut self, product: TypeId, params: Vec<TypeId>) {

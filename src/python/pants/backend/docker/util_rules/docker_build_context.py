@@ -5,45 +5,61 @@ from __future__ import annotations
 
 import logging
 import re
+import shlex
 from abc import ABC
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Iterable, Mapping
 
 from pants.backend.docker.package_types import BuiltDockerImage
-from pants.backend.docker.subsystems.dockerfile_parser import DockerfileInfo, DockerfileInfoRequest
+from pants.backend.docker.subsystems.docker_options import DockerOptions
+from pants.backend.docker.subsystems.dockerfile_parser import (
+    DockerfileInfo,
+    DockerfileInfoRequest,
+    parse_dockerfile,
+)
 from pants.backend.docker.target_types import DockerImageSourceField
 from pants.backend.docker.util_rules.docker_build_args import (
     DockerBuildArgs,
     DockerBuildArgsRequest,
+    docker_build_args,
 )
 from pants.backend.docker.util_rules.docker_build_env import (
     DockerBuildEnvironment,
     DockerBuildEnvironmentError,
     DockerBuildEnvironmentRequest,
+    docker_build_environment_vars,
 )
-from pants.backend.docker.utils import suggest_renames
+from pants.backend.docker.utils import image_ref_regexp, suggest_renames
 from pants.backend.docker.value_interpolation import DockerBuildArgsInterpolationValue
 from pants.backend.shell.target_types import ShellSourceField
-from pants.core.goals.package import BuiltPackage, EnvironmentAwarePackageRequest, PackageFieldSet
+from pants.core.goals.package import (
+    BuiltPackage,
+    EnvironmentAwarePackageRequest,
+    PackageFieldSet,
+    environment_aware_package,
+)
 from pants.core.target_types import FileSourceField
-from pants.core.util_rules.source_files import SourceFiles, SourceFilesRequest
-from pants.engine.addresses import Address, Addresses, UnparsedAddressInputs
+from pants.core.util_rules.source_files import SourceFilesRequest, determine_source_files
+from pants.engine.addresses import Address, UnparsedAddressInputs
 from pants.engine.fs import Digest, MergeDigests, Snapshot
-from pants.engine.rules import Get, MultiGet, collect_rules, rule
+from pants.engine.internals.graph import (
+    find_valid_field_sets,
+    resolve_targets,
+    resolve_unparsed_address_inputs,
+)
+from pants.engine.internals.graph import transitive_targets as transitive_targets_get
+from pants.engine.intrinsics import digest_to_snapshot
+from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import (
     Dependencies,
     DependenciesRequest,
-    FieldSetsPerTarget,
     FieldSetsPerTargetRequest,
     GeneratedSources,
     GenerateSourcesRequest,
     SourcesField,
-    Targets,
-    TransitiveTargets,
     TransitiveTargetsRequest,
 )
 from pants.engine.unions import UnionRule
-from pants.util.meta import classproperty
 from pants.util.strutil import softwrap, stable_hash
 from pants.util.value_interpolation import InterpolationContext, InterpolationValue
 
@@ -114,6 +130,7 @@ class DockerBuildContext:
         build_env: DockerBuildEnvironment,
         upstream_image_ids: Iterable[str],
         dockerfile_info: DockerfileInfo,
+        should_suggest_renames: bool = True,
     ) -> DockerBuildContext:
         interpolation_context: dict[str, dict[str, str] | InterpolationValue] = {}
 
@@ -139,14 +156,8 @@ class DockerBuildContext:
         )
         interpolation_context["tags"] = tags_values
 
-        return cls(
-            build_args=build_args,
-            digest=snapshot.digest,
-            dockerfile=dockerfile_info.source,
-            build_env=build_env,
-            upstream_image_ids=tuple(sorted(upstream_image_ids)),
-            interpolation_context=InterpolationContext.from_dict(interpolation_context),
-            copy_source_vs_context_source=tuple(
+        copy_source_vs_context_source = (
+            tuple(
                 suggest_renames(
                     tentative_paths=(
                         # We don't want to include the Dockerfile as a suggested rename
@@ -156,26 +167,20 @@ class DockerBuildContext:
                     actual_files=snapshot.files,
                     actual_dirs=snapshot.dirs,
                 )
-            ),
-            stages=tuple(sorted(stage_names)),
+            )
+            if should_suggest_renames
+            else ()
         )
 
-    @classproperty
-    def _image_ref_regexp(cls):
-        return re.compile(
-            r"""
-            ^
-            # Optional registry.
-            ((?P<registry>[^/:_ ]+:?[^/:_ ]*)/)?
-            # Repository.
-            (?P<repository>[^:@ \t\n\r\f\v]+)
-            # Optionally with `:tag`.
-            (:(?P<tag>[^@ ]+))?
-            # Optionally with `@digest`.
-            (@(?P<digest>\S+))?
-            $
-            """,
-            re.VERBOSE,
+        return cls(
+            build_args=build_args,
+            digest=snapshot.digest,
+            dockerfile=dockerfile_info.source,
+            build_env=build_env,
+            upstream_image_ids=tuple(sorted(upstream_image_ids)),
+            interpolation_context=InterpolationContext.from_dict(interpolation_context),
+            copy_source_vs_context_source=copy_source_vs_context_source,
+            stages=tuple(sorted(stage_names)),
         )
 
     @classmethod
@@ -184,7 +189,8 @@ class DockerBuildContext:
     ) -> tuple[set[str], dict[str, str]]:
         # Go over all FROM tags and names for all stages.
         stage_names: set[str] = set()
-        stage_tags = (tag.split(maxsplit=1) for tag in dockerfile_info.version_tags)
+        # tag is empty if image is referenced by digest instead
+        stage_tags = ([*tag.split(maxsplit=1), ""][:2] for tag in dockerfile_info.version_tags)
         tags_values: dict[str, str] = {}
         for idx, (stage, tag) in enumerate(stage_tags):
             if tag.startswith("build-arg:"):
@@ -197,7 +203,7 @@ class DockerBuildContext:
                         f"Failed to parse Dockerfile baseimage tag for stage {stage} in "
                         f"{dockerfile_info.address} target, unknown build ARG: {build_arg!r}."
                     )
-                parsed = re.match(cls._image_ref_regexp, image_ref.strip("\"'"))
+                parsed = re.match(image_ref_regexp, image_ref.strip("\"'"))
                 tag = parsed.group("tag") or (parsed.group("digest") and "latest") if parsed else ""
                 if not tag:
                     raise DockerBuildContextError(
@@ -207,10 +213,11 @@ class DockerBuildContext:
 
             if stage != f"stage{idx}":
                 stage_names.add(stage)
-            if idx == 0:
-                # Expose the first (stage0) FROM directive as the "baseimage".
-                tags_values["baseimage"] = tag
-            tags_values[stage] = tag
+            if tag:
+                if idx == 0:
+                    # Expose the first (stage0) FROM directive as the "baseimage".
+                    tags_values["baseimage"] = tag
+                tags_values[stage] = tag
 
         return stage_names, tags_values
 
@@ -236,9 +243,11 @@ class DockerBuildContext:
             # values from the Dockerfile however, in order to not having to duplicate them in
             # the BUILD files.
             return {
-                arg_name: arg_value
-                if has_value
-                else build_env.get(arg_name, build_arg_defaults.get(arg_name))
+                arg_name: (
+                    arg_value
+                    if has_value
+                    else build_env.get(arg_name, build_arg_defaults.get(arg_name))
+                )
                 for arg_name, has_value, arg_value in [
                     build_arg.partition("=") for build_arg in build_args
                 ]
@@ -254,19 +263,55 @@ class DockerBuildContext:
             ) from e
 
 
+async def _map_build_args_to_addresses(
+    dockerfile_info: DockerfileInfo,
+    dockerfile_build_args: dict[str, str],
+) -> dict[str, Address]:
+    from_image_addresses = await concurrently(
+        resolve_unparsed_address_inputs(
+            UnparsedAddressInputs(
+                [value],
+                owning_address=dockerfile_info.address,
+                description_of_origin=softwrap(
+                    f"""
+                    the FROM arguments from the file {dockerfile_info.source}
+                    from the target {dockerfile_info.address}
+                    """
+                ),
+                skip_invalid_addresses=True,
+            ),
+            **implicitly(),
+        )
+        for value in dockerfile_build_args.values()
+    )
+    return {
+        arg_name: addresses.expect_single()
+        for arg_name, addresses in zip(
+            dockerfile_build_args.keys(), from_image_addresses, strict=True
+        )
+        if addresses
+    }
+
+
 @rule
-async def create_docker_build_context(request: DockerBuildContextRequest) -> DockerBuildContext:
+async def create_docker_build_context(
+    request: DockerBuildContextRequest,
+    options: DockerOptions,
+) -> DockerBuildContext:
     # Get all targets to include in context.
-    transitive_targets = await Get(TransitiveTargets, TransitiveTargetsRequest([request.address]))
+    transitive_targets = await transitive_targets_get(
+        TransitiveTargetsRequest([request.address]), **implicitly()
+    )
     docker_image = transitive_targets.roots[0]
 
     # Get all dependencies for the root target.
-    root_dependencies = await Get(Targets, DependenciesRequest(docker_image.get(Dependencies)))
+    root_dependencies = await resolve_targets(
+        **implicitly(DependenciesRequest(docker_image.get(Dependencies)))
+    )
 
     # Get all file sources from the root dependencies. That includes any non-file sources that can
     # be "codegen"ed into a file source.
-    sources_request = Get(
-        SourceFiles,
+    sources_request = determine_source_files(
         SourceFilesRequest(
             sources_fields=[tgt.get(SourcesField) for tgt in root_dependencies],
             for_sources_types=(
@@ -274,29 +319,32 @@ async def create_docker_build_context(request: DockerBuildContextRequest) -> Doc
                 FileSourceField,
             ),
             enable_codegen=True,
-        ),
+        )
     )
 
-    embedded_pkgs_per_target_request = Get(
-        FieldSetsPerTarget,
-        FieldSetsPerTargetRequest(PackageFieldSet, transitive_targets.dependencies),
+    embedded_pkgs_per_target_request = find_valid_field_sets(
+        FieldSetsPerTargetRequest(PackageFieldSet, transitive_targets.dependencies), **implicitly()
     )
 
-    sources, embedded_pkgs_per_target, dockerfile_info = await MultiGet(
+    sources, embedded_pkgs_per_target, dockerfile_info = await concurrently(
         sources_request,
         embedded_pkgs_per_target_request,
-        Get(DockerfileInfo, DockerfileInfoRequest(docker_image.address)),
+        parse_dockerfile(DockerfileInfoRequest(docker_image.address), **implicitly()),
     )
 
     # Package binary dependencies for build context.
-    embedded_pkgs = await MultiGet(
-        Get(BuiltPackage, EnvironmentAwarePackageRequest(field_set))
+    pkgs_wanting_embedding = [
+        field_set
         for field_set in embedded_pkgs_per_target.field_sets
         # Exclude docker images, unless build_upstream_images is true.
         if (
             request.build_upstream_images
             or not isinstance(getattr(field_set, "source", None), DockerImageSourceField)
         )
+    ]
+    embedded_pkgs = await concurrently(
+        environment_aware_package(EnvironmentAwarePackageRequest(field_set))
+        for field_set in pkgs_wanting_embedding
     )
 
     if request.build_upstream_images:
@@ -318,39 +366,30 @@ async def create_docker_build_context(request: DockerBuildContextRequest) -> Doc
     all_digests = (dockerfile_info.digest, sources.snapshot.digest, *embedded_pkgs_digest)
 
     # Merge all digests to get the final docker build context digest.
-    context_request = Get(Snapshot, MergeDigests(d for d in all_digests if d))
+    context_request = digest_to_snapshot(**implicitly(MergeDigests(d for d in all_digests if d)))
 
     # Requests for build args and env
-    build_args_request = Get(DockerBuildArgs, DockerBuildArgsRequest(docker_image))
-    build_env_request = Get(DockerBuildEnvironment, DockerBuildEnvironmentRequest(docker_image))
-    context, build_args, build_env = await MultiGet(
+    build_args_request = docker_build_args(DockerBuildArgsRequest(docker_image), **implicitly())
+    build_env_request = docker_build_environment_vars(
+        DockerBuildEnvironmentRequest(docker_image), **implicitly()
+    )
+    context, supplied_build_args, build_env = await concurrently(
         context_request, build_args_request, build_env_request
     )
+
+    build_args = supplied_build_args
 
     upstream_image_ids = []
     if request.build_upstream_images:
         # Update build arg values for FROM image build args.
 
         # Get the FROM image build args with defined values in the Dockerfile & build args.
-        merged_from_build_args = {
-            k: build_args.to_dict().get(k, v)
-            for k, v in dockerfile_info.from_image_build_args.to_dict().items()
-        }
-        dockerfile_build_args = {k: v for k, v in merged_from_build_args.items() if v}
+        dockerfile_build_args = dockerfile_info.from_image_build_args.with_overrides(
+            supplied_build_args
+        ).nonempty()
         # Parse the build args values into Address instances.
-        from_image_addresses = await Get(
-            Addresses,
-            UnparsedAddressInputs(
-                dockerfile_build_args.values(),
-                owning_address=dockerfile_info.address,
-                description_of_origin=softwrap(
-                    f"""
-                    the FROM arguments from the file {dockerfile_info.source}
-                    from the target {dockerfile_info.address}
-                    """
-                ),
-                skip_invalid_addresses=True,
-            ),
+        build_arg_addresses = await _map_build_args_to_addresses(
+            dockerfile_info, dockerfile_build_args
         )
         # Map those addresses to the corresponding built image ref (tag).
         address_to_built_image_tag = {
@@ -368,10 +407,28 @@ async def create_docker_build_context(request: DockerBuildContextRequest) -> Doc
         # Create the FROM image build args.
         from_image_build_args = [
             f"{arg_name}={address_to_built_image_tag[addr]}"
-            for arg_name, addr in zip(dockerfile_build_args.keys(), from_image_addresses)
+            for arg_name, addr in build_arg_addresses.items()
         ]
-        # Merge all build args.
-        build_args = DockerBuildArgs.from_strings(*build_args, *from_image_build_args)
+        build_args = build_args.extended(from_image_build_args)
+
+    # Render build args for turning COPY values in ARGS which are targets into their output
+    dockerfile_copy_args = dockerfile_info.copy_build_args.with_overrides(
+        supplied_build_args
+    ).nonempty()
+
+    def get_artifact_paths(built_package: BuiltPackage) -> list[str]:
+        return [e.relpath for e in built_package.artifacts if e.relpath]
+
+    addrs_to_paths = {
+        field_set.address: get_artifact_paths(pkg)
+        for field_set, pkg in zip(embedded_pkgs_per_target.field_sets, embedded_pkgs)
+    }
+
+    copy_arg_as_build_args = await fill_args_from_copy(
+        dockerfile_copy_args, dockerfile_info, addrs_to_paths
+    )
+
+    build_args = build_args.extended(copy_arg_as_build_args)
 
     return DockerBuildContext.create(
         build_args=build_args,
@@ -379,7 +436,40 @@ async def create_docker_build_context(request: DockerBuildContextRequest) -> Doc
         upstream_image_ids=upstream_image_ids,
         dockerfile_info=dockerfile_info,
         build_env=build_env,
+        should_suggest_renames=options.suggest_renames,
     )
+
+
+async def fill_args_from_copy(
+    dockerfile_copy_args: dict[str, str], dockerfile_info, addrs_to_paths
+):
+    copy_arg_addresses = await resolve_unparsed_address_inputs(
+        UnparsedAddressInputs(
+            dockerfile_info.copy_build_args.to_dict().values(),
+            owning_address=dockerfile_info.address,
+            description_of_origin=softwrap(
+                f"""
+                the COPY arguments from the file {dockerfile_info.source}
+                from the target {dockerfile_info.address}
+                """
+            ),
+            skip_invalid_addresses=True,
+        ),
+        **implicitly(),
+    )
+
+    def resolve_arg(arg_name, maybe_addr) -> str:
+        if maybe_addr in addrs_to_paths:
+            return f"{arg_name}={shlex.join(addrs_to_paths[maybe_addr])}"
+        else:
+            # When the ARG value is a reference to a normal file
+            return f"{arg_name}={maybe_addr}"
+
+    copy_arg_as_build_args = [
+        resolve_arg(arg_name, arg_value)
+        for arg_name, arg_value in (zip(dockerfile_copy_args.keys(), copy_arg_addresses))
+    ]
+    return copy_arg_as_build_args
 
 
 def rules():

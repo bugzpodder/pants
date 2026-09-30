@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from textwrap import dedent
-from typing import Iterable, Mapping
 
 import pytest
 
@@ -226,8 +226,14 @@ def test_can_deploy_3rd_party_chart(rule_runner: RuleRunner) -> None:
             ),
         }
     )
-
-    deploy_process = _run_deployment(rule_runner, "", "deploy_3rd_party")
+    deploy_process = _run_deployment(
+        rule_runner,
+        "",
+        "deploy_3rd_party",
+        args=[
+            "--helm-infer-external-docker-images=['quay.io/kiwigrid/k8s-sidecar','grafana/grafana','bats/bats','k8s.gcr.io/kube-state-metrics/kube-state-metrics','quay.io/prometheus/node-exporter','quay.io/prometheus-operator/prometheus-operator']"
+        ],
+    )
 
     assert deploy_process.process
     assert len(deploy_process.publish_dependencies) == 0

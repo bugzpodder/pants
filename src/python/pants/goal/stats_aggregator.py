@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import base64
 import datetime
 import json
 import logging
@@ -11,8 +10,9 @@ from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import TypedDict
 
+from pants.engine.internals import native_engine
 from pants.engine.internals.scheduler import Workunit
 from pants.engine.rules import collect_rules, rule
 from pants.engine.streaming_workunit_handler import (
@@ -31,6 +31,10 @@ from pants.util.strutil import softwrap
 logger = logging.getLogger(__name__)
 
 HISTOGRAM_PERCENTILES = [25, 50, 75, 90, 95, 99]
+
+
+def _decode_histogram(encoded_histogram: bytes):
+    return native_engine.decode_observation_histogram(encoded_histogram, HISTOGRAM_PERCENTILES)
 
 
 class CounterObject(TypedDict):
@@ -85,7 +89,7 @@ class StatsAggregatorSubsystem(Subsystem):
             observation histograms, e.g. the number of cache hits and the time saved by
             caching.
 
-            For histogram summaries to work, you must add `hdrhistogram` to `[GLOBAL].plugins`.
+            Histogram summaries are decoded by the native engine.
             """
         ),
         advanced=True,
@@ -114,7 +118,7 @@ class StatsAggregatorSubsystem(Subsystem):
     )
 
 
-def _log_or_write_to_file_plain(output_file: Optional[str], lines: list[str]) -> None:
+def _log_or_write_to_file_plain(output_file: str | None, lines: list[str]) -> None:
     """Send text to the stdout or write to the output file (plain text)."""
     if lines:
         text = "\n".join(lines)
@@ -126,7 +130,7 @@ def _log_or_write_to_file_plain(output_file: Optional[str], lines: list[str]) ->
             logger.info(text)
 
 
-def _log_or_write_to_file_json(output_file: Optional[str], stats_object: StatsObject) -> None:
+def _log_or_write_to_file_json(output_file: str | None, stats_object: StatsObject) -> None:
     """Send JSON Lines single line object to the stdout or write to the file."""
     if not stats_object:
         return
@@ -147,15 +151,13 @@ class StatsAggregatorCallback(WorkunitsCallback):
         *,
         log: bool,
         memory: bool,
-        output_file: Optional[str],
-        has_histogram_module: bool,
+        output_file: str | None,
         format: StatsOutputFormat,
     ) -> None:
         super().__init__()
         self.log = log
         self.memory = memory
         self.output_file = output_file
-        self.has_histogram_module = has_histogram_module
         self.format = format
 
     @property
@@ -212,11 +214,9 @@ class StatsAggregatorCallback(WorkunitsCallback):
                 f"Memory summary (total size in bytes, count, name):\n{memory_lines}"
             )
 
-        if not (self.log and self.has_histogram_module):
+        if not self.log:
             _log_or_write_to_file_plain(self.output_file, output_lines)
             return
-
-        from hdrh.histogram import HdrHistogram  # pants: no-infer-dep
 
         histograms = context.get_observation_histograms()["histograms"]
         if not histograms:
@@ -226,24 +226,19 @@ class StatsAggregatorCallback(WorkunitsCallback):
 
         output_lines.append("Observation histogram summaries:")
         for name, encoded_histogram in histograms.items():
-            # Note: The Python library for HDR Histogram will only decode compressed histograms
-            # that are further encoded with base64. See
-            # https://github.com/HdrHistogram/HdrHistogram_py/issues/29.
-            histogram = HdrHistogram.decode(base64.b64encode(encoded_histogram))
+            histogram = _decode_histogram(encoded_histogram)
             percentile_to_vals = "\n".join(
-                f"  p{percentile}: {value}"
-                for percentile, value in histogram.get_percentile_to_value_dict(
-                    HISTOGRAM_PERCENTILES
-                ).items()
+                f"  p{percentile}: {histogram[f'p{percentile}']}"
+                for percentile in HISTOGRAM_PERCENTILES
             )
             output_lines.append(
                 f"Summary of `{name}` observation histogram:\n"
-                f"  min: {histogram.get_min_value()}\n"
-                f"  max: {histogram.get_max_value()}\n"
-                f"  mean: {histogram.get_mean_value():.3f}\n"
-                f"  std dev: {histogram.get_stddev():.3f}\n"
-                f"  total observations: {histogram.total_count}\n"
-                f"  sum: {int(histogram.get_mean_value() * histogram.total_count)}\n"
+                f"  min: {histogram['min']}\n"
+                f"  max: {histogram['max']}\n"
+                f"  mean: {histogram['mean']:.3f}\n"
+                f"  std dev: {histogram['std_dev']:.3f}\n"
+                f"  total observations: {histogram['total_observations']}\n"
+                f"  sum: {histogram['sum']}\n"
                 f"{percentile_to_vals}"
             )
         _log_or_write_to_file_plain(self.output_file, output_lines)
@@ -292,11 +287,9 @@ class StatsAggregatorCallback(WorkunitsCallback):
             ]
             stats_object["memory_summary"] = memory_lines
 
-        if not (self.log and self.has_histogram_module):
+        if not self.log:
             _log_or_write_to_file_json(self.output_file, stats_object)
             return
-
-        from hdrh.histogram import HdrHistogram  # pants: no-infer-dep
 
         histograms = context.get_observation_histograms()["histograms"]
         if not histograms:
@@ -306,25 +299,20 @@ class StatsAggregatorCallback(WorkunitsCallback):
 
         observation_histograms: list[ObservationHistogramObject] = []
         for name, encoded_histogram in histograms.items():
-            # Note: The Python library for HDR Histogram will only decode compressed histograms
-            # that are further encoded with base64. See
-            # https://github.com/HdrHistogram/HdrHistogram_py/issues/29.
-            histogram = HdrHistogram.decode(base64.b64encode(encoded_histogram))
+            histogram = _decode_histogram(encoded_histogram)
             percentile_to_vals = {
-                f"p{percentile}": value
-                for percentile, value in histogram.get_percentile_to_value_dict(
-                    HISTOGRAM_PERCENTILES
-                ).items()
+                f"p{percentile}": histogram[f"p{percentile}"]
+                for percentile in HISTOGRAM_PERCENTILES
             }
 
             observation_histogram: ObservationHistogramObject = {
                 "name": name,
-                "min": histogram.get_min_value(),
-                "max": histogram.get_max_value(),
-                "mean": round(histogram.get_mean_value(), 3),
-                "std_dev": round(histogram.get_stddev(), 3),
-                "total_observations": histogram.total_count,
-                "sum": int(histogram.get_mean_value() * histogram.total_count),
+                "min": histogram["min"],
+                "max": histogram["max"],
+                "mean": round(histogram["mean"], 3),
+                "std_dev": round(histogram["std_dev"], 3),
+                "total_observations": histogram["total_observations"],
+                "sum": histogram["sum"],
                 **percentile_to_vals,  # type: ignore
             }
             observation_histograms.append(observation_histogram)
@@ -355,30 +343,15 @@ class StatsAggregatorCallbackFactoryRequest:
 
 
 @rule
-def construct_callback(
+async def construct_callback(
     _: StatsAggregatorCallbackFactoryRequest, subsystem: StatsAggregatorSubsystem
 ) -> WorkunitsCallbackFactory:
-    has_histogram_module = False
-    if subsystem.log:
-        try:
-            import hdrh.histogram  # noqa: F401
-        except ImportError:
-            logger.warning(
-                "Please run with `--plugins=hdrhistogram` if you would like histogram summaries to "
-                "be shown at the end of the run, or permanently add "
-                "`[GLOBAL].plugins = ['hdrhistogram']`. This will cause Pants to install "
-                "the `hdrhistogram` dependency from PyPI."
-            )
-        else:
-            has_histogram_module = True
-
     return WorkunitsCallbackFactory(
         lambda: (
             StatsAggregatorCallback(
                 log=subsystem.log,
                 memory=subsystem.memory_summary,
                 output_file=subsystem.output_file,
-                has_histogram_module=has_histogram_module,
                 format=subsystem.format,
             )
             if subsystem.log or subsystem.memory_summary

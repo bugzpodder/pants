@@ -6,6 +6,7 @@ from __future__ import annotations
 import itertools
 import json
 import textwrap
+import tomllib
 
 import pytest
 
@@ -14,7 +15,7 @@ from pants.backend.python.util_rules.interpreter_constraints import InterpreterC
 from pants.backend.python.util_rules.lockfile_metadata import PythonLockfileMetadataV3
 from pants.backend.python.util_rules.pex_requirements import (
     Lockfile,
-    ResolvePexConfig,
+    ResolveConfig,
     ResolvePexConstraintsFile,
     _pex_lockfile_requirement_count,
     get_metadata,
@@ -22,6 +23,7 @@ from pants.backend.python.util_rules.pex_requirements import (
     strip_comments_from_pex_json_lockfile,
     validate_metadata,
 )
+from pants.backend.python.util_rules.uv import generate_pyproject_toml
 from pants.core.util_rules.lockfile_metadata import (
     BEGIN_LOCKFILE_HEADER,
     END_LOCKFILE_HEADER,
@@ -168,7 +170,7 @@ def test_validate_lockfiles(
         req_strings,
         validate_consumed_req_strings=True,
         python_setup=create_python_setup(InvalidLockfileBehavior.warn),
-        resolve_config=ResolvePexConfig(
+        resolve_config=ResolveConfig(
             indexes=(),
             find_links=(),
             manylinux="not-manylinux" if invalid_manylinux else None,
@@ -181,7 +183,14 @@ def test_validate_lockfiles(
             ),
             no_binary=FrozenOrderedSet(["not-sdist" if invalid_no_binary else "sdist"]),
             only_binary=FrozenOrderedSet(["not-bdist" if invalid_only_binary else "bdist"]),
+            overrides=FrozenOrderedSet(),
+            excludes=FrozenOrderedSet(),
+            sources=FrozenOrderedSet(),
             path_mappings=(),
+            lock_style="universal",
+            complete_platforms=(),
+            uv_platforms=(),
+            uploaded_prior_to=None,
         ),
     )
 
@@ -190,8 +199,7 @@ def test_validate_lockfiles(
 
     reqs_desc = comma_separated_list(f"`{rs}`" for rs in req_strings)
     contains(
-        f"You are consuming {reqs_desc} from the `a` lockfile at lock.txt "
-        "with incompatible inputs"
+        f"You are consuming {reqs_desc} from the `a` lockfile at lock.txt with incompatible inputs"
     )
     contains(
         "The lockfile does not provide all the necessary requirements",
@@ -209,7 +217,7 @@ def test_validate_lockfiles(
     contains("The `no_binary` arguments have changed", if_=invalid_no_binary)
     contains("The `manylinux` argument has changed", if_=invalid_manylinux)
 
-    contains("./pants generate-lockfiles --resolve=a`")
+    contains("pants generate-lockfiles --resolve=a`")
 
 
 def test_is_probably_pex_json_lockfile():
@@ -350,24 +358,24 @@ def test_pex_lockfile_requirement_count() -> None:
     )
 
 
-class TestResolvePexConfigPexArgs:
-    def pairwise(self, iterable):
-        # Drop once on 3.10
-        # https://docs.python.org/3/library/itertools.html#itertools.pairwise
-        a, b = itertools.tee(iterable)
-        next(b, None)
-        return zip(a, b)
-
+class TestResolveConfigPexArgs:
     def simple_config_args(self, manylinux=None, only_binary=None, no_binary=None):
         return tuple(
-            ResolvePexConfig(
+            ResolveConfig(
                 indexes=[],
                 find_links=[],
                 manylinux=manylinux,
                 constraints_file=None,
                 no_binary=FrozenOrderedSet(no_binary) if no_binary else FrozenOrderedSet(),
                 only_binary=FrozenOrderedSet(only_binary) if only_binary else FrozenOrderedSet(),
+                excludes=FrozenOrderedSet(),
+                overrides=FrozenOrderedSet(),
+                sources=FrozenOrderedSet(),
                 path_mappings=[],
+                lock_style="universal",
+                complete_platforms=(),
+                uv_platforms=(),
+                uploaded_prior_to=None,
             ).pex_args()
         )
 
@@ -381,11 +389,11 @@ class TestResolvePexConfigPexArgs:
         many = "manylinux2014_ppc64le"
         args = self.simple_config_args(manylinux=many)
         assert len(args) == 3
-        assert ("--manylinux", many) in self.pairwise(args)
+        assert ("--manylinux", many) in itertools.pairwise(args)
 
     def test_only_binary(self):
         assert "--only-binary=foo" in self.simple_config_args(only_binary=["foo"])
-        assert ("--only-binary=foo", "--only-binary=bar") in self.pairwise(
+        assert ("--only-binary=foo", "--only-binary=bar") in itertools.pairwise(
             self.simple_config_args(only_binary=["foo", "bar"])
         )
 
@@ -407,7 +415,7 @@ class TestResolvePexConfigPexArgs:
 
     def test_no_binary(self):
         assert "--only-build=foo" in self.simple_config_args(no_binary=["foo"])
-        assert ("--only-build=foo", "--only-build=bar") in self.pairwise(
+        assert ("--only-build=foo", "--only-build=bar") in itertools.pairwise(
             self.simple_config_args(no_binary=["foo", "bar"])
         )
 
@@ -423,3 +431,180 @@ class TestResolvePexConfigPexArgs:
 
         assert "--wheel" in self.simple_config_args(no_binary=["foo", ":none:"])
         assert "--only-build" not in " ".join(self.simple_config_args(no_binary=["foo", ":none:"]))
+
+    def test_uploaded_prior_to(self):
+        args = self.simple_config_args()
+        assert "--uploaded-prior-to" not in " ".join(args)
+
+        args = tuple(
+            ResolveConfig(
+                indexes=[],
+                find_links=[],
+                manylinux=None,
+                constraints_file=None,
+                no_binary=FrozenOrderedSet(),
+                only_binary=FrozenOrderedSet(),
+                excludes=FrozenOrderedSet(),
+                overrides=FrozenOrderedSet(),
+                sources=FrozenOrderedSet(),
+                path_mappings=[],
+                lock_style="universal",
+                complete_platforms=(),
+                uv_platforms=(),
+                uploaded_prior_to="2023-09-20",
+            ).pex_args()
+        )
+        assert "--uploaded-prior-to=2023-09-20" in args
+
+
+def _uv_config(
+    indexes=None,
+    sources=None,
+    only_binary=None,
+    no_binary=None,
+    uploaded_prior_to=None,
+):
+    cfg = ResolveConfig(
+        indexes=indexes if indexes is not None else ["https://pypi.org/simple"],
+        find_links=[],
+        manylinux=None,
+        constraints_file=None,
+        no_binary=FrozenOrderedSet(no_binary or []),
+        only_binary=FrozenOrderedSet(only_binary or []),
+        excludes=FrozenOrderedSet(),
+        overrides=FrozenOrderedSet(),
+        sources=FrozenOrderedSet(sources or []),
+        path_mappings=[],
+        lock_style="universal",
+        complete_platforms=(),
+        uv_platforms=(),
+        uploaded_prior_to=uploaded_prior_to,
+    )
+    return tomllib.loads(cfg.uv_config())
+
+
+def test_uv_config_indexes():
+    ics = InterpreterConstraints([">=3.8"])
+
+    parsed = tomllib.loads(generate_pyproject_toml("test", ics, [], indexes=[]))
+    assert parsed["tool"]["uv"].get("no-index") is True
+    assert "index" not in parsed["tool"]["uv"]
+
+    parsed = tomllib.loads(
+        generate_pyproject_toml("test", ics, [], indexes=["https://example.com/simple"])
+    )
+    indexes = parsed["tool"]["uv"]["index"]
+    assert len(indexes) == 1
+    assert indexes[0]["url"] == "https://example.com/simple"
+    assert indexes[0]["default"] is True
+
+    parsed = tomllib.loads(
+        generate_pyproject_toml(
+            "test",
+            ics,
+            [],
+            indexes=[
+                "https://primary.example.com/simple",
+                "fallback=https://secondary.example.com/simple",
+            ],
+            find_links=[
+                "https://findlinks.example.com/index",
+                "other=https://findlinks.other.com/index",
+            ],
+        )
+    )
+    indexes = parsed["tool"]["uv"]["index"]
+    assert len(indexes) == 4
+    assert indexes[0]["url"] == "https://primary.example.com/simple"
+    assert "name" not in indexes[0]
+    assert "default" not in indexes[0]
+    assert "explicit" not in indexes[0]
+    assert indexes[1]["url"] == "https://secondary.example.com/simple"
+    assert indexes[1].get("name") == "fallback"
+    assert "default" not in indexes[1]
+    assert indexes[1]["explicit"] is True
+    assert indexes[2]["url"] == "https://findlinks.example.com/index"
+    assert "name" not in indexes[2]
+    assert "default" not in indexes[2]
+    assert "explicit" not in indexes[2]
+    assert indexes[3]["url"] == "https://findlinks.other.com/index"
+    assert indexes[3].get("name") == "other"
+    assert indexes[3]["default"] is True
+    assert indexes[3]["explicit"] is True
+
+
+def test_uv_config_sources():
+    ics = InterpreterConstraints([">=3.8"])
+
+    parsed = tomllib.loads(generate_pyproject_toml("test", ics, ["requests"], sources=tuple()))
+    assert "sources" not in parsed.get("tool", {}).get("uv", {})
+
+    parsed = tomllib.loads(
+        generate_pyproject_toml("test", ics, ["requests"], sources=["myindex=requests>=2.0"])
+    )
+    assert parsed["tool"]["uv"]["sources"] == {"requests": {"index": "myindex"}}
+
+    parsed = tomllib.loads(
+        generate_pyproject_toml(
+            "test", ics, ["requests"], sources=['myindex=requests>=2.0; python_version > "3.8"']
+        )
+    )
+    assert parsed["tool"]["uv"]["sources"]["requests"]["index"] == "myindex"
+    assert "python_version" in parsed["tool"]["uv"]["sources"]["requests"]["marker"]
+
+    parsed = tomllib.loads(
+        generate_pyproject_toml(
+            "test",
+            ics,
+            ["requests", "boto3"],
+            sources=["indexa=requests>=2.0", "indexb=boto3>=1.0"],
+        )
+    )
+    assert parsed["tool"]["uv"]["sources"]["requests"] == {"index": "indexa"}
+    assert parsed["tool"]["uv"]["sources"]["boto3"] == {"index": "indexb"}
+
+
+def test_uv_config_no_binary():
+    parsed = _uv_config(no_binary=["foo", "bar"])
+    assert parsed["no-binary-package"] == ["foo", "bar"]
+    assert "no-binary" not in parsed
+
+    parsed = _uv_config(no_binary=[":all:"])
+    assert parsed.get("no-binary") is True
+    assert "no-binary-package" not in parsed
+
+    # :all: wins even when combined with package names
+    parsed = _uv_config(no_binary=["foo", ":all:"])
+    assert parsed.get("no-binary") is True
+    assert "no-binary-package" not in parsed
+
+    # :none: means "no restriction" — no key emitted
+    parsed = _uv_config(no_binary=[":none:"])
+    assert "no-binary" not in parsed
+    assert "no-binary-package" not in parsed
+
+
+def test_uv_config_only_binary():
+    parsed = _uv_config(only_binary=["foo", "bar"])
+    assert parsed["no-build-package"] == ["foo", "bar"]
+    assert "no-build" not in parsed
+
+    parsed = _uv_config(only_binary=[":all:"])
+    assert parsed.get("no-build") is True
+    assert "no-build-package" not in parsed
+
+    parsed = _uv_config(only_binary=["foo", ":all:"])
+    assert parsed.get("no-build") is True
+    assert "no-build-package" not in parsed
+
+    parsed = _uv_config(only_binary=[":none:"])
+    assert "no-build" not in parsed
+    assert "no-build-package" not in parsed
+
+
+def test_uv_config_exclude_newer():
+    parsed = _uv_config(uploaded_prior_to="2023-09-20")
+    assert parsed["exclude-newer"] == "2023-09-20"
+
+    parsed = _uv_config()
+    assert "exclude-newer" not in parsed

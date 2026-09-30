@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from textwrap import dedent
 
@@ -94,6 +95,77 @@ def test_find_binary_file_path(rule_runner: RuleRunner, tmp_path: Path) -> None:
     assert binary_paths.first_path.path == str(binary_path_abs)
 
 
+def test_find_binary_symlink_to_dir_on_path(rule_runner: RuleRunner, tmp_path: Path) -> None:
+    # A symlink-to-directory on PATH should be followed and the binary found inside it.
+    target_dir = tmp_path / "real_bin_dir"
+    MyBin.create(target_dir)
+    symlink = tmp_path / "link_to_bin_dir"
+    symlink.symlink_to(target_dir)
+
+    binary_paths = rule_runner.request(
+        BinaryPaths,
+        [BinaryPathRequest(binary_name=MyBin.binary_name, search_path=[str(symlink)])],
+    )
+    assert binary_paths.first_path is not None
+    assert binary_paths.first_path.path == str(symlink / MyBin.binary_name)
+
+
+def test_find_binary_symlink_to_file_on_path(rule_runner: RuleRunner, tmp_path: Path) -> None:
+    # Regression test for https://github.com/pantsbuild/pants/issues/21990:
+    # a symlink-to-file on PATH should be skipped gracefully, not crash with IntrinsicError.
+    target_file = tmp_path / "some_file"
+    target_file.touch()
+    symlink = tmp_path / "my_symlink"
+    symlink.symlink_to(target_file)
+
+    binary_paths = rule_runner.request(
+        BinaryPaths,
+        [BinaryPathRequest(binary_name=MyBin.binary_name, search_path=[str(symlink)])],
+    )
+    assert binary_paths.first_path is None
+
+
+def test_find_binary_file_component_on_path(rule_runner: RuleRunner, tmp_path: Path) -> None:
+    # Regression test for https://github.com/pantsbuild/pants/issues/21990:
+    # a path like `foo/bar` where `foo` is a file should be skipped gracefully, not crash.
+    file_component = tmp_path / "not_a_dir"
+    file_component.touch()
+    bogus_path = file_component / "subdir"
+
+    binary_paths = rule_runner.request(
+        BinaryPaths,
+        [BinaryPathRequest(binary_name=MyBin.binary_name, search_path=[str(bogus_path)])],
+    )
+    assert binary_paths.first_path is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="chmod does not yield EPERM on Windows")
+def test_find_binary_permission_denied_path_entry(rule_runner: RuleRunner, tmp_path: Path) -> None:
+    # Regression test for https://github.com/pantsbuild/pants/issues/23366:
+    # a PATH directory that returns EPERM/EACCES on metadata of its children
+    # should be skipped, not crash with IntrinsicError.
+    denied = tmp_path / "denied"
+    denied.mkdir()
+    MyBin.create(denied)
+    denied.chmod(0o000)
+    try:
+        good_dir = tmp_path / "bin"
+        good_path = MyBin.create(good_dir)
+        binary_paths = rule_runner.request(
+            BinaryPaths,
+            [
+                BinaryPathRequest(
+                    binary_name=MyBin.binary_name,
+                    search_path=[str(denied), str(good_dir)],
+                )
+            ],
+        )
+        assert binary_paths.first_path is not None
+        assert binary_paths.first_path.path == str(good_path)
+    finally:
+        denied.chmod(0o755)
+
+
 def test_find_binary_respects_search_path_order(rule_runner: RuleRunner, tmp_path: Path) -> None:
     binary_path_abs1 = MyBin.create(tmp_path / "bin1")
     binary_path_abs2 = MyBin.create(tmp_path / "bin2")
@@ -175,4 +247,77 @@ def test_binary_shims_paths(rule_runner: RuleRunner, tmp_path: Path) -> None:
             """
         ),
         binary_shim.content.decode(),
+    )
+
+
+def test_no_negative_caching_of_binary_paths_lookups(
+    rule_runner: RuleRunner, tmp_path: Path
+) -> None:
+    MyBin.create(tmp_path / "foo")
+    MyBin.create(tmp_path / "bar")
+
+    def find_binary_paths() -> BinaryPaths:
+        return rule_runner.request(
+            BinaryPaths,
+            [
+                BinaryPathRequest(
+                    binary_name=MyBin.binary_name,
+                    search_path=[
+                        str(tmp_path / "foo"),
+                        str(tmp_path / "bar"),
+                    ],
+                    check_file_entries=True,
+                )
+            ],
+        )
+
+    binary_paths = find_binary_paths()
+    assert len(binary_paths.paths) == 2
+    assert binary_paths.paths[0].path == str(tmp_path / "foo" / MyBin.binary_name)
+    assert binary_paths.paths[1].path == str(tmp_path / "bar" / MyBin.binary_name)
+
+    # Delete the one of the binaries. It should no longer be found by the binary paths lookup.
+    (tmp_path / "foo" / MyBin.binary_name).unlink()
+
+    # Force a new session since the path lookup even though uncached across sessions is still
+    # cached in the current session.
+    rule_runner.new_session("session2")
+    rule_runner.set_options([])
+
+    binary_paths = find_binary_paths()
+    assert len(binary_paths.paths) == 1
+    assert binary_paths.paths[0].path == str(tmp_path / "bar" / MyBin.binary_name)
+
+
+def test_merge_and_detection_of_duplicate_binary_paths() -> None:
+    # Test merge of duplicate paths where content hash is the same.
+    shims_request_1 = BinaryShimsRequest.for_paths(
+        BinaryPath("/foo/bar", "abc123"),
+        BinaryPath("/abc/def/123", "def456"),
+        BinaryPath("/foo/bar", "abc123"),
+        rationale="awesomeness",
+    )
+    assert shims_request_1.paths == (
+        BinaryPath("/abc/def/123", "def456"),
+        BinaryPath("/foo/bar", "abc123"),
+    )
+
+    # Test detection of duplicate pahs with differing content hashes. Exception should be thrown.
+    with pytest.raises(ValueError, match="Detected duplicate paths with mismatched content"):
+        _ = BinaryShimsRequest.for_paths(
+            BinaryPath("/foo/bar", "abc123"),
+            BinaryPath("/abc/def/123", "def456"),
+            BinaryPath("/foo/bar", "xyz789"),
+            rationale="awesomeness",
+        )
+
+    # Test paths with no duplication.
+    shims_request_2 = BinaryShimsRequest.for_paths(
+        BinaryPath("/foo/bar", "abc123"),
+        BinaryPath("/abc/def/123", "def456"),
+        rationale="awesomeness",
+    )
+    assert shims_request_2.paths == (
+        BinaryPath("/abc/def/123", "def456"),
+        BinaryPath("/foo/bar", "abc123"),
     )

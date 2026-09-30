@@ -3,15 +3,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import pytest
-from packaging.requirements import InvalidRequirement
-from pkg_resources import Requirement
+from packaging.requirements import InvalidRequirement, Requirement
 
 from pants.backend.python.subsystems.setup import PythonSetup
-from pants.backend.python.target_types import InterpreterConstraintsField
+from pants.backend.python.target_types import InterpreterConstraintsField, PythonResolveField
 from pants.backend.python.util_rules.interpreter_constraints import (
     _PATCH_VERSION_UPPER_BOUND,
     InterpreterConstraints,
@@ -28,14 +27,18 @@ from pants.util.strutil import softwrap
 @dataclass(frozen=True)
 class MockFieldSet(FieldSet):
     interpreter_constraints: InterpreterConstraintsField
+    resolve: PythonResolveField
 
     @classmethod
-    def create_for_test(cls, address: Address, compat: str | None) -> MockFieldSet:
+    def create_for_test(
+        cls, address: Address, compat: str | None, resolve: str = "python-default"
+    ) -> MockFieldSet:
         return cls(
             address=address,
             interpreter_constraints=InterpreterConstraintsField(
                 [compat] if compat else None, address=address
             ),
+            resolve=PythonResolveField(resolve, address=address),
         )
 
 
@@ -44,7 +47,7 @@ def test_merge_interpreter_constraints() -> None:
         result = sorted(str(req) for req in InterpreterConstraints.merge_constraint_sets(inp))
         # Requirement.parse() sorts specs differently than we'd like, so we convert each str to a
         # Requirement.
-        normalized_expected = sorted(str(Requirement.parse(v)) for v in expected)
+        normalized_expected = sorted(str(Requirement(v)) for v in expected)
         assert result == normalized_expected
 
     # Multiple constraint sets get merged so that they are ANDed.
@@ -148,6 +151,21 @@ def test_merge_interpreter_constraints() -> None:
         expected=["PyPy>=43.0,<44.0", "Jython>=1.2,<1.3"],
     )
 
+    # The free-threaded / GIL ABI qualifier is preserved, and an unqualified constraint (which
+    # matches either ABI) narrows to whichever ABI it is ANDed with.
+    assert_merged(
+        inp=[["CPython[free-threaded]==3.14.*"], ["CPython==3.14.*"]],
+        expected=["CPython[free-threaded]==3.14.*"],
+    )
+    assert_merged(
+        inp=[["CPython[gil]>=3.14"], ["CPython==3.14.*"]],
+        expected=["CPython[gil]>=3.14,==3.14.*"],
+    )
+    assert_merged(
+        inp=[["CPython[free-threaded]==3.14.*"], ["CPython[free-threaded]>=3.13"]],
+        expected=["CPython[free-threaded]==3.14.*,>=3.13"],
+    )
+
     # Ensure we error when there is no solution.
     def assert_impossible(constraints, expected_msg):
         with pytest.raises(ValueError) as excinfo:
@@ -160,6 +178,11 @@ def test_merge_interpreter_constraints() -> None:
         )
 
     assert_impossible([["CPython==3.7.*"], ["PyPy==43.0"]], "(CPython==3.7.*) AND (PyPy==43.0)")
+    # The two CPython ABIs are mutually exclusive.
+    assert_impossible(
+        [["CPython[free-threaded]==3.14.*"], ["CPython[gil]==3.14.*"]],
+        "(CPython[free-threaded]==3.14.*) AND (CPython[gil]==3.14.*)",
+    )
     assert_impossible(
         [["CPython==3.7.*", "Jython>=1.2"], ["PyPy==43.0", "Stackless<3.7"]],
         "(CPython==3.7.* OR Jython>=1.2) AND (PyPy==43.0 OR Stackless<3.7)",
@@ -235,6 +258,7 @@ def test_interpreter_constraints_minimum_python_version(
         (["CPython==3.7.*", "PyPy==3.6.*"], "PyPy==3.6.*"),
         (["CPython"], "CPython==2.7.*"),
         (["CPython==3.7.*,<3.6"], None),
+        (["CPython[free-threaded]>=3.9"], "CPython[free-threaded]==3.9.*"),
         ([], None),
     ],
 )
@@ -300,7 +324,12 @@ def test_group_field_sets_by_constraints() -> None:
     ]
     assert InterpreterConstraints.group_field_sets_by_constraints(
         [py2_fs, *py3_fs],
-        python_setup=create_subsystem(PythonSetup, interpreter_constraints=[]),
+        python_setup=create_subsystem(
+            PythonSetup,
+            interpreter_constraints=[],
+            warn_on_python2_usage=False,
+            enable_resolves=False,
+        ),
     ) == FrozenDict(
         {
             InterpreterConstraints(["CPython>=2.7,<3"]): (py2_fs,),
@@ -322,11 +351,16 @@ def test_group_field_sets_by_constraints_with_unsorted_inputs() -> None:
         ),
     ]
 
-    ic_36 = InterpreterConstraints([Requirement.parse("CPython==3.6.*")])
+    ic_36 = InterpreterConstraints([Requirement("CPython==3.6.*")])
 
     output = InterpreterConstraints.group_field_sets_by_constraints(
         py3_fs,
-        python_setup=create_subsystem(PythonSetup, interpreter_constraints=[]),
+        python_setup=create_subsystem(
+            PythonSetup,
+            interpreter_constraints=[],
+            warn_on_python2_usage=False,
+            enable_resolves=False,
+        ),
     )
 
     assert output[ic_36] == (
@@ -441,6 +475,12 @@ def test_enumerate_python_versions_invalid_universe(version: str) -> None:
             [">=3.5"],
             True,
         ),  # target matches a weirdly specified non-disjoint IC list
+        # An ABI-agnostic candidate contains an ABI-qualified target...
+        (["==3.9.*"], ["CPython[free-threaded]==3.9.*"], True),
+        # ...but a qualified candidate does not contain an agnostic or opposite-ABI target.
+        (["CPython[free-threaded]==3.9.*"], ["==3.9.*"], False),
+        (["CPython[free-threaded]==3.9.*"], ["CPython[gil]==3.9.*"], False),
+        (["CPython[free-threaded]>=3.9"], ["CPython[free-threaded]==3.9.*"], True),
     ),
 )
 def test_contains(candidate, target, matches) -> None:
@@ -485,8 +525,9 @@ def test_partition_into_major_minor_versions(constraints: list[str], expected: l
         (["CPython==2.7.*"], (2, 7)),
         (["==3.0.*"], (3, 0)),
         (["==3.45.*"], (3, 45)),
+        (["CPython[free-threaded]==3.14.*"], (3, 14)),
+        (["CPython[gil]==3.14.*"], (3, 14)),
         ([">=3.45,<3.46"], (3, 45)),
-        ([">=3.45.*,<3.46.*"], (3, 45)),
         (["CPython>=3.45,<3.46"], (3, 45)),
         (["<3.46,>=3.45"], (3, 45)),
         # Invalid/too hard
@@ -510,7 +551,6 @@ def test_partition_into_major_minor_versions(constraints: list[str], expected: l
         ([">3.45,<=3.46"], None),
         ([">3.45,<3.47"], None),
         (["===3.45"], None),
-        ([">=3.45,<=3.45.*"], None),
         # wrong number of elements
         ([], None),
         (["==3.45.*", "==3.46.*"], None),
@@ -541,10 +581,55 @@ def test_major_minor_version_when_single_and_entire(
         ("CPython==3.9.*", "CPython==3.9.*"),
         ("==3.9.*", "CPython==3.9.*"),
         ("PyPy==3.9.*", "PyPy==3.9.*"),
+        ("CPython[free-threaded]==3.14.*", "CPython[free-threaded]==3.14.*"),
+        ("CPython[gil]==3.14.*", "CPython[gil]==3.14.*"),
+        ("[free-threaded]==3.14.*", "CPython[free-threaded]==3.14.*"),
+        # Pex's `+t` / `-t` value spelling is accepted and normalized to the `[extra]` form.
+        ("CPython+t==3.14.*", "CPython[free-threaded]==3.14.*"),
+        ("CPython-t==3.14.*", "CPython[gil]==3.14.*"),
+        ("+t==3.14.*", "CPython[free-threaded]==3.14.*"),
     ],
 )
 def test_parse_python_interpreter_constraint_when_valid(input_ic: str, expected: str) -> None:
-    assert parse_constraint(input_ic) == Requirement.parse(expected)
+    assert parse_constraint(input_ic) == Requirement(expected)
+
+
+@pytest.mark.parametrize(
+    ("constraints", "expected"),
+    [
+        ([], None),
+        (["CPython==3.14.*"], None),
+        (["CPython[free-threaded]==3.14.*"], True),
+        (["CPython[gil]==3.14.*"], False),
+        (["CPython[free-threaded]==3.14.*", "CPython[free-threaded]==3.15.*"], True),
+        # Mixed ABIs across the OR'd alternatives are not a single requirement.
+        (["CPython[free-threaded]==3.14.*", "CPython[gil]==3.14.*"], None),
+        (["CPython[free-threaded]==3.14.*", "CPython==3.15.*"], None),
+    ],
+)
+def test_requires_free_threaded_abi(constraints: list[str], expected: bool | None) -> None:
+    assert InterpreterConstraints(constraints).requires_free_threaded_abi() is expected
+
+
+def test_for_fixed_python_version_free_threaded() -> None:
+    assert InterpreterConstraints.for_fixed_python_version("3.14.1") == InterpreterConstraints(
+        ["CPython==3.14.1"]
+    )
+    assert InterpreterConstraints.for_fixed_python_version(
+        "3.14.1", free_threaded=True
+    ) == InterpreterConstraints(["CPython[free-threaded]==3.14.1"])
+    assert InterpreterConstraints.for_fixed_python_version(
+        "3.14.1", free_threaded=False
+    ) == InterpreterConstraints(["CPython[gil]==3.14.1"])
+
+
+def test_free_threaded_qualifier_reaches_pex_arg_list() -> None:
+    # Pex selects the ABI from this qualifier; it must survive to the CLI verbatim.
+    ics = InterpreterConstraints(["CPython[free-threaded]==3.14.*"])
+    assert ics.generate_pex_arg_list() == [
+        "--interpreter-constraint",
+        "CPython[free-threaded]==3.14.*",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -552,6 +637,8 @@ def test_parse_python_interpreter_constraint_when_valid(input_ic: str, expected:
     [
         ("some-invalid-constraint-3.9.*", "Failed to parse Python interpreter constraint"),
         ("3.9.*", "Failed to parse Python interpreter constraint"),
+        ("CPython[nogil]==3.14.*", "unknown qualifier"),
+        ("CPython[free-threaded,gil]==3.14.*", "cannot require both"),
     ],
 )
 def test_parse_python_interpreter_constraint_when_invalid(
@@ -559,3 +646,30 @@ def test_parse_python_interpreter_constraint_when_invalid(
 ) -> None:
     with pytest.raises(InvalidRequirement, match=expected_error):
         parse_constraint(input_ic)
+
+
+@pytest.mark.parametrize(
+    argnames=("compat", "enable_resolves", "expected"),
+    argvalues=[
+        ("==3.11.*", False, InterpreterConstraints.for_fixed_python_version("3.11.*")),
+        (None, False, InterpreterConstraints.for_fixed_python_version("3.10.*")),
+        (None, True, InterpreterConstraints.for_fixed_python_version("3.12.*")),
+    ],
+)
+def test_default_to_resolve_interpreter_constraints(
+    compat: str | None, enable_resolves: bool, expected: InterpreterConstraints
+) -> None:
+    field_set = MockFieldSet.create_for_test(
+        Address("src/python/path.py", target_name="test"), compat
+    )
+    subsystem = create_subsystem(
+        PythonSetup,
+        enable_resolves=enable_resolves,
+        interpreter_constraints=["==3.10.*"],
+        default_resolve="python-default",
+        resolves={"python-default": "default.lock"},
+        default_to_resolve_interpreter_constraints=True,
+        resolves_to_interpreter_constraints={"python-default": ["==3.12.*"]},
+        warn_on_python2_usage=False,
+    )
+    assert InterpreterConstraints.create_from_field_sets([field_set], subsystem) == expected

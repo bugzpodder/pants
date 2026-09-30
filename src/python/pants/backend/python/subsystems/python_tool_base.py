@@ -3,9 +3,17 @@
 
 from __future__ import annotations
 
+import importlib.resources
+import json
 import logging
 import os
-from typing import ClassVar, Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+from functools import cache
+from typing import ClassVar
+from urllib.parse import urlparse
+
+import toml
 
 from pants.backend.python.target_types import ConsoleScript, EntryPoint, MainSpecification
 from pants.backend.python.util_rules.interpreter_constraints import InterpreterConstraints
@@ -18,18 +26,28 @@ from pants.backend.python.util_rules.pex_requirements import (
     Lockfile,
     PexRequirements,
     Resolve,
+    get_lockfile_for_resolve,
+    load_lockfile,
+    strip_comments_from_pex_json_lockfile,
 )
 from pants.core.goals.resolves import ExportableTool
 from pants.engine.fs import Digest
-from pants.engine.internals.selectors import Get
+from pants.engine.rules import implicitly
 from pants.option.errors import OptionsError
 from pants.option.option_types import StrListOption, StrOption
 from pants.option.subsystem import Subsystem
 from pants.util.docutil import doc_url, git_url
 from pants.util.meta import classproperty
-from pants.util.strutil import softwrap
+from pants.util.pip_requirement import PipRequirement
+from pants.util.strutil import softwrap, strval
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _PackageNameAndVersion:
+    name: str
+    version: str
 
 
 class PythonToolRequirementsBase(Subsystem, ExportableTool):
@@ -37,29 +55,50 @@ class PythonToolRequirementsBase(Subsystem, ExportableTool):
 
     # Subclasses must set.
     default_version: ClassVar[str]
+    # Must be set by subclasses - will be used to set the help text in this class.
+    help_short: ClassVar[str | Callable[[], str]]
     # Subclasses do not need to override.
     default_extra_requirements: ClassVar[Sequence[str]] = []
 
     # Subclasses may set to override the value computed from default_version and
     # default_extra_requirements.
+    # The primary package used in the subsystem must always be the first requirement.
     # TODO: Once we get rid of those options, subclasses must set this to loose
     #  requirements that reflect any minimum capabilities Pants assumes about the tool.
     default_requirements: Sequence[str] = []
 
-    default_interpreter_constraints: ClassVar[Sequence[str]] = ["CPython>=3.7,<4"]
+    default_interpreter_constraints: ClassVar[Sequence[str]] = ["CPython>=3.10,<3.15"]
     register_interpreter_constraints: ClassVar[bool] = False
 
     default_lockfile_resource: ClassVar[tuple[str, str] | None] = None
 
-    install_from_resolve = StrOption(
-        advanced=True,
-        default=None,
-        help=lambda cls: softwrap(
+    @classmethod
+    def _help_extended(cls) -> str:
+        base_help = strval(cls.help_short)
+        help_paragraphs = [base_help]
+        package_and_version = cls._default_package_name_and_version()
+        if package_and_version:
+            new_paragraph = f"This version of Pants uses `{package_and_version.name}` version {package_and_version.version} by default. Use a dedicated lockfile and the `install_from_resolve` option to control this."
+            help_paragraphs.append(new_paragraph)
+
+        return "\n\n".join(help_paragraphs)
+
+    help = classproperty(_help_extended)
+
+    @classmethod
+    def _install_from_resolve_help(cls) -> str:
+        package_and_version = cls._default_package_name_and_version()
+        version_clause = (
+            f", which uses `{package_and_version.name}` version {package_and_version.version}"
+            if package_and_version
+            else ""
+        )
+        return softwrap(
             f"""\
             If specified, install the tool using the lockfile for this named resolve.
 
             This resolve must be defined in `[python].resolves`, as described in
-            {doc_url("docs/python/overview/third-party-dependencies#user-lockfiles")}.
+            {doc_url("docs/python/overview/lockfiles#lockfiles-for-tools")}.
 
             The resolve's entire lockfile will be installed, unless specific requirements are
             listed via the `requirements` option, in which case only those requirements
@@ -67,13 +106,18 @@ class PythonToolRequirementsBase(Subsystem, ExportableTool):
             outputs when the resolve incurs changes to unrelated requirements.
 
             If unspecified, and the `lockfile` option is unset, the tool will be installed
-            using the default lockfile shipped with Pants.
+            using the default lockfile shipped with Pants{version_clause}.
 
             If unspecified, and the `lockfile` option is set, the tool will use the custom
             `{cls.options_scope}` "tool lockfile" generated from the `version` and
             `extra_requirements` options. But note that this mechanism is deprecated.
             """
-        ),
+        )
+
+    install_from_resolve = StrOption(
+        advanced=True,
+        default=None,
+        help=lambda cls: cls._install_from_resolve_help(),
     )
 
     requirements = StrListOption(
@@ -85,7 +129,9 @@ class PythonToolRequirementsBase(Subsystem, ExportableTool):
 
             Values can be pip-style requirements (e.g., `tool` or `tool==1.2.3` or `tool>=1.2.3`),
             or addresses of `python_requirement` targets (or targets that generate or depend on
-            `python_requirement` targets).
+            `python_requirement` targets). Make sure to use the `//` prefix to refer to targets
+            using their full address from the root (e.g. `//3rdparty/python:tool`). This is necessary
+            to distinguish address specs from local or VCS requirements.
 
             The lockfile will be validated against the requirements - if a lockfile doesn't
             provide the requirement (at a suitable version, if the requirement specifies version
@@ -152,7 +198,7 @@ class PythonToolRequirementsBase(Subsystem, ExportableTool):
 
             If you would like to generate a lockfile for {resolve_name},
             follow the instructions for setting up lockfiles for tools
-            {doc_url('docs/python/overview/lockfiles#lockfiles-for-tools')}
+            {doc_url("docs/python/overview/lockfiles#lockfiles-for-tools")}
         """
         )
 
@@ -168,6 +214,76 @@ class PythonToolRequirementsBase(Subsystem, ExportableTool):
             url_description_of_origin=origin,
             resolve_name=cls.options_scope,
         )
+
+    @classmethod
+    @cache
+    def _default_package_name_and_version(cls) -> _PackageNameAndVersion | None:
+        if cls.default_lockfile_resource is None:
+            return None
+
+        lockfile = cls.pex_requirements_for_default_lockfile()
+        parts = urlparse(lockfile.url)
+        # urlparse retains the leading / in URLs with a netloc.
+        lockfile_path = parts.path[1:] if parts.path.startswith("/") else parts.path
+        if parts.scheme in {"", "file"}:
+            with open(lockfile_path, "rb") as fp:
+                lock_bytes = fp.read()
+        elif parts.scheme == "resource":
+            # The "netloc" in our made-up "resource://" scheme is the package.
+            lock_bytes = (
+                importlib.resources.files(parts.netloc).joinpath(lockfile_path).read_bytes()
+            )
+        else:
+            raise ValueError(
+                f"Unsupported scheme {parts.scheme} for lockfile URL: {lockfile.url} "
+                f"(origin: {lockfile.url_description_of_origin})"
+            )
+
+        # Note that this code relies on knowing the internal structure of uv and pex lockfiles,
+        # neither of which are guaranteed. If parsing fails we'll return None and the calling
+        # code will deal with it (by omitting some information from help strings).
+        first_default_requirement = PipRequirement.parse(cls.default_requirements[0])
+        stripped_lock_bytes = strip_comments_from_pex_json_lockfile(lock_bytes)
+
+        try:  # Is it uv.lock?
+            lockfile_contents = toml.loads(lock_bytes.decode())
+            # The first requirement must contain the primary package for this tool, otherwise
+            # this will pick up the wrong requirement.
+            return next(
+                _PackageNameAndVersion(name=first_default_requirement.name, version=pkg["version"])
+                for pkg in lockfile_contents["package"]
+                if pkg["name"] == first_default_requirement.name
+            )
+        except KeyError:
+            # It's toml, but the schema is off.
+            logger.warning(f"File at {lockfile.url} was not of expected uv.lock schema.")
+            return None
+        except toml.TomlDecodeError:
+            # It's not toml, so it's not uv.lock format. Fall through to try pex lockfile format.
+            # TODO: This is only used internally, for generating help, based on the *default*
+            #  lockfiles. Once those are all uv, and we are confident they will remain so,
+            #  we can remove the JSON handling here.
+            pass
+
+        try:
+            lockfile_contents = json.loads(stripped_lock_bytes)
+            # The first requirement must contain the primary package for this tool, otherwise
+            # this will pick up the wrong requirement.
+            return next(
+                _PackageNameAndVersion(
+                    name=first_default_requirement.name, version=requirement["version"]
+                )
+                for resolve in lockfile_contents["locked_resolves"]
+                for requirement in resolve["locked_requirements"]
+                if requirement["project_name"] == first_default_requirement.name
+            )
+        except KeyError:
+            # It's json, but the schema is off.
+            logger.warning(f"File at {lockfile.url} was not of expected pex lock schema.")
+            return None
+        except json.JSONDecodeError:
+            # It's not json, so it's not pex lock format.
+            raise Exception(f"File at {lockfile.url} was not of any recognized lockfile format")
 
     def pex_requirements(
         self,
@@ -314,8 +430,8 @@ async def get_loaded_lockfile(subsystem: PythonToolBase) -> LoadedLockfile:
     else:
         assert isinstance(requirements, PexRequirements)
         assert isinstance(requirements.from_superset, Resolve)
-        lockfile = await Get(Lockfile, Resolve, requirements.from_superset)
-    loaded_lockfile = await Get(LoadedLockfile, LoadedLockfileRequest(lockfile))
+        lockfile = await get_lockfile_for_resolve(requirements.from_superset, **implicitly())
+    loaded_lockfile = await load_lockfile(LoadedLockfileRequest(lockfile), **implicitly())
     return loaded_lockfile
 
 

@@ -1,30 +1,65 @@
 # Copyright 2021 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
+# pants: infer-dep(native_engine.so)
+# pants: infer-dep(native_engine.so.metadata)
+
 from __future__ import annotations
 
-from io import RawIOBase
-from typing import (
-    Any,
+from collections.abc import (
     Callable,
-    ClassVar,
-    FrozenSet,
-    Generic,
+    Coroutine,
+    Generator,
+    Hashable,
     Iterable,
+    Iterator,
+    KeysView,
     Mapping,
-    Protocol,
     Sequence,
+)
+from datetime import datetime, timedelta
+from enum import Enum
+from io import RawIOBase
+from pathlib import Path
+from typing import (
+    AbstractSet,
+    Any,
+    ClassVar,
+    Generic,
+    Protocol,
+    Self,
     TextIO,
-    Tuple,
     TypeVar,
+    final,
     overload,
 )
 
-from typing_extensions import Self
-
+from pants.base.glob_match_error_behavior import GlobMatchErrorBehavior
+from pants.engine.fs import (
+    CreateDigest,
+    DigestContents,
+    DigestEntries,
+    DigestSubset,
+    GlobExpansionConjunction,
+    NativeDownloadFile,
+    PathMetadataRequest,
+    PathMetadataResult,
+    Paths,
+)
+from pants.engine.internals.docker import DockerResolveImageRequest, DockerResolveImageResult
+from pants.engine.internals.native_dep_inference import (
+    NativeDockerfileInfo,
+    NativeJavascriptFileDependencies,
+    NativePythonFileDependencies,
+)
 from pants.engine.internals.scheduler import Workunit, _PathGlobsAndRootCollection
-from pants.engine.internals.session import SessionValues
-from pants.engine.process import InteractiveProcess, InteractiveProcessResult
+from pants.engine.internals.session import RunId, SessionValues
+from pants.engine.process import (
+    FallibleProcessResult,
+    InteractiveProcess,
+    InteractiveProcessResult,
+    Process,
+)
 
 # TODO: black and flake8 disagree about the content of this file:
 #   see https://github.com/psf/black/issues/1548
@@ -37,13 +72,83 @@ from pants.engine.process import InteractiveProcess, InteractiveProcessResult
 class PyFailure:
     def get_error(self) -> Exception | None: ...
 
+K = TypeVar("K")
+V = TypeVar("V")
+
+class FrozenDict(Mapping[K, V]):
+    """A wrapper around a normal `dict` that removes all methods to mutate the instance and that
+    implements __hash__.
+
+    This should be used instead of normal dicts when working with the engine because normal dicts
+    are not safe to use.
+    """
+
+    @overload
+    def __new__(cls, __items: Iterable[tuple[K, V]], **kwargs: V) -> Self: ...
+    @overload
+    def __new__(cls, __other: Mapping[K, V], **kwargs: V) -> Self: ...
+    @overload
+    def __new__(cls, **kwargs: V) -> Self: ...
+    @classmethod
+    def deep_freeze(cls, data: Mapping[K, V]) -> Self: ...
+    @staticmethod
+    def frozen(to_freeze: Mapping[K, V]) -> FrozenDict[K, V]: ...
+    def __getitem__(self, k: K) -> V: ...
+    def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[K]: ...
+    def __reversed__(self) -> Iterator[K]: ...
+    def __eq__(self, other: Any) -> Any: ...
+    def __lt__(self, other: Any) -> bool: ...
+    def __or__(self, other: Any) -> FrozenDict[K, V]: ...
+    def __ror__(self, other: Any) -> FrozenDict[K, V]: ...
+    def __hash__(self) -> int: ...
+    def __repr__(self) -> str: ...
+
+T_co = TypeVar("T_co", covariant=True)
+
+class FrozenOrderedSet(AbstractSet[T_co], Hashable):
+    """A frozen (i.e. immutable) ordered set backed by Rust.
+
+    This is safe to use with the V2 engine.
+    """
+
+    def __new__(cls, iterable: Iterable[T_co] | None = None) -> Self: ...
+    def __len__(self) -> int: ...
+    def __contains__(self, key: Any) -> bool: ...
+    def __iter__(self) -> Iterator[T_co]: ...
+    def __reversed__(self) -> Iterator[T_co]: ...
+    def __hash__(self) -> int: ...
+    def __eq__(self, other: Any) -> bool: ...
+    def __or__(self, other: Iterable[T_co]) -> FrozenOrderedSet[T_co]: ...  # type: ignore[override]  # widens from AbstractSet
+    def __and__(self, other: Iterable[T_co]) -> FrozenOrderedSet[T_co]: ...
+    def __sub__(self, other: Iterable[T_co]) -> FrozenOrderedSet[T_co]: ...
+    def __xor__(self, other: Iterable[T_co]) -> FrozenOrderedSet[T_co]: ...  # type: ignore[override]  # widens from AbstractSet
+    def __bool__(self) -> bool: ...
+    def __repr__(self) -> str: ...
+    def union(self, *others: Iterable[T_co]) -> FrozenOrderedSet[T_co]: ...
+    def intersection(self, *others: Iterable[T_co]) -> FrozenOrderedSet[T_co]: ...
+    def difference(self, *others: Iterable[T_co]) -> FrozenOrderedSet[T_co]: ...
+    def symmetric_difference(self, other: Iterable[T_co]) -> FrozenOrderedSet[T_co]: ...
+    def issubset(self, other: Iterable[T_co]) -> bool: ...
+    def issuperset(self, other: Iterable[T_co]) -> bool: ...
+    def isdisjoint(self, other: Iterable[T_co]) -> bool: ...
+
+_K = TypeVar("_K", bound=Hashable)
+_V = TypeVar("_V")
+
+class LockedMap(Generic[_K, _V]):
+    def get_or_insert(self, key: _K, compute: Callable[[], _V]) -> _V: ...
+    def put(self, key: _K, value: _V) -> None: ...
+    def forget(self, key: _K) -> None: ...
+    def clear(self) -> None: ...
+
 # ------------------------------------------------------------------------------
 # Address
 # ------------------------------------------------------------------------------
 
-BANNED_CHARS_IN_TARGET_NAME: FrozenSet
-BANNED_CHARS_IN_GENERATED_NAME: FrozenSet
-BANNED_CHARS_IN_PARAMETERS: FrozenSet
+BANNED_CHARS_IN_TARGET_NAME: frozenset
+BANNED_CHARS_IN_GENERATED_NAME: frozenset
+BANNED_CHARS_IN_PARAMETERS: frozenset
 
 def address_spec_parse(
     spec: str,
@@ -140,6 +245,7 @@ class AddressInput:
         directory, i.e. a target which leaves off `name`.
         """
         ...
+
     @property
     def spec(self) -> str: ...
     @property
@@ -155,6 +261,7 @@ class AddressInput:
     def file_to_address(self) -> Address:
         """Converts to an Address by assuming that the path_component is a file on disk."""
         ...
+
     def dir_to_address(self) -> Address:
         """Converts to an Address by assuming that the path_component is a directory on disk."""
         ...
@@ -190,6 +297,7 @@ class Address:
           them, this will always be relative.
         """
         ...
+
     @property
     def spec_path(self) -> str: ...
     @property
@@ -207,6 +315,7 @@ class Address:
     def is_parametrized_subset_of(self, other: Address) -> bool:
         """True if this Address is == to the given Address, but with a subset of its parameters."""
         ...
+
     @property
     def filename(self) -> str: ...
     @property
@@ -221,17 +330,21 @@ class Address:
         "relative" spec notation.
         """
         ...
+
     @property
     def path_safe_spec(self) -> str: ...
-    def parametrize(self, parameters: Mapping[str, str]) -> Address:
-        """Creates a new Address with the given `parameters` merged over self.parameters."""
+    def parametrize(self, parameters: Mapping[str, str], replace: bool = False) -> Address:
+        """Creates a new Address with the given `parameters` merged or replaced over
+        self.parameters."""
         ...
+
     def maybe_convert_to_target_generator(self) -> Address:
         """If this address is generated or parametrized, convert it to its generator target.
 
         Otherwise, return self unmodified.
         """
         ...
+
     def create_generated(self, generated_name: str) -> Address: ...
     def create_file(self, relative_file_path: str) -> Address: ...
     def debug_hint(self) -> str: ...
@@ -243,6 +356,51 @@ class Address:
     def __gt__(self, other: Any) -> bool: ...
 
 # ------------------------------------------------------------------------------
+# Union
+# ------------------------------------------------------------------------------
+
+class UnionRule:
+    union_base: type
+    union_member: type
+
+    def __init__(self, union_base: type, union_member: type) -> None: ...
+
+_T = TypeVar("_T", bound=type)
+
+class UnionMembership:
+    @staticmethod
+    def from_rules(rules: Iterable[UnionRule]) -> UnionMembership: ...
+    @staticmethod
+    def empty() -> UnionMembership: ...
+    def __contains__(self, union_type: _T) -> bool: ...
+    def __getitem__(self, union_type: _T) -> Sequence[_T]:
+        """Get all members of this union type.
+
+        If the union type does not exist because it has no members registered, this will raise an
+        IndexError.
+
+        Note that the type hint assumes that all union members will have subclassed the union type
+        - this is only a convention and is not actually enforced. So, you may have inaccurate type
+        hints.
+        """
+
+    def get(self, union_type: _T) -> Sequence[_T]:
+        """Get all members of this union type.
+
+        If the union type does not exist because it has no members registered, return an empty
+        Sequence.
+
+        Note that the type hint assumes that all union members will have subclassed the union type
+        - this is only a convention and is not actually enforced. So, you may have inaccurate type
+        hints.
+        """
+
+    def items(self) -> Iterable[tuple[type, Sequence[type]]]: ...
+    def is_member(self, union_type: type, putative_member: type) -> bool: ...
+    def has_members(self, union_type: type) -> bool:
+        """Check whether the union has an implementation or not."""
+
+# ------------------------------------------------------------------------------
 # Scheduler
 # ------------------------------------------------------------------------------
 
@@ -250,6 +408,7 @@ class PyExecutor:
     def __init__(self, core_threads: int, max_threads: int) -> None: ...
     def to_borrowed(self) -> PyExecutor: ...
     def shutdown(self, duration_secs: float) -> None: ...
+    def max_blocking_threads(self) -> int | None: ...
 
 # ------------------------------------------------------------------------------
 # Target
@@ -263,10 +422,315 @@ class _NoValue:
     def __bool__(self) -> bool:
         """NB: Always returns `False`."""
         ...
+
     def __repr__(self) -> str: ...
 
 # Marker for unspecified field values that should use the default value if applicable.
 NO_VALUE: _NoValue
+
+class TextBlock:
+    """Block of lines in a file.
+
+    Lines are 1 indexed, `start` is inclusive.
+
+    TextBlock is used as a part of unified diff hunk, thus it can be empty,
+    i.e. count can be equal to 0. In the special case when the file is empty
+    start = 0 and count = 0.
+    """
+
+    start: int
+    count: int
+    end: int
+    def __init__(self, start: int, count: int) -> None: ...
+    def __hash__(self) -> int: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __ne__(self, other: object) -> bool: ...
+    def __getnewargs__(self) -> tuple[int, int]: ...
+
+class Hunk:
+    """Hunk of difference in unified format.
+
+    https://www.gnu.org/software/diffutils/manual/html_node/Detailed-Unified.html
+
+    In the special case when file is created left = None.
+    In the special case when file is deleted right = None.
+    """
+
+    left: TextBlock | None
+    right: TextBlock | None
+    def __init__(self, left: TextBlock | None, right: TextBlock | None) -> None: ...
+    def __hash__(self) -> int: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __ne__(self, other: object) -> bool: ...
+    def __getnewargs__(self) -> tuple[TextBlock | None, TextBlock | None]: ...
+
+class SourceBlock:
+    """Block of lines in a file.
+
+    Lines are 1 indexed, `start` is inclusive, `end` is exclusive.
+
+    SourceBlock is used to describe a set of source lines that are owned by a Target,
+    thus it can't be empty, i.e. `start` must be less than `end`.
+    """
+
+    start: int
+    end: int
+    def __init__(self, start: int, end: int) -> None: ...
+    def __len__(self) -> int: ...
+    def __hash__(self) -> int: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __ne__(self, other: object) -> bool: ...
+    def __getnewargs__(self) -> tuple[int, int]: ...
+    def is_touched_by(self, o: TextBlock) -> bool: ...
+    @classmethod
+    def from_text_block(cls, text_block: TextBlock) -> SourceBlock: ...
+
+class SourceBlocks(FrozenOrderedSet[SourceBlock]): ...
+
+class TargetAdaptor:
+    """A light-weight object to store target information before being converted into the Target
+    API."""
+
+    type_alias: str
+    name: str | None
+    kwargs: FrozenDict[str, Any]
+    description_of_origin: str
+    origin_sources_blocks: FrozenDict[str, SourceBlocks]
+    name_explicitly_set: bool
+    def __init__(
+        self,
+        type_alias: str,
+        name: str | None,
+        __description_of_origin__: str,
+        __origin_sources_blocks__: FrozenDict[str, SourceBlocks] | None = None,
+        **kwargs: Any,
+    ) -> None: ...
+    def with_new_kwargs(self, **kwargs: Any) -> TargetAdaptor: ...
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __hash__(self) -> int: ...
+
+class PluginFieldDescriptor:
+    """Descriptor that creates a unique @union type per subclass.
+
+    This is the Rust equivalent of @distinct_union_type_per_subclass.
+    """
+
+    def __get__(self, obj: Any | None, objtype: type | None = None) -> type: ...
+
+_F = TypeVar("_F", bound=Field)
+
+class Target:
+    """A Target represents an addressable set of metadata.
+
+    Set the `help` class property with a description, which will be used in `./pants help`. For the
+    best rendering, use soft wrapping (e.g. implicit string concatenation) within paragraphs, but
+    hard wrapping (`\n`) to separate distinct paragraphs and/or lists.
+    """
+
+    # Subclasses must define these
+    alias: ClassVar[str]
+    core_fields: ClassVar[tuple[type[Field], ...]]
+    help: ClassVar[str | Callable[[], str]]
+
+    removal_version: ClassVar[str | None] = None
+    removal_hint: ClassVar[str | None] = None
+
+    deprecated_alias: ClassVar[str | None] = None
+    deprecated_alias_removal_version: ClassVar[str | None] = None
+
+    # These get calculated in the constructor
+    address: Address
+    field_values: FrozenDict[type[Field], Field]
+    residence_dir: str
+    name_explicitly_set: bool
+    description_of_origin: str
+    origin_sources_blocks: FrozenDict[str, SourceBlocks]
+    field_types: KeysView[type[Field]]
+
+    PluginField: ClassVar[PluginFieldDescriptor]
+
+    @final
+    def __init__(
+        self,
+        unhydrated_values: Mapping[str, Any],
+        address: Address,
+        # NB: `union_membership` is only optional to facilitate tests. In production, we should
+        # always provide this parameter. This should be safe to do because production code should
+        # rarely directly instantiate Targets and should instead use the engine to request them.
+        union_membership: UnionMembership | None = None,
+        *,
+        name_explicitly_set: bool = True,
+        residence_dir: str | None = None,
+        ignore_unrecognized_fields: bool = False,
+        description_of_origin: str | None = None,
+        origin_sources_blocks: FrozenDict[str, SourceBlocks] | None = None,
+    ) -> None:
+        """Create a target.
+
+        :param unhydrated_values: A mapping of field aliases to their raw values. Any left off
+            fields will either use their default or error if required=True.
+        :param address: How to uniquely identify this target.
+        :param union_membership: Used to determine plugin fields. This must be set in production!
+        :param residence_dir: Where this target "lives". If unspecified, will be the `spec_path`
+            of the `address`, i.e. where the target was either explicitly defined or where its
+            target generator was explicitly defined. Target generators can, however, set this to
+            the directory where the generated target provides metadata for. For example, a
+            file-based target like `python_source` should set this to the parent directory of
+            its file. A file-less target like `go_third_party_package` should keep the default of
+            `address.spec_path`. This field impacts how command line specs work, so that globs
+            like `dir:` know whether to match the target or not.
+        :param ignore_unrecognized_fields: Don't error if fields are not recognized. This is only
+            intended for when Pants is bootstrapping itself.
+        :param description_of_origin: Where this target was declared, such as a path to BUILD file
+            and line number.
+        """
+        ...
+
+    def __repr__(self) -> str: ...
+    def __str__(self) -> str: ...
+    def __hash__(self) -> int: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __lt__(self, other: object) -> bool: ...
+    def __gt__(self, other: object) -> bool: ...
+    @final
+    def __getitem__(self, field: type[_F]) -> _F:
+        """Get the requested `Field` instance belonging to this target.
+
+        If the `Field` is not registered on this `Target` type, this method will raise a
+        `KeyError`. To avoid this, you should first call `tgt.has_field()` or `tgt.has_fields()`
+        to ensure that the field is registered, or, alternatively, use `Target.get()`.
+
+        See the docstring for `Target.get()` for how this method handles subclasses of the
+        requested Field and for tips on how to use the returned value.
+        """
+        ...
+
+    @final
+    def get(self, field: type[_F], *, default_raw_value: Any | None = None) -> _F:
+        """Get the requested `Field` instance belonging to this target.
+
+        This will return an instance of the requested field type, e.g. an instance of
+        `InterpreterConstraints`, `SourcesField`, `EntryPoint`, etc. Usually, you will want to
+        grab the `Field`'s inner value, e.g. `tgt.get(Compatibility).value`. (For async fields like
+        `SourcesField`, you may need to hydrate the value.).
+
+        This works with subclasses of `Field`. For example, if you subclass `Tags`
+        to define a custom subclass `CustomTags`, both `tgt.get(Tags)` and
+        `tgt.get(CustomTags)` will return the same `CustomTags` instance.
+
+        If the `Field` is not registered on this `Target` type, this will return an instance of
+        the requested Field by using `default_raw_value` to create the instance. Alternatively,
+        first call `tgt.has_field()` or `tgt.has_fields()` to ensure that the field is registered,
+        or, alternatively, use indexing (e.g. `tgt[Compatibility]`) to raise a KeyError when the
+        field is not registered.
+        """
+        ...
+
+    @final
+    def _maybe_get(self, field: type[_F]) -> _F | None: ...
+    @final
+    def has_field(self, field: type[Field]) -> bool:
+        """Check that this target has registered the requested field.
+
+        This works with subclasses of `Field`. For example, if you subclass `Tags` to define a
+        custom subclass `CustomTags`, both `tgt.has_field(Tags)` and
+        `python_tgt.has_field(CustomTags)` will return True.
+        """
+        ...
+
+    @final
+    def has_fields(self, fields: Iterable[type[Field]]) -> bool:
+        """Check that this target has registered all of the requested fields.
+
+        This works with subclasses of `Field`. For example, if you subclass `Tags` to define a
+        custom subclass `CustomTags`, both `tgt.has_fields([Tags])` and
+        `python_tgt.has_fields([CustomTags])` will return True.
+        """
+        ...
+
+    @final
+    @classmethod
+    def _has_fields(
+        cls, fields: Iterable[type[Field]], registered_fields: Iterable[type[Field]]
+    ) -> bool: ...
+    @final
+    @classmethod
+    def _find_registered_field_subclass(
+        cls, requested_field: type[_F], registered_fields: Iterable[type[Field]]
+    ) -> type[_F] | None:
+        """Check if the Target has registered a subclass of the requested Field.
+
+        This is necessary to allow targets to override the functionality of common fields. For
+        example, you could subclass `Tags` to define `CustomTags` with a different default. At the
+        same time, we still want to be able to call `tgt.get(Tags)`, in addition to
+        `tgt.get(CustomTags)`.
+        """
+        ...
+
+    @final
+    @classmethod
+    def class_field_types(
+        cls, union_membership: UnionMembership | None
+    ) -> FrozenOrderedSet[type[Field]]:
+        """Return all registered Fields belonging to this target type.
+
+        You can also use the instance property `tgt.field_types` to avoid having to pass the
+        parameter UnionMembership.
+        """
+        ...
+
+    @final
+    @classmethod
+    def class_has_field(cls, field: type[Field], union_membership: UnionMembership) -> bool:
+        """Behaves like `Target.has_field()`, but works as a classmethod rather than an instance
+        method."""
+        ...
+
+    @final
+    @classmethod
+    def class_has_fields(
+        cls, fields: Iterable[type[Field]], union_membership: UnionMembership
+    ) -> bool:
+        """Behaves like `Target.has_fields()`, but works as a classmethod rather than an instance
+        method."""
+        ...
+
+    @final
+    @classmethod
+    def class_get_field(cls, field: type[_F], union_membership: UnionMembership) -> type[_F]:
+        """Get the requested Field type registered with this target type.
+
+        This will error if the field is not registered, so you should call Target.class_has_field()
+        first.
+        """
+        ...
+
+    @classmethod
+    def _find_plugin_fields(cls, union_membership: UnionMembership) -> tuple[type[Field], ...]: ...
+    @classmethod
+    def register_plugin_field(cls, field: type[Field]) -> UnionRule:
+        """Register a new field on the target type.
+
+        In the `rules()` register.py entry-point, include
+        `MyTarget.register_plugin_field(NewField)`. This will register `NewField` as a first-class
+        citizen. Plugins can use this new field like any other.
+        """
+        ...
+
+    @final
+    @classmethod
+    def _get_field_aliases_to_field_types(
+        cls, field_types: Iterable[type[Field]]
+    ) -> dict[str, type[Field]]: ...
+    def validate(self) -> None:
+        """Validate the target, such as checking for mutually exclusive fields.
+
+        N.B.: The validation should only be of properties intrinsic to the associated files in any
+        context. If the validation only makes sense for certain goals acting on targets; those
+        validations should be done in the associated rules.
+        """
+        ...
 
 class Field:
     """A Field.
@@ -336,6 +800,8 @@ class Field:
 
     value: ImmutableValue | None
 
+    _raw_value_type: ClassVar[str]
+
     def __init__(self, raw_value: Any | None, address: Address) -> None: ...
     @classmethod
     def compute_value(cls, raw_value: Any | None, address: Address) -> ImmutableValue:
@@ -348,16 +814,276 @@ class Field:
         """
         ...
 
+_ST = TypeVar("_ST")
+
+class ScalarField(Field, Generic[_ST]):
+    expected_type: ClassVar[type[_ST]]
+    expected_type_description: ClassVar[str]
+    value: _ST | None
+    default: ClassVar[_ST | None] = None
+
+    @classmethod
+    def compute_value(cls, raw_value: Any | None, address: Address) -> _ST | None: ...
+
+class BoolField(ScalarField[bool]):
+    """A field whose value is a boolean.
+
+    Subclasses must either set `default: bool` or `required = True` so that the value is always
+    defined.
+    """
+
+    expected_type: ClassVar[type[bool]]
+    expected_type_description: ClassVar[str]
+    value: bool
+    default: ClassVar[bool]
+
+    @classmethod
+    def compute_value(cls, raw_value: bool, address: Address) -> bool: ...  # type: ignore[override]
+
+class TriBoolField(ScalarField[bool]):
+    """A field whose value is a boolean or None, which is meant to represent a tri-state."""
+
+    expected_type: ClassVar[type[bool]]
+    expected_type_description: ClassVar[str]
+
+    @classmethod
+    def compute_value(cls, raw_value: bool | None, address: Address) -> bool | None: ...
+
+class StringField(ScalarField[str]):
+    expected_type: ClassVar[type[str]]
+    expected_type_description: ClassVar[str]
+    valid_choices: ClassVar[type[Enum] | tuple[str, ...] | None]
+
+    @classmethod
+    def compute_value(cls, raw_value: str | None, address: Address) -> str | None: ...
+
+_ET = TypeVar("_ET")
+
+class SequenceField(Field, Generic[_ET]):
+    expected_element_type: ClassVar[type]
+    expected_type_description: ClassVar[str]
+    value: tuple[_ET, ...] | None
+    default: ClassVar[tuple[_ET, ...] | None] = None
+
+    @classmethod
+    def compute_value(
+        cls, raw_value: Iterable[Any] | None, address: Address
+    ) -> tuple[_ET, ...] | None: ...
+
+class StringSequenceField(SequenceField[str]):
+    expected_element_type: ClassVar[type[str]]
+    expected_type_description: ClassVar[str]
+    valid_choices: ClassVar[type[Enum] | tuple[str, ...] | None]
+
+    @classmethod
+    def compute_value(
+        cls, raw_value: Iterable[str] | None, address: Address
+    ) -> tuple[str, ...] | None: ...
+
+# NB: By subclassing `Field`, MyPy understands our type hints, and it means it doesn't matter
+# which order you use for inheriting the field template vs. the mixin.
+class AsyncFieldMixin(Field):
+    """A mixin to store the field's original `Address` for use during hydration by the engine.
+
+    Typically, you should also create a dataclass representing the hydrated value and another for
+    the request, then a rule to go from the request to the hydrated value. The request class should
+    store the async field as a property.
+
+    (Why use the request class as the rule input, rather than the field itself? It's a wrapper so
+    that subclasses of the async field work properly, given that the engine uses exact type IDs.
+    This is like WrappedTarget.)
+
+    For example:
+
+        class Sources(StringSequenceField, AsyncFieldMixin):
+            alias = "sources"
+
+            # Often, async fields will want to define entry points like this to allow subclasses to
+            # change behavior.
+            def validate_resolved_files(self, files: Sequence[str]) -> None:
+                pass
+
+
+        @dataclass(frozen=True)
+        class HydrateSourcesRequest:
+            field: Sources
+
+
+        @dataclass(frozen=True)
+        class HydratedSources:
+            snapshot: Snapshot
+
+
+        @rule
+        async def hydrate_sources(request: HydrateSourcesRequest) -> HydratedSources:
+            digest = await path_globs_to_digest(PathGlobs(request.field.value))
+            result = await digest_to_snapshot(digest)
+            request.field.validate_resolved_files(result.files)
+            ...
+            return HydratedSources(result)
+
+    Then, call sites can `await` if they need to hydrate the field, even if they subclassed
+    the original async field to have custom behavior:
+
+        sources1 = hydrate_sources(HydrateSourcesRequest(my_tgt.get(Sources)))
+        sources2 = hydrate_sources(HydrateSourcesRequest(custom_tgt.get(CustomSources)))
+    """
+
+    address: Address
+
+    def __hash__(self) -> int: ...
+    def __eq__(self, other: Any) -> bool: ...
+    def __ne__(self, other: Any) -> bool: ...
+    def __repr__(self) -> str: ...
+
+class SourcesField(AsyncFieldMixin):
+    """A field for the sources that a target owns.
+
+    When defining a new sources field, you should subclass `MultipleSourcesField` or
+    `SingleSourceField`, which set up the field's `alias` and data type / parsing. However, you
+    should use `tgt.get(SourcesField)` when you need to operate on all sources types, such as
+    with `HydrateSourcesRequest`, so that both subclasses work.
+
+    Subclasses may set the following class properties:
+
+    - `expected_file_extensions` -- A tuple of strings containing the expected file extensions for
+        source files. The default is no expected file extensions.
+    - `expected_num_files` -- An integer or range stating the expected total number of source
+        files. The default is no limit on the number of source files.
+    - `uses_source_roots` -- Whether the concept of "source root" pertains to the source files
+        referenced by this field.
+    - `default` -- A default value for this field.
+    - `default_glob_match_error_behavior` -- Advanced option, should very rarely be used. Override
+        glob match error behavior when using the default value. If setting this to
+        `GlobMatchErrorBehavior.ignore`, make sure you have other validation in place in case the
+        default glob doesn't match any files, if required, to alert the user appropriately.
+    """
+
+    expected_file_extensions: ClassVar[tuple[str, ...] | None]
+    expected_num_files: ClassVar[int | range | None]
+    uses_source_roots: ClassVar[bool]
+    default: ClassVar[Any]
+    default_glob_match_error_behavior: ClassVar[Any | None]
+    @property
+    def globs(self) -> tuple[str, ...]:
+        """The raw globs, relative to the BUILD file."""
+        ...
+    def validate_resolved_files(self, files: Sequence[str]) -> None:
+        """Perform any additional validation on the resulting source files, e.g. ensuring that
+        certain banned files are not used.
+
+        To enforce that the resulting files end in certain extensions, such as `.py` or `.java`, set
+        the class property `expected_file_extensions`.
+
+        To enforce that there are only a certain number of resulting files, such as binary targets
+        checking for only 0-1 sources, set the class property `expected_num_files`.
+        """
+        ...
+    @staticmethod
+    def prefix_glob_with_dirpath(dirpath: str, glob: str) -> str: ...
+    def _prefix_glob_with_address(self, glob: str) -> str: ...
+    def path_globs(self, unmatched_build_file_globs: Any) -> PathGlobs: ...
+    @classmethod
+    def can_generate(cls, output_type: type[SourcesField], union_membership: Any) -> bool:
+        """Can this field be used to generate the output_type?
+
+        Generally, this method does not need to be used. Most call sites can simply use the below,
+        and the engine will generate the sources if possible or will return an instance of
+        HydratedSources with an empty snapshot if not possible:
+
+            await hydrate_sources(
+                HydrateSourcesRequest(
+                    sources_field,
+                    for_sources_types=[FortranSources],
+                    enable_codegen=True,
+                ),
+                **implicitly(),
+            )
+
+        This method is useful when you need to filter targets before hydrating them, such as how
+        you may filter targets via `tgt.has_field(MyField)`.
+        """
+        ...
+    @property
+    def filespec(self) -> Filespec:
+        """The original globs, returned in the Filespec.
+
+        The globs will be relativized to the build root.
+        """
+        ...
+    @property
+    def filespec_matcher(self) -> FilespecMatcher: ...
+
+class MultipleSourcesField(SourcesField):
+    """The `sources: list[str]` field.
+
+    See the docstring for `SourcesField` for some class properties you can set, such as
+    `expected_file_extensions`.
+
+    When you need to get the sources for all targets, use `tgt.get(SourcesField)` rather than
+    `tgt.get(MultipleSourcesField)`.
+    """
+
+    alias: ClassVar[str]
+    ban_subdirectories: ClassVar[bool]
+    @property
+    def globs(self) -> tuple[str, ...]: ...
+    @classmethod
+    def compute_value(
+        cls, raw_value: Iterable[str] | None, address: Any
+    ) -> tuple[str, ...] | None: ...
+
+class OptionalSingleSourceField(SourcesField):
+    """The `source: str` field.
+
+    See the docstring for `SourcesField` for some class properties you can set, such as
+    `expected_file_extensions`.
+
+    When you need to get the sources for all targets, use `tgt.get(SourcesField)` rather than
+    `tgt.get(OptionalSingleSourceField)`.
+
+    Use `SingleSourceField` if the source must exist.
+    """
+
+    alias: ClassVar[str]
+    @property
+    def globs(self) -> tuple[str, ...]: ...
+    @property
+    def file_path(self) -> str | None:
+        """The path to the file, relative to the build root.
+
+        This works without hydration because we validate that `*` globs and `!` ignores are not
+        used. However, consider still hydrating so that you verify the source file actually exists.
+
+        The return type is optional because it's possible to have 0-1 files.
+        """
+        ...
+    @classmethod
+    def compute_value(cls, raw_value: str | None, address: Any) -> str | None: ...
+
+class SingleSourceField(OptionalSingleSourceField):
+    """The `source: str` field.
+
+    Unlike `OptionalSingleSourceField`, the `.value` must be defined, whether by setting the
+    `default` or making the field `required`.
+
+    See the docstring for `SourcesField` for some class properties you can set, such as
+    `expected_file_extensions`.
+
+    When you need to get the sources for all targets, use `tgt.get(SourcesField)` rather than
+    `tgt.get(SingleSourceField)`.
+    """
+
+    value: str
+    @property
+    def file_path(self) -> str: ...
+
 # ------------------------------------------------------------------------------
 # FS
 # ------------------------------------------------------------------------------
 
 class Digest:
-    """A Digest is a lightweight reference to a set of files known about by the engine.
-
-    You can use `await Get(Snapshot, Digest)` to see the file names referred to, or use `await
-    Get(DigestContents, Digest)` to see the actual file content.
-    """
+    """A Digest is a lightweight reference to a set of files known about by the engine."""
 
     def __init__(self, fingerprint: str, serialized_bytes_length: int) -> None: ...
     @property
@@ -384,11 +1110,8 @@ class Snapshot:
     """A Snapshot is a collection of sorted file paths and dir paths fingerprinted by their
     names/content.
 
-    You can lift a `Digest` to a `Snapshot` with `await Get(Snapshot, Digest, my_digest)`.
-
     The `files` and `dirs` properties are symlink oblivious. If you require knowing about symlinks,
-    you can use the `digest` property to request the `DigestEntries`:
-    `await Get(DigestEntries, Digest, snapshot.digest)`.
+    you can use the `digest` property to request the `DigestEntries`.
     """
 
     @classmethod
@@ -416,12 +1139,8 @@ class Snapshot:
 class MergeDigests:
     """A request to merge several digests into one single digest.
 
-    This will fail if there are any conflicting changes, such as two digests having the same
-    file but with different content.
-
-    Example:
-
-        result = await Get(Digest, MergeDigests([digest1, digest2])
+    This will fail if there are any conflicting changes, such as two digests having the same file
+    but with different content.
     """
 
     def __init__(self, digests: Iterable[Digest]) -> None: ...
@@ -430,12 +1149,7 @@ class MergeDigests:
     def __repr__(self) -> str: ...
 
 class AddPrefix:
-    """A request to add the specified prefix path to every file and directory in the digest.
-
-    Example:
-
-        result = await Get(Digest, AddPrefix(input_digest, "my_dir")
-    """
+    """A request to add the specified prefix path to every file and directory in the digest."""
 
     def __init__(self, digest: Digest, prefix: str) -> None: ...
     def __eq__(self, other: AddPrefix | Any) -> bool: ...
@@ -447,10 +1161,6 @@ class RemovePrefix:
 
     This will fail if there are any files or directories in the original input digest without the
     specified prefix.
-
-    Example:
-
-        result = await Get(Digest, RemovePrefix(input_digest, "my_dir")
     """
 
     def __init__(self, digest: Digest, prefix: str) -> None: ...
@@ -465,11 +1175,147 @@ class FilespecMatcher:
     def __repr__(self) -> str: ...
     def matches(self, paths: Sequence[str]) -> list[str]: ...
 
+class Filespec:
+    """The original globs for a SourcesField, with includes and excludes.
+
+    For example: Filespec(includes=['helloworld/*.py'], excludes=['helloworld/ignore.py']).
+
+    The globs are in zglobs format.
+    """
+
+    @property
+    def includes(self) -> tuple[str, ...]: ...
+    @property
+    def excludes(self) -> tuple[str, ...]: ...
+    def __getitem__(self, key: str) -> tuple[str, ...]: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __repr__(self) -> str: ...
+
+class PathGlobs:
+    def __init__(
+        self,
+        globs: Iterable[str],
+        glob_match_error_behavior: GlobMatchErrorBehavior = ...,
+        conjunction: GlobExpansionConjunction = ...,
+        description_of_origin: str | None = None,
+    ) -> None:
+        """A request to find files given a set of globs.
+        The syntax supported is roughly Git's glob syntax. Use `*` for globs, `**` for recursive
+        globs, and `!` for ignores.
+        :param globs: globs to match, e.g. `foo.txt` or `**/*.txt`. To exclude something, prefix it
+            with `!`, e.g. `!ignore.py`.
+        :param glob_match_error_behavior: whether to warn or error upon match failures
+        :param conjunction: whether all `globs` must match or only at least one must match
+        :param description_of_origin: a human-friendly description of where this PathGlobs request
+            is coming from, used to improve the error message for unmatched globs. For example,
+            this might be the text string "the option `--isort-config`".
+        """
+    @property
+    def globs(self) -> tuple[str, ...]: ...
+    @property
+    def glob_match_error_behavior(self) -> GlobMatchErrorBehavior: ...
+    @property
+    def conjunction(self) -> GlobExpansionConjunction: ...
+    @property
+    def description_of_origin(self) -> str | None: ...
+    def __eq__(self, other: PathGlobs | Any) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __repr__(self) -> str: ...
+
 EMPTY_DIGEST: Digest
 EMPTY_FILE_DIGEST: FileDigest
 EMPTY_SNAPSHOT: Snapshot
 
 def default_cache_path() -> str: ...
+
+class PathMetadataKind:
+    FILE: PathMetadataKind = ...
+    DIRECTORY: PathMetadataKind = ...
+    SYMLINK: PathMetadataKind = ...
+
+class PathMetadata:
+    def __new__(
+        cls,
+        path: str,
+        kind: PathMetadataKind,
+        length: int,
+        is_executable: bool,
+        unix_mode: int | None,
+        accessed: datetime | None,
+        created: datetime | None,
+        modified: datetime | None,
+        symlink_target: str | None,
+    ) -> PathMetadata: ...
+    @property
+    def path(self) -> str: ...
+    @property
+    def kind(self) -> PathMetadataKind: ...
+    @property
+    def length(self) -> int: ...
+    @property
+    def is_executable(self) -> bool: ...
+    @property
+    def unix_mode(self) -> int | None: ...
+    @property
+    def accessed(self) -> datetime | None: ...
+    @property
+    def created(self) -> datetime | None: ...
+    @property
+    def modified(self) -> datetime | None: ...
+    @property
+    def symlink_target(self) -> str | None: ...
+    def copy(self) -> PathMetadata: ...
+
+class PathNamespace:
+    WORKSPACE: PathNamespace = ...
+    SYSTEM: PathNamespace = ...
+
+    def __eq__(self, other: PathNamespace | Any) -> bool: ...
+    def __hash__(self) -> int: ...
+
+# ------------------------------------------------------------------------------
+# Intrinsics
+# ------------------------------------------------------------------------------
+
+async def create_digest(
+    create_digest: CreateDigest,
+) -> Digest: ...
+async def path_globs_to_digest(
+    path_globs: PathGlobs,
+) -> Digest: ...
+async def path_globs_to_paths(
+    path_globs: PathGlobs,
+) -> Paths: ...
+async def download_file(
+    native_download_file: NativeDownloadFile,
+) -> Digest: ...
+async def digest_to_snapshot(digest: Digest) -> Snapshot: ...
+async def get_digest_contents(digest: Digest) -> DigestContents: ...
+async def get_digest_entries(digest: Digest) -> DigestEntries: ...
+async def merge_digests(merge_digests: MergeDigests) -> Digest: ...
+async def remove_prefix(remove_prefix: RemovePrefix) -> Digest: ...
+async def add_prefix(add_prefix: AddPrefix) -> Digest: ...
+async def execute_process(
+    process: Process, process_execution_environment: ProcessExecutionEnvironment
+) -> FallibleProcessResult: ...
+async def digest_subset_to_digest(digest_subset: DigestSubset) -> Digest: ...
+async def session_values() -> SessionValues: ...
+async def run_id() -> RunId: ...
+async def interactive_process(
+    process: InteractiveProcess, process_execution_environment: ProcessExecutionEnvironment
+) -> InteractiveProcessResult: ...
+async def docker_resolve_image(request: DockerResolveImageRequest) -> DockerResolveImageResult: ...
+async def parse_dockerfile_info(
+    deps_request: NativeDependenciesRequest,
+) -> tuple[tuple[str, NativeDockerfileInfo]]: ...
+async def parse_python_deps(
+    deps_request: NativeDependenciesRequest,
+) -> tuple[tuple[str, NativePythonFileDependencies]]: ...
+async def parse_javascript_deps(
+    deps_request: NativeDependenciesRequest,
+) -> tuple[tuple[str, NativeJavascriptFileDependencies]]: ...
+async def path_metadata_request(request: PathMetadataRequest) -> PathMetadataResult: ...
 
 # ------------------------------------------------------------------------------
 # `pantsd`
@@ -496,6 +1342,9 @@ class ProcessExecutionEnvironment:
         docker_image: str | None,
         remote_execution: bool,
         remote_execution_extra_platform_properties: Sequence[tuple[str, str]],
+        execute_in_workspace: bool,
+        # Must be a `KeepSandboxes` value
+        keep_sandboxes: str,
     ) -> None: ...
     def __eq__(self, other: ProcessExecutionEnvironment | Any) -> bool: ...
     def __hash__(self) -> int: ...
@@ -518,6 +1367,9 @@ class ProcessExecutionEnvironment:
 # ------------------------------------------------------------------------------
 
 def all_counter_names() -> list[str]: ...
+def decode_observation_histogram(
+    encoded: bytes, percentiles: Sequence[float]
+) -> dict[str, int | float]: ...
 
 # ------------------------------------------------------------------------------
 # Nailgun
@@ -534,6 +1386,125 @@ class PantsdClientException(Exception):
     pass
 
 # ------------------------------------------------------------------------------
+# Options
+# ------------------------------------------------------------------------------
+
+class PyGoalInfo:
+    def __init__(
+        self, scope_name: str, is_builtin: bool, is_auxiliary: bool, aliases: tuple[str, ...]
+    ) -> None: ...
+
+class PyOptionId:
+    def __init__(
+        self, *components: str, scope: str | None = None, switch: str | None = None
+    ) -> None: ...
+
+class PyNgInvocation:
+    @staticmethod
+    def empty() -> PyNgInvocation: ...
+    @staticmethod
+    def from_args(args: tuple[str, ...]) -> PyNgInvocation: ...
+    def global_flag_strings(self) -> tuple[str, ...]: ...
+    def specs(self) -> tuple[str, ...]: ...
+    def goals(self) -> tuple[str, ...]: ...
+    def passthru(self) -> tuple[str, ...]: ...
+
+class PyPantsCommand:
+    def builtin_or_auxiliary_goal(self) -> str | None: ...
+    def goals(self) -> list[str]: ...
+    def unknown_goals(self) -> list[str]: ...
+    def specs(self) -> list[str]: ...
+    def passthru(self) -> list[str]: ...
+
+class PyConfigSource:
+    def __init__(self, path: str, content: bytes) -> None: ...
+
+# See src/rust/engine/src/externs/options.rs for the Rust-side versions of these types.
+T = TypeVar("T")
+
+# List of tuples of (value, rank, details string).
+OptionValueDerivation = list[tuple[T, int, str]]
+
+# A tuple (value, rank of value, optional derivation of value).
+OptionValue = tuple[T | None, int, OptionValueDerivation | None]
+
+def py_bin_name() -> str: ...
+
+class PyOptionParser:
+    def __init__(
+        self,
+        buildroot: Path | None,
+        args: Sequence[str] | None,
+        env: dict[str, str],
+        configs: Sequence[PyConfigSource] | None,
+        allow_pantsrc: bool,
+        include_derivation: bool,
+        known_scopes_to_flags: dict[str, frozenset[str]] | None,
+        known_goals: Sequence[PyGoalInfo] | None,
+    ) -> None: ...
+    def get_bool(self, option_id: PyOptionId, default: bool | None) -> OptionValue[bool]: ...
+    def get_int(self, option_id: PyOptionId, default: int | None) -> OptionValue[int]: ...
+    def get_float(self, option_id: PyOptionId, default: float | None) -> OptionValue[float]: ...
+    def get_string(self, option_id: PyOptionId, default: str | None) -> OptionValue[str]: ...
+    def get_bool_list(
+        self, option_id: PyOptionId, default: Iterable[bool]
+    ) -> OptionValue[list[bool]]: ...
+    def get_int_list(
+        self, option_id: PyOptionId, default: Iterable[int]
+    ) -> OptionValue[list[int]]: ...
+    def get_float_list(
+        self, option_id: PyOptionId, default: Iterable[float]
+    ) -> OptionValue[list[float]]: ...
+    def get_string_list(
+        self, option_id: PyOptionId, default: Iterable[str]
+    ) -> OptionValue[list[str]]: ...
+    def get_dict(self, option_id: PyOptionId, default: dict[str, Any]) -> OptionValue[dict]: ...
+    def get_command(self) -> PyPantsCommand: ...
+    def get_unconsumed_flags(self) -> dict[str, list[str]]: ...
+    def validate_config(self, valid_keys: dict[str, set[str]]) -> list[str]: ...
+
+class PyNgOptionsReader:
+    # Useful in tests.
+    def __init__(
+        self,
+        buildroot: Path,
+        flags: dict[str, dict[str, tuple[str | None, ...]]],
+        env: dict[str, str],
+        configs: Sequence[PyConfigSource],
+    ) -> None: ...
+    def get_bool(self, option_id: PyOptionId, default: bool | None) -> OptionValue[bool]: ...
+    def get_int(self, option_id: PyOptionId, default: int | None) -> OptionValue[int]: ...
+    def get_float(self, option_id: PyOptionId, default: float | None) -> OptionValue[float]: ...
+    def get_string(self, option_id: PyOptionId, default: str | None) -> OptionValue[str]: ...
+    def get_bool_list(
+        self, option_id: PyOptionId, default: list[bool] | tuple[bool]
+    ) -> OptionValue[list[bool]]: ...
+    def get_int_list(
+        self, option_id: PyOptionId, default: list[int] | tuple[int]
+    ) -> OptionValue[list[int]]: ...
+    def get_float_list(
+        self, option_id: PyOptionId, default: list[float] | tuple[float]
+    ) -> OptionValue[list[float]]: ...
+    def get_string_list(
+        self, option_id: PyOptionId, default: list[str] | tuple[str]
+    ) -> OptionValue[list[str]]: ...
+    def get_dict(self, option_id: PyOptionId, default: dict[str, Any]) -> OptionValue[dict]: ...
+
+class PyNgSourcePartition:
+    def paths(self) -> tuple[str, ...]: ...
+    def options_reader(self) -> PyNgOptionsReader: ...
+
+class PyNgOptions:
+    def __init__(
+        self,
+        pants_invocation: PyNgInvocation,
+        env: dict[str, str],
+        include_derivation: bool,
+    ) -> None: ...
+    def get_options_reader_for_dir(self, dir: str) -> PyNgOptionsReader: ...
+    def partition_sources(self, paths: tuple[str, ...]) -> tuple[PyNgSourcePartition, ...]: ...
+
+# ------------------------------------------------------------------------------
 # Testutil
 # ------------------------------------------------------------------------------
 
@@ -548,6 +1519,8 @@ class PyStubCAS:
     @property
     def address(self) -> str: ...
     def remove(self, digest: FileDigest | Digest) -> bool: ...
+    def contains(self, digest: FileDigest | Digest) -> bool: ...
+    def contains_action_result(self, digest: FileDigest | Digest) -> bool: ...
     def action_cache_len(self) -> int: ...
 
 # ------------------------------------------------------------------------------
@@ -557,23 +1530,21 @@ class PyStubCAS:
 class InferenceMetadata:
     @staticmethod
     def javascript(
-        package_root: str, import_patterns: dict[str, list[str]]
+        package_root: str,
+        import_patterns: dict[str, Sequence[str]],
+        config_root: str | None,
+        paths: dict[str, Sequence[str]],
     ) -> InferenceMetadata: ...
     def __eq__(self, other: InferenceMetadata | Any) -> bool: ...
     def __hash__(self) -> int: ...
     def __repr__(self) -> str: ...
 
 class NativeDependenciesRequest:
-    """A request to parse the dependencies of a file.
+    """A request to parse the dependencies of a set of files.
 
-    * The `digest` is expected to contain exactly one source file.
     * Depending on the implementation, a `metadata` structure
       can be passed. It will be supplied to the native parser, and
       it will be incorporated into the cache key.
-
-
-    Example:
-        result = await Get(NativeParsedPythonDependencies, NativeDependenciesRequest(input_digest, None)
     """
 
     def __init__(self, digest: Digest, metadata: InferenceMetadata | None = None) -> None: ...
@@ -598,6 +1569,7 @@ class RawFdRunner(Protocol):
         stderr_fileno: int,
     ) -> int: ...
 
+def initialize() -> None: ...
 def capture_snapshots(
     scheduler: PyScheduler,
     session: PySession,
@@ -617,6 +1589,11 @@ def write_digest(
     path_prefix: str,
     clear_paths: Sequence[str],
 ) -> None: ...
+def suggest_renames(
+    tentative_paths: Sequence[str],
+    actual_files: Sequence[str],
+    actual_dirs: Sequence[str],
+) -> list[tuple[str, str]]: ...
 def write_log(msg: str, level: int, target: str) -> None: ...
 def flush_log() -> None: ...
 def set_per_run_log_path(path: str | None) -> None: ...
@@ -654,11 +1631,13 @@ def tasks_task_begin(
 ) -> None: ...
 def tasks_task_end(tasks: PyTasks) -> None: ...
 def tasks_add_call(
-    tasks: PyTasks, output: type, inputs: Sequence[type], rule_id: str, explicit_args_arity: int
-) -> None: ...
-def tasks_add_get(tasks: PyTasks, output: type, inputs: Sequence[type]) -> None: ...
-def tasks_add_get_union(
-    tasks: PyTasks, output_type: type, input_types: Sequence[type], in_scope_types: Sequence[type]
+    tasks: PyTasks,
+    output: type,
+    inputs: Sequence[type],
+    rule_id: str,
+    explicit_args_arity: int,
+    vtable_entries: Sequence[tuple[type, str]] | None,
+    in_scope_types: Sequence[type] | None,
 ) -> None: ...
 def tasks_add_query(tasks: PyTasks, output_type: type, input_types: Sequence[type]) -> None: ...
 def execution_add_root_select(
@@ -676,6 +1655,7 @@ def scheduler_create(
     tasks: PyTasks,
     types: PyTypes,
     build_root: str,
+    pants_workdir: str,
     local_execution_root_dir: str,
     named_caches_dir: str,
     ignore_patterns: Sequence[str],
@@ -693,8 +1673,9 @@ def scheduler_metrics(scheduler: PyScheduler, session: PySession) -> dict[str, i
 def scheduler_live_items(
     scheduler: PyScheduler, session: PySession
 ) -> tuple[list[Any], dict[str, tuple[int, int]]]: ...
-def scheduler_shutdown(scheduler: PyScheduler, timeout_secs: int) -> None: ...
+def scheduler_shutdown(scheduler: PyScheduler, timeout: timedelta) -> None: ...
 def session_new_run_id(session: PySession) -> None: ...
+def session_enable_streaming_workunits(session: PySession) -> None: ...
 def session_poll_workunits(
     scheduler: PyScheduler, session: PySession, max_log_verbosity_level: int
 ) -> tuple[tuple[Workunit, ...], tuple[Workunit, ...]]: ...
@@ -710,7 +1691,7 @@ def session_record_test_observation(
 ) -> None: ...
 def session_isolated_shallow_clone(session: PySession, build_id: str) -> PySession: ...
 def session_wait_for_tail_tasks(
-    scheduler: PyScheduler, session: PySession, timeout: float
+    scheduler: PyScheduler, session: PySession, timeout: timedelta
 ) -> None: ...
 def graph_len(scheduler: PyScheduler) -> int: ...
 def graph_visualize(scheduler: PyScheduler, session: PySession, path: str) -> None: ...
@@ -722,9 +1703,6 @@ def validate_reachability(scheduler: PyScheduler) -> None: ...
 def rule_graph_consumed_types(
     scheduler: PyScheduler, param_types: Sequence[type], product_type: type
 ) -> list[type]: ...
-def rule_graph_rule_gets(
-    scheduler: PyScheduler,
-) -> dict[Callable, list[tuple[type, list[type], Callable]]]: ...
 def rule_graph_visualize(scheduler: PyScheduler, path: str) -> None: ...
 def rule_subgraph_visualize(
     scheduler: PyScheduler, param_types: Sequence[type], product_type: type, path: str
@@ -732,7 +1710,7 @@ def rule_subgraph_visualize(
 def garbage_collect_store(scheduler: PyScheduler, target_size_bytes: int) -> None: ...
 def lease_files_in_graph(scheduler: PyScheduler, session: PySession) -> None: ...
 def strongly_connected_components(
-    adjacency_lists: Sequence[Tuple[Any, Sequence[Any]]]
+    adjacency_lists: Sequence[tuple[Any, Sequence[Any]]],
 ) -> Sequence[Sequence[Any]]: ...
 def hash_prefix_zero_bits(item: str) -> int: ...
 
@@ -741,21 +1719,31 @@ def hash_prefix_zero_bits(item: str) -> int: ...
 # ------------------------------------------------------------------------------
 
 _Output = TypeVar("_Output")
+_Output_co = TypeVar("_Output_co", covariant=True)
 _Input = TypeVar("_Input")
 
-class PyGeneratorResponseCall:
+class Call(Generic[_Output_co]):
+    rule_id: str
+    output_type: type
+    args: tuple[Any, ...]
+    implicit_args: dict[Any, type]
+
     @overload
     def __init__(
         self,
+        rule_id: str,
         output_type: type,
         args: tuple[Any, ...],
         input_arg0: dict[Any, type],
     ) -> None: ...
     @overload
-    def __init__(self, output_type: type, args: tuple[Any, ...], input_arg0: _Input) -> None: ...
+    def __init__(
+        self, rule_id: str, output_type: type, args: tuple[Any, ...], input_arg0: _Input
+    ) -> None: ...
     @overload
     def __init__(
         self,
+        rule_id: str,
         output_type: type,
         args: tuple[Any, ...],
         input_arg0: type[_Input],
@@ -764,41 +1752,46 @@ class PyGeneratorResponseCall:
     @overload
     def __init__(
         self,
+        rule_id: str,
         output_type: type,
         args: tuple[Any, ...],
         input_arg0: type[_Input] | _Input,
         input_arg1: _Input | None = None,
     ) -> None: ...
+    def __await__(self) -> Generator[Any, None, _Output_co]: ...
+    def __repr__(self) -> str: ...
 
-class PyGeneratorResponseGet(Generic[_Output]):
+class _Concurrently(Generic[_Output_co]):
+    def __init__(
+        self, calls: tuple[Coroutine[Any, Any, Any] | Call[Any] | _Concurrently[Any], ...]
+    ) -> None: ...
+    def __await__(self) -> Generator[_Concurrently[_Output_co], None, _Output_co]: ...
+    @property
+    def calls(
+        self,
+    ) -> tuple[Coroutine[Any, Any, Any] | Call[Any] | _Concurrently[Any], ...]: ...
+
+class RuleCallTrampoline(Generic[_Output]):
+    """The callable `@rule` returns. Captures `rule_id` and `output_type` at decoration time so
+    each invocation constructs the already-awaitable `Call` directly.
+    `__getattribute__` forwards `__doc__` and other introspection attrs to the wrapped function.
+    """
+
+    rule_id: str
     output_type: type[_Output]
-    input_types: Sequence[type]
-    inputs: Sequence[Any]
+    rule: Any
+    __wrapped__: Callable[..., Any]
 
-    @overload
-    def __init__(self, output_type: type[_Output]) -> None: ...
-    @overload
     def __init__(
         self,
+        rule_id: str,
         output_type: type[_Output],
-        input_arg0: dict[Any, type],
+        wrapped: Callable[..., Any],
+        rule: Any,
     ) -> None: ...
-    @overload
-    def __init__(self, output_type: type[_Output], input_arg0: _Input) -> None: ...
-    @overload
-    def __init__(
-        self,
-        output_type: type[_Output],
-        input_arg0: type[_Input],
-        input_arg1: _Input,
-    ) -> None: ...
-    @overload
-    def __init__(
-        self,
-        output_type: type[_Output],
-        input_arg0: type[_Input] | _Input,
-        input_arg1: _Input | None = None,
-    ) -> None: ...
+    def __call__(
+        self, *args: Any, __implicitly: Sequence[Any] = (), **kwargs: Any
+    ) -> Call[_Output]: ...
 
 # ------------------------------------------------------------------------------
 # (uncategorized)

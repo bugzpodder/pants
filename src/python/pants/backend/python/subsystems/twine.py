@@ -5,30 +5,31 @@ from __future__ import annotations
 
 from pants.backend.python.subsystems.python_tool_base import PythonToolBase
 from pants.backend.python.target_types import ConsoleScript
+from pants.core.goals.resolves import ExportableTool
 from pants.core.util_rules.config_files import ConfigFilesRequest
 from pants.engine.fs import CreateDigest
 from pants.engine.rules import collect_rules
+from pants.engine.unions import UnionRule
 from pants.option.global_options import ca_certs_path_to_file_content
 from pants.option.option_types import ArgsListOption, BoolOption, FileOption, SkipOption, StrOption
 from pants.util.docutil import doc_url
 from pants.util.strutil import softwrap
 
+# pants: infer-dep(twine.lock*)
+
 
 class TwineSubsystem(PythonToolBase):
     options_scope = "twine"
     name = "Twine"
-    help = "The utility for publishing Python distributions to PyPI and other Python repositories."
+    help_short = (
+        "The utility for publishing Python distributions to PyPI and other Python repositories."
+    )
 
     default_version = "twine>=4,<5"
     default_main = ConsoleScript("twine")
 
     default_requirements = [
-        "twine>=3.7.1,<5",
-        # This explicit dependency resolves a weird behavior in poetry, where it would include a
-        # sys platform constraint on "Windows" when this was included transitively from the twine
-        # requirements.
-        # See: https://github.com/pantsbuild/pants/pull/13594#issuecomment-968154931
-        "colorama>=0.4.3",
+        "twine>=5.1.1,<8",
     ]
 
     register_interpreter_constraints = True
@@ -78,7 +79,7 @@ class TwineSubsystem(PythonToolBase):
 
             This option cannot be overridden via environment targets, so if you need a different
             value than what the rest of your organization is using, override the value via an
-            environment variable, CLI argument, or `.pants.rc` file. See {doc_url('docs/using-pants/key-concepts/options')}.
+            environment variable, CLI argument, or `.pants.rc` file. See {doc_url("docs/using-pants/key-concepts/options")}.
             """
         ),
     )
@@ -101,4 +102,7 @@ class TwineSubsystem(PythonToolBase):
 
 
 def rules():
-    return collect_rules()
+    return [
+        *collect_rules(),
+        UnionRule(ExportableTool, TwineSubsystem),
+    ]

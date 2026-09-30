@@ -1,16 +1,20 @@
 # Copyright 2020 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
+import os
+import re
 import string
 from collections import namedtuple
-from dataclasses import FrozenInstanceError, dataclass
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, ClassVar, Dict, Iterable, List, Optional, Sequence, Set, Tuple, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 
 from pants.engine.addresses import Address
 from pants.engine.fs import GlobExpansionConjunction, GlobMatchErrorBehavior, PathGlobs, Paths
+from pants.engine.internals.target_adaptor import SourceBlock, SourceBlocks
 from pants.engine.target import (
     NO_VALUE,
     AsyncFieldMixin,
@@ -28,6 +32,7 @@ from pants.engine.target import (
     IntField,
     InvalidFieldChoiceException,
     InvalidFieldException,
+    InvalidFieldMemberTypeException,
     InvalidFieldTypeException,
     InvalidGeneratedTargetException,
     InvalidTargetException,
@@ -42,14 +47,15 @@ from pants.engine.target import (
     StringField,
     StringSequenceField,
     Target,
+    TupleSequenceField,
     ValidNumbers,
     generate_file_based_overrides_field_help_message,
     get_shard,
     parse_shard_spec,
     targets_with_sources_types,
 )
-from pants.engine.unions import UnionMembership
-from pants.option.global_options import UnmatchedBuildFileGlobs
+from pants.engine.unions import UnionMembership, UnionRule
+from pants.option.bootstrap_options import UnmatchedBuildFileGlobs
 from pants.testutil.pytest_util import no_exception
 from pants.util.frozendict import FrozenDict
 from pants.util.ordered_set import FrozenOrderedSet, OrderedSet
@@ -61,11 +67,11 @@ from pants.util.ordered_set import FrozenOrderedSet, OrderedSet
 
 class FortranExtensions(Field):
     alias = "fortran_extensions"
-    value: Tuple[str, ...]
+    value: tuple[str, ...]
     default = ()
 
     @classmethod
-    def compute_value(cls, raw_value: Optional[Iterable[str]], address: Address) -> Tuple[str, ...]:
+    def compute_value(cls, raw_value: Iterable[str] | None, address: Address) -> tuple[str, ...]:
         value_or_default = super().compute_value(raw_value, address)
         # Add some arbitrary validation to test that hydration/validation works properly.
         bad_extensions = [
@@ -135,8 +141,8 @@ def test_field_and_target_eq() -> None:
     assert hash(tgt) != hash(other_tgt)
 
     # Ensure the target is frozen.
-    with pytest.raises(FrozenInstanceError):
-        tgt.address = addr  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        tgt.address = addr
 
     # Ensure that subclasses are not equal.
     class SubclassField(FortranVersion):
@@ -183,7 +189,7 @@ def test_get_field() -> None:
     assert default_field_tgt[FortranExtensions].value or 123 == 123
 
     assert (
-        FortranTarget.class_get_field(FortranExtensions, union_membership=UnionMembership({}))
+        FortranTarget.class_get_field(FortranExtensions, union_membership=UnionMembership.empty())
         is FortranExtensions
     )
 
@@ -193,7 +199,7 @@ def test_get_field() -> None:
     assert UnrelatedField.__name__ in str(exc)
 
     with pytest.raises(KeyError) as exc:
-        FortranTarget.class_get_field(UnrelatedField, union_membership=UnionMembership({}))
+        FortranTarget.class_get_field(UnrelatedField, union_membership=UnionMembership.empty())
     assert UnrelatedField.__name__ in str(exc)
 
     assert default_field_tgt.get(UnrelatedField).value == UnrelatedField.default
@@ -213,7 +219,7 @@ def test_field_hydration_is_eager() -> None:
 
 
 def test_has_fields() -> None:
-    empty_union_membership = UnionMembership({})
+    empty_union_membership = UnionMembership.empty()
     tgt = FortranTarget({}, Address("", target_name="lib"))
 
     assert tgt.field_types == {FortranExtensions, FortranVersion}
@@ -335,8 +341,8 @@ def test_override_preexisting_field_via_new_target() -> None:
 
         @classmethod
         def compute_value(
-            cls, raw_value: Optional[Iterable[str]], address: Address
-        ) -> Tuple[str, ...]:
+            cls, raw_value: Iterable[str] | None, address: Address
+        ) -> tuple[str, ...]:
             # Ensure that we avoid certain problematic extensions and always use some defaults.
             specified_extensions = super().compute_value(raw_value, address)
             banned = [
@@ -365,7 +371,9 @@ def test_override_preexisting_field_via_new_target() -> None:
     assert custom_tgt.has_field(CustomFortranExtensions) is True
     assert custom_tgt.has_fields([FortranExtensions, CustomFortranExtensions]) is True
     assert (
-        CustomFortranTarget.class_get_field(FortranExtensions, union_membership=UnionMembership({}))
+        CustomFortranTarget.class_get_field(
+            FortranExtensions, union_membership=UnionMembership.empty()
+        )
         is CustomFortranExtensions
     )
 
@@ -479,7 +487,7 @@ def test_target_residence_dir() -> None:
 def test_coarsened_target_equality() -> None:
     a, b = (FortranTarget({}, Address(name)) for name in string.ascii_lowercase[:2])
 
-    def ct(members: List[Target], dependencies: List[CoarsenedTarget] = []):
+    def ct(members: list[Target], dependencies: list[CoarsenedTarget] = []):
         return CoarsenedTarget(members, dependencies)
 
     assert ct([]) == ct([])
@@ -504,7 +512,7 @@ def test_coarsened_target_closure() -> None:
     all_targets = [FortranTarget({}, Address(name)) for name in string.ascii_lowercase[:5]]
     a, b, c, d, e = all_targets
 
-    def ct(members: List[Target], dependencies: List[CoarsenedTarget] = []) -> CoarsenedTarget:
+    def ct(members: list[Target], dependencies: list[CoarsenedTarget] = []) -> CoarsenedTarget:
         return CoarsenedTarget(members, dependencies)
 
     def assert_closure(cts: Sequence[CoarsenedTarget], expected: Sequence[Target]) -> None:
@@ -693,8 +701,8 @@ def test_scalar_field() -> None:
 
         @classmethod
         def compute_value(
-            cls, raw_value: Optional[CustomObject], address: Address
-        ) -> Optional[CustomObject]:
+            cls, raw_value: CustomObject | None, address: Address
+        ) -> CustomObject | None:
             return super().compute_value(raw_value, address)
 
     addr = Address("", target_name="example")
@@ -781,8 +789,8 @@ def test_sequence_field() -> None:
 
         @classmethod
         def compute_value(
-            cls, raw_value: Optional[Iterable[CustomObject]], address: Address
-        ) -> Optional[Tuple[CustomObject, ...]]:
+            cls, raw_value: Iterable[CustomObject] | None, address: Address
+        ) -> tuple[CustomObject, ...] | None:
             return super().compute_value(raw_value, address)
 
     addr = Address("", target_name="example")
@@ -802,6 +810,25 @@ def test_sequence_field() -> None:
     # All elements must be the expected type.
     with pytest.raises(InvalidFieldTypeException):
         Example([CustomObject(), 1, CustomObject()], addr)
+
+
+def test_tuple_sequence_field() -> None:
+    class Example(TupleSequenceField):
+        alias = "example"
+        expected_element_type = str
+        expected_element_count = -1
+        expected_type_description = "an iterable of n-tuples of strings"
+        expected_element_type_description = "n-tuple of strings"
+
+    addr = Address("", target_name="example")
+    assert Example([("hello", "world")], addr).value == (("hello", "world"),)
+    assert Example(None, addr).value is None
+    with pytest.raises(InvalidFieldTypeException):
+        Example("strings are technically iterable...", addr)
+    with pytest.raises(InvalidFieldMemberTypeException):
+        Example(["strings are technically iterable..."], addr)
+    with pytest.raises(InvalidFieldMemberTypeException):
+        Example([("hello", 0, "world")], addr)
 
 
 def test_string_sequence_field() -> None:
@@ -944,7 +971,7 @@ def test_dict_string_to_string_sequence_field() -> None:
 
     addr = Address("", target_name="example")
 
-    def assert_flexible_constructor(raw_value: Dict[str, Iterable[str]]) -> None:
+    def assert_flexible_constructor(raw_value: dict[str, Iterable[str]]) -> None:
         assert Example(raw_value, addr).value == FrozenDict(
             {k: tuple(v) for k, v in raw_value.items()}
         )
@@ -1012,14 +1039,18 @@ def test_targets_with_sources_types() -> None:
     result = targets_with_sources_types(
         [Sources1],
         [tgt1, tgt2, codegen_tgt],
-        union_membership=UnionMembership({GenerateSourcesRequest: [GenSources]}),
+        union_membership=UnionMembership.from_rules(
+            {UnionRule(GenerateSourcesRequest, GenSources)}
+        ),
     )
     assert set(result) == {tgt1, codegen_tgt}
 
     result = targets_with_sources_types(
         [Sources2],
         [tgt1, tgt2, codegen_tgt],
-        union_membership=UnionMembership({GenerateSourcesRequest: [GenSources]}),
+        union_membership=UnionMembership.from_rules(
+            {UnionRule(GenerateSourcesRequest, GenSources)}
+        ),
     )
     assert set(result) == {tgt2}
 
@@ -1061,7 +1092,7 @@ expected_path_globs = namedtuple(
                     "test/b",
                 ),
                 glob_match_error_behavior=GlobMatchErrorBehavior.warn,
-                conjunction=GlobExpansionConjunction.all_match,
+                conjunction=GlobExpansionConjunction.any_match,
                 description_of_origin="test:test's `sources` field",
             ),
             id="provided value warns on glob match error",
@@ -1108,7 +1139,7 @@ def test_multiple_sources_path_globs(
             expected_path_globs(
                 globs=("test/other_file",),
                 glob_match_error_behavior=GlobMatchErrorBehavior.warn,
-                conjunction=GlobExpansionConjunction.all_match,
+                conjunction=GlobExpansionConjunction.any_match,
                 description_of_origin="test:test's `source` field",
             ),
             id="provided value warns on glob match error",
@@ -1119,7 +1150,7 @@ def test_multiple_sources_path_globs(
             expected_path_globs(
                 globs=("test/life",),
                 glob_match_error_behavior=GlobMatchErrorBehavior.warn,
-                conjunction=GlobExpansionConjunction.all_match,
+                conjunction=GlobExpansionConjunction.any_match,
                 description_of_origin="test:test's `source` field",
             ),
             id="default glob conjunction",
@@ -1190,6 +1221,37 @@ def test_multiple_sources_field_ban_subdirs() -> None:
         TestSources(["dir/f.ext"], Address("project"))
 
 
+@pytest.mark.parametrize(
+    ("dirpath", "glob"),
+    [
+        (dirpath, prefix + body)
+        for dirpath in ("", "src", "src/python", "src/python/pants/engine", "a/b/c/d/e")
+        for body in (
+            "f.ext",
+            "file_name.py",
+            "*.py",
+            "*",
+            "**",
+            "**/*.py",
+            "dir/*.py",
+            "a/b/c.txt",
+            "sub/dir/**/*.pyi",
+            "/abs/f.py",
+            "/abs/dir/*.py",
+            "BUILD",
+            "with.multiple.dots.ext",
+        )
+        for prefix in ("", "!")
+    ],
+)
+def test_prefix_glob_with_dirpath_matches_os_path_join(dirpath: str, glob: str) -> None:
+    if glob.startswith("!"):
+        expected = f"!{os.path.join(dirpath, glob[1:])}"
+    else:
+        expected = os.path.join(dirpath, glob)
+    assert MultipleSourcesField.prefix_glob_with_dirpath(dirpath, glob) == expected
+
+
 # -----------------------------------------------------------------------------------------------
 # Test `ExplicitlyProvidedDependencies` helper functions
 # -----------------------------------------------------------------------------------------------
@@ -1232,7 +1294,7 @@ def test_explicitly_provided_dependencies_remaining_after_disambiguation() -> No
         ignores=FrozenOrderedSet([addr, generated_addr]),
     )
 
-    def assert_disambiguated_via_ignores(ambiguous: List[Address], expected: Set[Address]) -> None:
+    def assert_disambiguated_via_ignores(ambiguous: list[Address], expected: set[Address]) -> None:
         assert (
             epd.remaining_after_disambiguation(tuple(ambiguous), owners_must_be_ancestors=False)
             == expected
@@ -1277,12 +1339,12 @@ def test_explicitly_provided_dependencies_remaining_after_disambiguation() -> No
 
 def test_explicitly_provided_dependencies_disambiguated() -> None:
     def get_disambiguated(
-        ambiguous: List[Address],
+        ambiguous: list[Address],
         *,
-        ignores: Optional[List[Address]] = None,
-        includes: Optional[List[Address]] = None,
+        ignores: list[Address] | None = None,
+        includes: list[Address] | None = None,
         owners_must_be_ancestors: bool = False,
-    ) -> Optional[Address]:
+    ) -> Address | None:
         epd = ExplicitlyProvidedDependencies(
             address=Address("dir", target_name="input_tgt"),
             includes=FrozenOrderedSet(includes or []),
@@ -1337,10 +1399,10 @@ def test_explicitly_provided_dependencies_maybe_warn_of_ambiguous_dependency_inf
     caplog,
 ) -> None:
     def maybe_warn(
-        ambiguous: List[Address],
+        ambiguous: list[Address],
         *,
-        ignores: Optional[List[Address]] = None,
-        includes: Optional[List[Address]] = None,
+        ignores: list[Address] | None = None,
+        includes: list[Address] | None = None,
         owners_must_be_ancestors: bool = False,
     ) -> None:
         caplog.clear()
@@ -1467,7 +1529,7 @@ def test_overrides_field_normalization() -> None:
     assert OverridesField.flatten_paths(
         addr,
         [
-            (paths, globs, cast(Dict[str, Any], overrides))
+            (paths, globs, cast(dict[str, Any], overrides))
             for (paths, overrides), globs in zip(
                 [
                     (Paths(("dir/foo.ext",), ()), tgt1_override),
@@ -1542,3 +1604,30 @@ def test_generate_file_based_overrides_field_help_message() -> None:
     assert "example:\n\n    overrides={\n" in message
     assert '\n        "bar.proto"' in message
     assert "\n    }\n\nFile" in message
+
+
+def test_validate_origin_sources_blocks():
+    addr = Address("", target_name="t")
+
+    FortranTarget(
+        {},
+        addr,
+        origin_sources_blocks=FrozenDict(
+            [("file.txt", SourceBlocks([SourceBlock(start=0, end=1)]))]
+        ),
+    )
+
+    with pytest.raises(ValueError, match=re.compile(r"^Expected .*`FrozenDict`, got .*list")):
+        FortranTarget({}, addr, origin_sources_blocks=[SourceBlock(start=0, end=1)])
+
+    with pytest.raises(
+        ValueError, match=re.compile(r"^Expected .*`SourceBlocks`, got .*SourceBlock")
+    ):
+        FortranTarget(
+            {},
+            addr,
+            origin_sources_blocks=FrozenDict([("file.txt", SourceBlock(start=0, end=1))]),
+        )
+
+    with pytest.raises(ValueError, match=re.compile(r"^Expected .*`SourceBlocks`, got .*tuple")):
+        FortranTarget({}, addr, origin_sources_blocks=FrozenDict([("file.txt", ((0, 1),))]))

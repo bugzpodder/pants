@@ -3,27 +3,34 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, cast
 
 from pants.backend.project_info import dependents
-from pants.backend.project_info.dependents import Dependents, DependentsRequest
+from pants.backend.project_info.dependents import DependentsRequest, find_dependents
 from pants.base.build_environment import get_buildroot
-from pants.base.deprecated import resolve_conflicting_options
 from pants.engine.addresses import Address, Addresses
 from pants.engine.collection import Collection
-from pants.engine.internals.graph import Owners, OwnersRequest
+from pants.engine.internals.build_files import DELETED_ADDRESS
+from pants.engine.internals.graph import (
+    Owners,
+    OwnersRequest,
+    find_owners,
+    resolve_unexpanded_targets,
+)
 from pants.engine.internals.mapper import SpecsFilter
-from pants.engine.rules import Get, collect_rules, rule
-from pants.engine.target import UnexpandedTargets
+from pants.engine.rules import collect_rules, implicitly, rule
 from pants.option.option_types import EnumOption, StrOption
 from pants.option.option_value_container import OptionValueContainer
 from pants.option.subsystem import Subsystem
 from pants.util.docutil import doc_url
+from pants.util.frozendict import FrozenDict
 from pants.util.ordered_set import FrozenOrderedSet
 from pants.util.strutil import help_text
-from pants.vcs.git import GitWorktree
+from pants.vcs.change import ChangedFile, ChangeType
+from pants.vcs.git import GitWorktree, GitWorktreeRequest, get_git_worktree
+from pants.vcs.hunk import Hunk, TextBlocks
 
 
 class DependentsOption(Enum):
@@ -35,6 +42,7 @@ class DependentsOption(Enum):
 @dataclass(frozen=True)
 class ChangedRequest:
     sources: tuple[str, ...]
+    sources_blocks: FrozenDict[str, TextBlocks]
     dependents: DependentsOption
 
 
@@ -44,11 +52,11 @@ class ChangedAddresses(Collection[Address]):
 
 @rule
 async def find_changed_owners(
-    request: ChangedRequest, specs_filter: SpecsFilter
+    request: ChangedRequest,
+    specs_filter: SpecsFilter,
 ) -> ChangedAddresses:
     no_dependents = request.dependents == DependentsOption.NONE
-    owners = await Get(
-        Owners,
+    owners = await find_owners(
         OwnersRequest(
             request.sources,
             # If `--changed-dependents` is used, we cannot eagerly filter out root targets. We
@@ -57,8 +65,12 @@ async def find_changed_owners(
             filter_by_global_options=no_dependents,
             # Changing a BUILD file might impact the targets it defines.
             match_if_owning_build_file_included_in_sources=True,
+            sources_blocks=request.sources_blocks,
         ),
+        **implicitly(),
     )
+    owners = Owners(owners | {DELETED_ADDRESS})
+
     if no_dependents:
         return ChangedAddresses(owners)
 
@@ -72,13 +84,13 @@ async def find_changed_owners(
     owner_target_generators = FrozenOrderedSet(
         addr.maybe_convert_to_target_generator() for addr in owners if addr.is_generated_target
     )
-    dependents = await Get(
-        Dependents,
+    dependents = await find_dependents(
         DependentsRequest(
             owners,
             transitive=request.dependents == DependentsOption.TRANSITIVE,
             include_roots=False,
         ),
+        **implicitly(),
     )
     result = FrozenOrderedSet(owners) | (dependents - owner_target_generators)
     if specs_filter.is_specified:
@@ -87,7 +99,7 @@ async def find_changed_owners(
         #
         # Note that we use `UnexpandedTargets` rather than `Targets` or `FilteredTargets` so that
         # we preserve target generators.
-        result_as_tgts = await Get(UnexpandedTargets, Addresses(result))
+        result_as_tgts = await resolve_unexpanded_targets(Addresses(result))
         result = FrozenOrderedSet(
             tgt.address for tgt in result_as_tgts if specs_filter.matches(tgt)
         )
@@ -109,33 +121,48 @@ class ChangedOptions:
 
     @classmethod
     def from_options(cls, options: OptionValueContainer) -> ChangedOptions:
-        dependents = resolve_conflicting_options(
-            old_option="dependees",
-            new_option="dependents",
-            old_scope=Changed.options_scope,
-            new_scope=Changed.options_scope,
-            old_container=options,
-            new_container=options,
-        )
-        return cls(options.since, options.diffspec, dependents)
+        return cls(options.since, options.diffspec, options.dependents)
 
     @property
     def provided(self) -> bool:
         return bool(self.since) or bool(self.diffspec)
 
-    def changed_files(self, git_worktree: GitWorktree) -> list[str]:
-        """Determines the files changed according to SCM/workspace and options."""
+    def _changed_files(self, git_worktree: GitWorktree) -> set[ChangedFile]:
         if self.diffspec:
-            return cast(
-                List[str], git_worktree.changes_in(self.diffspec, relative_to=get_buildroot())
-            )
+            return git_worktree.changes_in(self.diffspec, relative_to=get_buildroot())
 
         changes_since = self.since or git_worktree.current_rev_identifier
-        return cast(
-            List[str],
-            git_worktree.changed_files(
-                from_commit=changes_since, include_untracked=True, relative_to=get_buildroot()
-            ),
+        return git_worktree.changed_files(
+            from_commit=changes_since,
+            include_untracked=True,
+            relative_to=get_buildroot(),
+        )
+
+    def changed_files(self, git_worktree: GitWorktree) -> set[str]:
+        """Determines the files changed according to SCM/workspace and options."""
+        return {cf.path for cf in self._changed_files(git_worktree)}
+
+    def deleted_files(self, git_worktree: GitWorktree) -> set[str]:
+        """Determines the files deleted according to SCM/workspace and options."""
+        return {
+            cf.path
+            for cf in self._changed_files(git_worktree)
+            if cf.change_type == ChangeType.DELETED
+        }
+
+    def diff_hunks(
+        self, git_worktree: GitWorktree, paths: Iterable[str]
+    ) -> dict[str, tuple[Hunk, ...]]:
+        """Determines the unified diff hunks changed according to SCM/workspace and options.
+
+        More info on unified diff: https://www.gnu.org/software/diffutils/manual/html_node/Detailed-Unified.html
+        """
+        changes_since = self.since or git_worktree.current_rev_identifier
+        return git_worktree.changed_files_lines(
+            paths,
+            from_commit=changes_since,
+            include_untracked=True,
+            relative_to=get_buildroot(),
         )
 
 
@@ -145,7 +172,7 @@ class Changed(Subsystem):
         f"""
         Tell Pants to detect what files and targets have changed from Git.
 
-        See {doc_url('docs/using-pants/advanced-target-selection')}.
+        See {doc_url("docs/using-pants/advanced-target-selection")}.
         """
     )
 
@@ -161,12 +188,26 @@ class Changed(Subsystem):
         default=DependentsOption.NONE,
         help="Include direct or transitive dependents of changed targets.",
     )
-    dependees = EnumOption(
-        default=DependentsOption.NONE,
-        help="Include direct or transitive dependents of changed targets.",
-        removal_version="2.23.0.dev0",
-        removal_hint="Use --dependents instead",
-    )
+
+
+@dataclass(frozen=True)
+class DeletedFiles:
+    paths: tuple[str, ...]
+
+
+@rule
+async def get_deleted_files(changed: Changed) -> DeletedFiles:
+    changed_options = ChangedOptions.from_options(changed.options)
+    if not changed_options.provided:
+        return DeletedFiles(tuple())
+    maybe_git_worktree = await get_git_worktree(GitWorktreeRequest(), **implicitly())
+    if maybe_git_worktree.git_worktree:
+        deleted_files = tuple(
+            sorted(changed_options.deleted_files(maybe_git_worktree.git_worktree))
+        )
+    else:
+        deleted_files = tuple()
+    return DeletedFiles(deleted_files)
 
 
 def rules():

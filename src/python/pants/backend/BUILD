@@ -19,6 +19,10 @@ DEFAULT_DEPENDENTS_RULES = (
     "//tests/**",
     # Allow build-support to use what ever.
     "//build-support/**",
+    # Allow release and CI tooling to use what ever.
+    "//src/python/pants_release/**",
+    # Allow testprojects to use any backend.
+    "//testprojects/**",
     # Deny all others.
     "!*",
 )
@@ -34,6 +38,8 @@ __dependents_rules__(
             "[/build_files/fmt/black/register.py]",
             "[/build_files/fmt/ruff/register.py]",
             "[/build_files/fmt/yapf/register.py]",
+            "[/build_files/fmt/buildifier/rules.py]",
+            "[/build_files/fmt/buildifier/subsystem.py]",
             "[/python/lint/black/rules.py]",
             "[/python/lint/black/subsystem.py]",
             "[/python/lint/ruff/format/rules.py]",
@@ -54,12 +60,14 @@ __dependents_rules__(
             "[/python/util_rules/pex_requirements.py]",
         ),
         "src/python/pants/init/plugin_resolver.py",
+        "src/python/pants/init/plugin_resolver_rules.py",
         DEFAULT_DEPENDENTS_RULES,
     ),
     (
         "[/python/util_rules/pex.py]",
         "src/python/pants/core/goals/update_build_files.py",
         "src/python/pants/init/plugin_resolver.py",
+        "src/python/pants/init/plugin_resolver_rules.py",
         DEFAULT_DEPENDENTS_RULES,
     ),
     (

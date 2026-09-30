@@ -3,19 +3,17 @@
 
 from __future__ import annotations
 
+import importlib.resources
 import os
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum, unique
-from typing import Iterable, Mapping
-
-import pkg_resources
 
 from pants.base.glob_match_error_behavior import GlobMatchErrorBehavior
-from pants.core.goals.generate_lockfiles import DEFAULT_TOOL_LOCKFILE, GenerateToolLockfileSentinel
+from pants.core.goals.resolves import ExportableTool
 from pants.engine.fs import (
     CreateDigest,
     Digest,
-    DigestEntries,
     DigestSubset,
     Directory,
     FileContent,
@@ -24,18 +22,39 @@ from pants.engine.fs import (
     PathGlobs,
     RemovePrefix,
 )
-from pants.engine.process import ProcessResult
-from pants.engine.rules import Get, MultiGet, collect_rules, rule
+from pants.engine.intrinsics import (
+    create_digest,
+    digest_subset_to_digest,
+    get_digest_entries,
+    merge_digests,
+    remove_prefix,
+)
+from pants.engine.process import execute_process_or_raise
+from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.unions import UnionRule
 from pants.jvm.jdk_rules import InternalJdk, JvmProcess
 from pants.jvm.jdk_rules import rules as jdk_rules
-from pants.jvm.resolve.coursier_fetch import ToolClasspath, ToolClasspathRequest
+from pants.jvm.resolve.coursier_fetch import ToolClasspathRequest, materialize_classpath_for_tool
 from pants.jvm.resolve.coursier_fetch import rules as coursier_fetch_rules
-from pants.jvm.resolve.jvm_tool import GenerateJvmLockfileFromTool
+from pants.jvm.resolve.jvm_tool import GenerateJvmLockfileFromTool, JvmToolBase
 from pants.jvm.resolve.jvm_tool import rules as jvm_tool_rules
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
-from pants.util.ordered_set import FrozenOrderedSet
+
+
+class JarTool(JvmToolBase):
+    options_scope = "jar_tool"
+    help = "The Java Archive Tool"
+
+    default_artifacts = (
+        "args4j:args4j:2.33",
+        "com.google.code.findbugs:jsr305:3.0.2",
+        "com.google.guava:guava:18.0",
+    )
+    default_lockfile_resource = (
+        "pants.jvm.jar_tool",
+        "jar_tool.lock",
+    )
 
 
 @unique
@@ -96,24 +115,22 @@ class JarToolRequest:
 
     @staticmethod
     def __parse_policies(
-        policies: Iterable[tuple[str, str | JarDuplicateAction]]
+        policies: Iterable[tuple[str, str | JarDuplicateAction]],
     ) -> Iterable[tuple[str, JarDuplicateAction]]:
         return [
             (
                 pattern,
-                action
-                if isinstance(action, JarDuplicateAction)
-                else JarDuplicateAction(action.lower()),
+                (
+                    action
+                    if isinstance(action, JarDuplicateAction)
+                    else JarDuplicateAction(action.lower())
+                ),
             )
             for (pattern, action) in policies
         ]
 
 
 _JAR_TOOL_MAIN_CLASS = "org.pantsbuild.tools.jar.Main"
-
-
-class JarToolGenerateLockfileSentinel(GenerateToolLockfileSentinel):
-    resolve_name = "jar_tool"
 
 
 @dataclass(frozen=True)
@@ -123,17 +140,17 @@ class JarToolCompiledClassfiles:
 
 @rule
 async def run_jar_tool(
-    request: JarToolRequest, jdk: InternalJdk, jar_tool: JarToolCompiledClassfiles
+    request: JarToolRequest, jdk: InternalJdk, tool: JarTool, jar_tool: JarToolCompiledClassfiles
 ) -> Digest:
     output_prefix = "__out"
     output_jarname = os.path.join(output_prefix, request.jar_name)
 
-    lockfile_request, empty_output_digest = await MultiGet(
-        Get(GenerateJvmLockfileFromTool, JarToolGenerateLockfileSentinel()),
-        Get(Digest, CreateDigest([Directory(output_prefix)])),
+    tool_classpath, empty_output_digest = await concurrently(
+        materialize_classpath_for_tool(
+            ToolClasspathRequest(lockfile=GenerateJvmLockfileFromTool.create(tool))
+        ),
+        create_digest(CreateDigest([Directory(output_prefix)])),
     )
-
-    tool_classpath = await Get(ToolClasspath, ToolClasspathRequest(lockfile=lockfile_request))
 
     toolcp_prefix = "__toolcp"
     jartoolcp_prefix = "__jartoolcp"
@@ -193,25 +210,26 @@ async def run_jar_tool(
         level=LogLevel.DEBUG,
     )
 
-    result = await Get(ProcessResult, JvmProcess, tool_process)
-    return await Get(Digest, RemovePrefix(result.output_digest, output_prefix))
+    result = await execute_process_or_raise(**implicitly({tool_process: JvmProcess}))
+    return await remove_prefix(RemovePrefix(result.output_digest, output_prefix))
 
 
 _JAR_TOOL_SRC_PACKAGES = ["args4j", "jar_tool_source"]
 
 
 def _load_jar_tool_sources() -> list[FileContent]:
+    parent_module = ".".join(__name__.split(".")[:-1])
     result = []
     for package in _JAR_TOOL_SRC_PACKAGES:
         # pkg_path = package.replace(".", os.path.sep)
         # relative_folder = os.path.join("src", pkg_path)
-        for basename in pkg_resources.resource_listdir(__name__, package):
+        for resource in importlib.resources.files(parent_module).joinpath(package).iterdir():
+            if not resource.is_file():
+                continue
             result.append(
                 FileContent(
-                    path=os.path.join(package, basename),
-                    content=pkg_resources.resource_string(
-                        __name__, os.path.join(package, basename)
-                    ),
+                    path=os.path.join(package, resource.name),
+                    content=resource.read_bytes(),
                 )
             )
     return result
@@ -219,20 +237,17 @@ def _load_jar_tool_sources() -> list[FileContent]:
 
 # TODO(13879): Consolidate compilation of wrapper binaries to common rules.
 @rule
-async def build_jar_tool(jdk: InternalJdk) -> JarToolCompiledClassfiles:
-    lockfile_request, source_digest = await MultiGet(
-        Get(GenerateJvmLockfileFromTool, JarToolGenerateLockfileSentinel()),
-        Get(
-            Digest,
-            CreateDigest(_load_jar_tool_sources()),
-        ),
-    )
+async def build_jar_tool(jdk: InternalJdk, tool: JarTool) -> JarToolCompiledClassfiles:
+    source_digest = await create_digest(CreateDigest(_load_jar_tool_sources()))
 
     dest_dir = "classfiles"
-    materialized_classpath, java_subset_digest, empty_dest_dir = await MultiGet(
-        Get(ToolClasspath, ToolClasspathRequest(prefix="__toolcp", lockfile=lockfile_request)),
-        Get(
-            Digest,
+    materialized_classpath, java_subset_digest, empty_dest_dir = await concurrently(
+        materialize_classpath_for_tool(
+            ToolClasspathRequest(
+                prefix="__toolcp", lockfile=GenerateJvmLockfileFromTool.create(tool)
+            )
+        ),
+        digest_subset_to_digest(
             DigestSubset(
                 source_digest,
                 PathGlobs(
@@ -240,65 +255,42 @@ async def build_jar_tool(jdk: InternalJdk) -> JarToolCompiledClassfiles:
                     glob_match_error_behavior=GlobMatchErrorBehavior.error,
                     description_of_origin="jar tool sources",
                 ),
-            ),
+            )
         ),
-        Get(Digest, CreateDigest([Directory(path=dest_dir)])),
+        create_digest(CreateDigest([Directory(path=dest_dir)])),
     )
 
-    merged_digest, src_entries = await MultiGet(
-        Get(
-            Digest,
-            MergeDigests([materialized_classpath.digest, source_digest, empty_dest_dir]),
-        ),
-        Get(DigestEntries, Digest, java_subset_digest),
+    merged_digest, src_entries = await concurrently(
+        merge_digests(MergeDigests([materialized_classpath.digest, source_digest, empty_dest_dir])),
+        get_digest_entries(java_subset_digest),
     )
 
-    compile_result = await Get(
-        ProcessResult,
-        JvmProcess(
-            jdk=jdk,
-            classpath_entries=[f"{jdk.java_home}/lib/tools.jar"],
-            argv=[
-                "com.sun.tools.javac.Main",
-                "-cp",
-                ":".join(materialized_classpath.classpath_entries()),
-                "-d",
-                dest_dir,
-                *[entry.path for entry in src_entries if isinstance(entry, FileEntry)],
-            ],
-            input_digest=merged_digest,
-            output_directories=(dest_dir,),
-            description="Compile jar-tool sources using javac.",
-            level=LogLevel.DEBUG,
-            use_nailgun=False,
-        ),
+    compile_result = await execute_process_or_raise(
+        **implicitly(
+            JvmProcess(
+                jdk=jdk,
+                classpath_entries=[f"{jdk.java_home}/lib/tools.jar"],
+                argv=[
+                    "com.sun.tools.javac.Main",
+                    "-cp",
+                    ":".join(materialized_classpath.classpath_entries()),
+                    "-d",
+                    dest_dir,
+                    *[entry.path for entry in src_entries if isinstance(entry, FileEntry)],
+                ],
+                input_digest=merged_digest,
+                output_directories=(dest_dir,),
+                description="Compile jar-tool sources using javac.",
+                level=LogLevel.DEBUG,
+                use_nailgun=False,
+            )
+        )
     )
 
-    stripped_classfiles_digest = await Get(
-        Digest, RemovePrefix(compile_result.output_digest, dest_dir)
+    stripped_classfiles_digest = await remove_prefix(
+        RemovePrefix(compile_result.output_digest, dest_dir)
     )
     return JarToolCompiledClassfiles(digest=stripped_classfiles_digest)
-
-
-@rule
-async def generate_jartool_lockfile_request(
-    _: JarToolGenerateLockfileSentinel,
-) -> GenerateJvmLockfileFromTool:
-    return GenerateJvmLockfileFromTool(
-        artifact_inputs=FrozenOrderedSet(
-            {
-                "args4j:args4j:2.33",
-                "com.google.code.findbugs:jsr305:3.0.2",
-                "com.google.guava:guava:18.0",
-            }
-        ),
-        artifact_option_name="n/a",
-        lockfile_option_name="n/a",
-        resolve_name=JarToolGenerateLockfileSentinel.resolve_name,
-        read_lockfile_dest=DEFAULT_TOOL_LOCKFILE,
-        write_lockfile_dest="src/python/pants/jvm/jar_tool/jar_tool.lock",
-        default_lockfile_resource=("pants.jvm.jar_tool", "jar_tool.lock"),
-    )
 
 
 def rules():
@@ -307,5 +299,5 @@ def rules():
         *coursier_fetch_rules(),
         *jdk_rules(),
         *jvm_tool_rules(),
-        UnionRule(GenerateToolLockfileSentinel, JarToolGenerateLockfileSentinel),
+        UnionRule(ExportableTool, JarTool),
     ]

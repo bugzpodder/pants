@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import Iterable
+from collections.abc import Iterable
+from textwrap import dedent
 
 import pytest
 
@@ -76,7 +77,7 @@ def test_parses_projects(rule_runner: RuleRunner) -> None:
     [
         (None, ("clean-install",)),
         ("npm@10.2.4", ("clean-install",)),
-        ("pnpm@7.5.0", ("install", "--frozen-lockfile")),
+        ("pnpm@9.5.0", ("install", "--frozen-lockfile")),
         ("yarn@1.22.19", ("install", "--frozen-lockfile")),
         ("yarn@2.4.3", ("install", "--immutable")),
         ("yarn@3.6.4", ("install", "--immutable")),
@@ -110,10 +111,9 @@ def test_immutable_install_args_property_with_unsupported_package_manager(
             "src/js/foo/package.json": given_package("foo", "0.0.1", package_manager="bar@2.4.3"),
         }
     )
-    projects = rule_runner.request(AllNodeJSProjects, [])
     expected_error = "Unsupported package manager: bar"
-    with pytest.raises(ValueError, match=expected_error):
-        {project.immutable_install_args for project in projects}
+    with engine_error(ValueError, contains=expected_error):
+        rule_runner.request(AllNodeJSProjects, [])
 
 
 def test_root_package_json_is_supported(rule_runner: RuleRunner) -> None:
@@ -144,7 +144,7 @@ def test_parses_project_with_workspaces(rule_runner: RuleRunner) -> None:
     [project] = rule_runner.request(AllNodeJSProjects, [])
     assert project.root_dir == "src/js"
     assert {workspace.name for workspace in project.workspaces} == {"egg", "ham", "spam"}
-    assert project.package_manager == "npm"
+    assert project.package_manager.name == "npm"
 
 
 def test_parses_project_with_nested_workspaces(rule_runner: RuleRunner) -> None:
@@ -252,6 +252,31 @@ def test_workspaces_without_conflicting_package_manager_versions_works(
             "src/js/foo/package.json": given_package("ham", "0.0.1", package_manager="npm@1"),
             "src/js/bar/BUILD": "package_json()",
             "src/js/bar/package.json": given_package("spam", "0.0.2", package_manager="npm@1"),
+        }
+    )
+
+    assert len(rule_runner.request(AllNodeJSProjects, [])) == 1
+
+
+def test_pnpm_workspaces_is_ignored_for_non_pnpm_projects(
+    rule_runner: RuleRunner,
+) -> None:
+    rule_runner.write_files(
+        {
+            # Configure PNPM workspaces such that 'foo' is a project root dir - this should
+            # be ignored, but if not, would result in two projects
+            "src/js/pnpm-workspace.yaml": dedent(
+                """\
+                packages:
+                    - "foo/*"
+                """
+            ),
+            "src/js/package.json": given_package_with_workspaces(
+                "egg", "1.0.0", "foo", "bar", package_manager="npm@1"
+            ),
+            "src/js/BUILD": "package_json()",
+            "src/js/foo/BUILD": "package_json()",
+            "src/js/foo/package.json": given_package("ham", "0.0.1", package_manager="npm@1"),
         }
     )
 

@@ -5,18 +5,11 @@ from __future__ import annotations
 
 from enum import Enum
 
+from pants.core.util_rules.unowned_dependency_behavior import UnownedDependencyUsageOption
 from pants.option.option_types import BoolOption, EnumOption, IntOption, StrListOption
 from pants.option.subsystem import Subsystem
 from pants.util.docutil import bin_name
 from pants.util.strutil import softwrap
-
-
-class UnownedDependencyUsage(Enum):
-    """What action to take when an inferred dependency is unowned."""
-
-    RaiseError = "error"
-    LogWarning = "warning"
-    DoNothing = "ignore"
 
 
 class InitFilesInference(Enum):
@@ -70,6 +63,22 @@ class PythonInferSubsystem(Subsystem):
             If `--string-imports` is True, treat valid-looking strings with at least this many
             dots in them as potential dynamic dependencies. E.g., `'foo.bar.Baz'` will be
             treated as a potential dependency if this option is set to 2 but not if set to 3.
+            """
+        ),
+    )
+    string_import_ignore = StrListOption(
+        default=[],
+        help=softwrap(
+            """
+            Dotted string values that should be ignored for string-based dependency inference.
+
+            If there are many string values that look like module or class references but should not
+            become inferred dependencies, you can list them here instead of annotating each occurrence with
+            `# pants: no-infer-dep`.
+
+            Values are glob patterns matched against the full dotted string. For example,
+            `string-import-ignore=["foo.generated.*", "acme.plugins.dev_only"]` will ignore
+            `foo.generated.loader` and `acme.plugins.dev_only`.
             """
         ),
     )
@@ -134,21 +143,12 @@ class PythonInferSubsystem(Subsystem):
             """
         ),
     )
-    unowned_dependency_behavior = EnumOption(
-        default=UnownedDependencyUsage.LogWarning,
-        help=softwrap(
-            """
-            How to handle imports that don't have an inferrable owner.
-
-            Usually when an import cannot be inferred, it represents an issue like Pants not being
-            properly configured, e.g. targets not set up. Often, missing dependencies will result
-            in confusing runtime errors like `ModuleNotFoundError`, so this option can be helpful
-            to error more eagerly.
-
-            To ignore any false positives, either add `# pants: no-infer-dep` to the line of the
+    unowned_dependency_behavior = UnownedDependencyUsageOption(
+        example_runtime_issue="`ModuleNotFoundError`",
+        how_to_ignore="""
+            either add `# pants: no-infer-dep` to the line of the
             import or put the import inside a `try: except ImportError:` block.
-            """
-        ),
+            """,
     )
     ambiguity_resolution = EnumOption(
         default=AmbiguityResolution.none,

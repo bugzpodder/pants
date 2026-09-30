@@ -3,20 +3,25 @@
 
 import re
 from enum import Enum
-from typing import Match, Optional, Tuple, cast
+from re import Match
+from typing import cast
 
 from pants.backend.python.target_types import PexCompletePlatformsField, PythonResolveField
 from pants.backend.python.util_rules.faas import (
+    FaaSArchitecture,
     PythonFaaSCompletePlatforms,
     PythonFaaSDependencies,
     PythonFaaSHandlerField,
+    PythonFaaSKnownRuntime,
     PythonFaaSLayoutField,
     PythonFaaSPex3VenvCreateExtraArgsField,
+    PythonFaaSPexBuildExtraArgs,
     PythonFaaSRuntimeField,
+    PythonFaaSUvPlatforms,
 )
 from pants.backend.python.util_rules.faas import rules as faas_rules
+from pants.core.environments.target_types import EnvironmentField
 from pants.core.goals.package import OutputPathField
-from pants.core.util_rules.environments import EnvironmentField
 from pants.engine.addresses import Address
 from pants.engine.rules import collect_rules
 from pants.engine.target import COMMON_TARGET_FIELDS, InvalidFieldException, StringField, Target
@@ -42,6 +47,9 @@ class PythonGoogleCloudFunctionHandlerField(PythonFaaSHandlerField):
     )
 
 
+PYTHON_RUNTIME_REGEX = r"^python(?P<major>\d)(?P<minor>\d+)$"
+
+
 class PythonGoogleCloudFunctionRuntimes(Enum):
     PYTHON_37 = "python37"
     PYTHON_38 = "python38"
@@ -50,9 +58,46 @@ class PythonGoogleCloudFunctionRuntimes(Enum):
     PYTHON_311 = "python311"
     PYTHON_312 = "python312"
 
+    def to_interpreter_version(self) -> tuple[int, int]:
+        """Returns the Python version implied by the runtime, as (major, minor)."""
+        mo = cast(Match, re.match(PYTHON_RUNTIME_REGEX, self.value))
+        return int(mo.group("major")), int(mo.group("minor"))
+
 
 class PythonGoogleCloudFunctionRuntime(PythonFaaSRuntimeField):
-    PYTHON_RUNTIME_REGEX = r"^python(?P<major>\d)(?P<minor>\d+)$"
+    # The manylinux values were confirmed by running `ldd --version` in each of the images.
+    DOCKER_RUNTIME_MAPPING = {
+        PythonGoogleCloudFunctionRuntimes.PYTHON_37: (
+            "us-central1-docker.pkg.dev/serverless-runtimes/google-18-full/runtimes/python37",
+            "python37_20240728_3_7_17_RC00",
+            "manylinux_2_17",
+        ),
+        PythonGoogleCloudFunctionRuntimes.PYTHON_38: (
+            "us-central1-docker.pkg.dev/serverless-runtimes/google-18-full/runtimes/python38",
+            "python38_20240728_3_8_19_RC00",
+            "manylinux_2_17",
+        ),
+        PythonGoogleCloudFunctionRuntimes.PYTHON_39: (
+            "us-central1-docker.pkg.dev/serverless-runtimes/google-18-full/runtimes/python39",
+            "python39_20240728_3_9_19_RC00",
+            "manylinux_2_17",
+        ),
+        PythonGoogleCloudFunctionRuntimes.PYTHON_310: (
+            "us-central1-docker.pkg.dev/serverless-runtimes/google-22-full/runtimes/python310",
+            "python310_20240728_3_10_14_RC00",
+            "manylinux_2_35",
+        ),
+        PythonGoogleCloudFunctionRuntimes.PYTHON_311: (
+            "us-central1-docker.pkg.dev/serverless-runtimes/google-22-full/runtimes/python311",
+            "python311_20240728_3_11_9_RC00",
+            "manylinux_2_35",
+        ),
+        PythonGoogleCloudFunctionRuntimes.PYTHON_312: (
+            "us-central1-docker.pkg.dev/serverless-runtimes/google-22-full/runtimes/python312",
+            "python312_20240728_3_12_4_RC00",
+            "manylinux_2_35",
+        ),
+    }
 
     valid_choices = PythonGoogleCloudFunctionRuntimes
     help = help_text(
@@ -67,23 +112,35 @@ class PythonGoogleCloudFunctionRuntime(PythonFaaSRuntimeField):
         """
     )
 
+    known_runtimes = tuple(
+        PythonFaaSKnownRuntime(
+            runtime.value,
+            *runtime.to_interpreter_version(),
+            docker_repo=docker_repo,
+            tag=docker_tag,
+            architecture=FaaSArchitecture.X86_64,
+            manylinux=manylinux,
+        )
+        for runtime, (docker_repo, docker_tag, manylinux) in DOCKER_RUNTIME_MAPPING.items()
+    )
+
     @classmethod
-    def compute_value(cls, raw_value: Optional[str], address: Address) -> Optional[str]:
+    def compute_value(cls, raw_value: str | None, address: Address) -> str | None:
         value = super().compute_value(raw_value, address)
         if value is None:
             return None
-        if not re.match(cls.PYTHON_RUNTIME_REGEX, value):
+        if not re.match(PYTHON_RUNTIME_REGEX, value):
             raise InvalidFieldException(
                 f"The `{cls.alias}` field in target at {address} must be of the form pythonXY, "
                 f"but was {value}."
             )
         return value
 
-    def to_interpreter_version(self) -> Optional[Tuple[int, int]]:
+    def to_interpreter_version(self) -> tuple[int, int] | None:
         """Returns the Python version implied by the runtime, as (major, minor)."""
         if self.value is None:
             return None
-        mo = cast(Match, re.match(self.PYTHON_RUNTIME_REGEX, self.value))
+        mo = cast(Match, re.match(PYTHON_RUNTIME_REGEX, self.value))
         return int(mo.group("major")), int(mo.group("minor"))
 
     @classmethod
@@ -118,8 +175,10 @@ class PythonGoogleCloudFunction(Target):
         PythonGoogleCloudFunctionHandlerField,
         PythonGoogleCloudFunctionRuntime,
         PythonFaaSCompletePlatforms,
+        PythonFaaSUvPlatforms,
         PythonGoogleCloudFunctionType,
         PythonFaaSPex3VenvCreateExtraArgsField,
+        PythonFaaSPexBuildExtraArgs,
         PythonFaaSLayoutField,
         PythonResolveField,
         EnvironmentField,
@@ -128,7 +187,7 @@ class PythonGoogleCloudFunction(Target):
         f"""
         A self-contained Python function suitable for uploading to Google Cloud Function.
 
-        See {doc_url('docs/python/integrations/google-cloud-functions')}.
+        See {doc_url("docs/python/integrations/google-cloud-functions")}.
         """
     )
 

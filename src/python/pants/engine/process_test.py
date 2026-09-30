@@ -3,8 +3,14 @@
 
 from __future__ import annotations
 
+import os
+import textwrap
+from pathlib import Path
+
 import pytest
 
+from pants.core.environments.target_types import LocalWorkspaceEnvironmentTarget
+from pants.engine.environment import EnvironmentName
 from pants.engine.fs import (
     EMPTY_DIGEST,
     CreateDigest,
@@ -15,27 +21,33 @@ from pants.engine.fs import (
     FileContent,
     SymlinkEntry,
 )
+from pants.engine.internals.native_engine import Snapshot
 from pants.engine.internals.scheduler import ExecutionError
+from pants.engine.platform import Platform
 from pants.engine.process import (
     FallibleProcessResult,
     InteractiveProcess,
     InteractiveProcessResult,
     Process,
     ProcessCacheScope,
+    ProcessConcurrency,
     ProcessResult,
 )
+from pants.option.global_options import KeepSandboxes
 from pants.testutil.rule_runner import QueryRule, RuleRunner, mock_console
 from pants.util.contextutil import environment_as
 
 
-def new_rule_runner() -> RuleRunner:
+def new_rule_runner(**extra_kwargs) -> RuleRunner:
     return RuleRunner(
         rules=[
             QueryRule(ProcessResult, [Process]),
             QueryRule(FallibleProcessResult, [Process]),
             QueryRule(InteractiveProcessResult, [InteractiveProcess]),
             QueryRule(DigestEntries, [Digest]),
+            QueryRule(Platform, []),
         ],
+        **extra_kwargs,
     )
 
 
@@ -178,8 +190,8 @@ def test_cache_scope_successful(rule_runner: RuleRunner) -> None:
 
 
 def test_cache_scope_per_restart() -> None:
-    success_argv = ("/bin/bash", "-c", "echo $RANDOM")
-    failure_argv = ("/bin/bash", "-c", "echo $RANDOM; exit 1")
+    success_argv = ("/bin/bash", "-c", "echo $RANDOM$RANDOM")
+    failure_argv = ("/bin/bash", "-c", "echo $RANDOM$RANDOM; exit 1")
 
     always_cache_success = Process(
         success_argv, cache_scope=ProcessCacheScope.PER_RESTART_ALWAYS, description="foo"
@@ -299,3 +311,319 @@ def test_interactive_process_inputs(rule_runner: RuleRunner, run_in_workspace: b
             "prefix1",
             "prefix2",
         }
+
+
+def test_interactive_process_starts_new_session(rule_runner: RuleRunner) -> None:
+    # NB: `run_interactive_process()` expects an initialized workunit store, which only certain
+    # other engine operations take steps to initialize. This test otherwise has no engine setup
+    # to perform, so make an empty request with the side-effect of workunit initialization.
+    rule_runner.request(Digest, [CreateDigest([])])
+
+    # NB: Strictly speaking this is testing an implementation detail, because it's much more
+    # difficult to directly test the higher-level behavior we actually want: that interactive
+    # processes are able to read from stdin connected to a terminal without observing SIGTTIN.
+    #
+    # If a process is spawned in a background process group of a session associated with a
+    # controlling terminal, and the process attempts to read stdin from the controlling terminal,
+    # its entire process group will be signalled with SIGTTIN. By default, this stops every
+    # process in the group and appears as a hang.
+    #
+    # If instead the process is spawned in a new session, it still inherits file descriptors as
+    # normal, but as the process is necessarily no longer associated with the session of that
+    # controlling terminal it is also no longer subject to being signalled with SIGTTIN for reads
+    # on that terminal.
+    #
+    # `mock_console` isn't sufficient to recreate these conditions as its stdin is not tied to a
+    # controlling terminal, but we can at least ensure that interactive processes are spawned in
+    # a new session.
+    #
+    # `exec` preserves the spawned process's PID while `ps` reports its PID and session ID. The
+    # leader of a new session has a session ID equal to its PID.
+    process = InteractiveProcess(
+        argv=["/bin/bash", "-c", 'exec /bin/ps -o pid= -o sid= -p "$$"'],
+    )
+
+    with mock_console(rule_runner.options_bootstrapper) as (_, stdio_reader):
+        result = rule_runner.run_interactive_process(process)
+        assert result.exit_code == 0
+
+        pid, sid = map(int, stdio_reader.get_stdout().split())
+        assert pid == sid
+
+
+def test_interactive_process_rejects_invalid_run_in_workspace(rule_runner: RuleRunner) -> None:
+    process = object.__new__(InteractiveProcess)
+    object.__setattr__(process, "process", Process(["/bin/echo", "hello"], description="echo"))
+    object.__setattr__(process, "run_in_workspace", "yes")
+    object.__setattr__(process, "keep_sandboxes", KeepSandboxes.never)
+    object.__setattr__(process, "forward_signals_to_process", True)
+    object.__setattr__(process, "restartable", False)
+
+    with pytest.raises(ExecutionError, match="run_in_workspace"):
+        rule_runner.request(InteractiveProcessResult, [process])
+
+
+def test_interactive_process_rejects_invalid_keep_sandboxes(rule_runner: RuleRunner) -> None:
+    class InvalidKeepSandboxes:
+        value = "sometimes"
+
+    process = object.__new__(InteractiveProcess)
+    object.__setattr__(process, "process", Process(["/bin/echo", "hello"], description="echo"))
+    object.__setattr__(process, "run_in_workspace", False)
+    object.__setattr__(process, "keep_sandboxes", InvalidKeepSandboxes())
+    object.__setattr__(process, "forward_signals_to_process", True)
+    object.__setattr__(process, "restartable", False)
+
+    with pytest.raises(ExecutionError, match="Failed to parse keep_sandboxes"):
+        rule_runner.request(InteractiveProcessResult, [process])
+
+
+@pytest.mark.parametrize("working_directory", [None, "foo", "foo/bar"])
+@pytest.mark.parametrize("run_in_workspace", [True, False])
+def test_interactive_process_working_directory(
+    rule_runner: RuleRunner,
+    working_directory: str,
+    run_in_workspace: bool,
+) -> None:
+    # Test that interactive processes can run in a working directory, and that the
+    # working directory is correctly resolved relative to the sandbox root or workspace root.
+    rule_runner.write_files(
+        {
+            "test.txt": "workspace test.txt",
+            "foo/test.txt": "workspace foo/test.txt",
+            "foo/bar/test.txt": "workspace foo/bar/test.txt",
+        }
+    )
+    input_digest = rule_runner.make_snapshot(
+        {
+            "test.txt": "chroot test.txt",
+            "foo/test.txt": "chroot foo/test.txt",
+            "foo/bar/test.txt": "chroot foo/bar/test.txt",
+        }
+    ).digest
+
+    process = InteractiveProcess(
+        argv=["/bin/bash", "-c", "pwd && cat test.txt"],
+        input_digest=input_digest,
+        working_directory=working_directory,
+        run_in_workspace=run_in_workspace,
+    )
+
+    with mock_console(rule_runner.options_bootstrapper) as (_, stdio_reader):
+        result = rule_runner.run_interactive_process(process)
+        stdout = stdio_reader.get_stdout()
+        stderr = stdio_reader.get_stderr()
+        assert result.exit_code == 0, (
+            f"Process failed with exit code {result.exit_code}.\nstdout: {stdout}\nstderr: {stderr}"
+        )
+
+        lines = stdout.splitlines()
+        assert len(lines) == 2
+        if working_directory is not None:
+            assert lines[0].endswith(working_directory)
+
+        expected_prefix = "workspace" if run_in_workspace else "chroot"
+        expected_path = os.path.join(*(s for s in (working_directory, "test.txt") if s))
+        assert f"{expected_prefix} {expected_path}" in stdout
+
+
+def test_workspace_execution_support() -> None:
+    rule_runner = RuleRunner(
+        rules=[
+            QueryRule(ProcessResult, [Process]),
+            QueryRule(FallibleProcessResult, [Process]),
+            QueryRule(InteractiveProcessResult, [InteractiveProcess]),
+            QueryRule(DigestEntries, [Digest]),
+            QueryRule(Platform, []),
+        ],
+        target_types=[LocalWorkspaceEnvironmentTarget],
+        inherent_environment=EnvironmentName("workspace"),
+    )
+    rule_runner.write_files(
+        {
+            "BUILD": "experimental_workspace_environment(name='workspace')",
+        }
+    )
+    rule_runner.set_options(
+        ["--environments-preview-names={'workspace': '//:workspace'}"], env_inherit={"PATH"}
+    )
+
+    build_root = Path(rule_runner.build_root)
+
+    # Check that a custom exit code is returned as expected.
+    process = Process(
+        argv=["/bin/bash", "-c", "exit 143"],
+        description="a process which reports its error code",
+        cache_scope=ProcessCacheScope.PER_SESSION,  # necessary to ensure result not cached from prior test runs
+    )
+    result = rule_runner.request(FallibleProcessResult, [process])
+    assert result.exit_code == 143
+    assert result.metadata.execution_environment.environment_type == "workspace"
+
+    # Test whether there is a distinction between the workspace and chroot when a workspace
+    # process executes. Do this by putting a file in the build root which is not covered by a
+    # target, a depenency created via a digest, and have the invoked process create a file
+    # in the build root.
+    rule_runner.write_files(
+        {
+            "unmanaged.txt": "from-workspace\n",
+        }
+    )
+    input_snapshot = rule_runner.make_snapshot(
+        {
+            "dependency.txt": "from-digest\n",
+        }
+    )
+    script = textwrap.dedent(
+        """
+        cat '{chroot}/dependency.txt'
+        pwd
+        cat unmanaged.txt
+        touch created-by-invocation
+        """
+    )
+    process = Process(
+        argv=["/bin/bash", "-c", script],
+        input_digest=input_snapshot.digest,
+        description="a workspace process",
+        cache_scope=ProcessCacheScope.PER_SESSION,  # necessary to ensure result not cached from prior test runs
+    )
+    result2 = rule_runner.request(ProcessResult, [process])
+    lines = result2.stdout.decode().splitlines()
+    assert lines == [
+        "from-digest",
+        rule_runner.build_root,
+        "from-workspace",
+    ]
+    assert (build_root / "created-by-invocation").exists()
+
+    # Test that changing the working directory works.
+    subdir = build_root / "subdir"
+    subdir.mkdir()
+    process = Process(
+        argv=["/bin/bash", "-c", "touch file-in-subdir"],
+        description="check working_directory works",
+        working_directory="subdir",
+        cache_scope=ProcessCacheScope.PER_SESSION,  # necessary to ensure result not cached from prior test runs
+    )
+    _ = rule_runner.request(ProcessResult, [process])
+    assert (subdir / "file-in-subdir").exists()
+
+    # Test output capture correctly captures from the sandbox and not the workspace.
+    script = textwrap.dedent(
+        """
+        touch '{chroot}/capture-this-file' will-not-capture-this-file
+        echo this-goes-to-stdout
+        echo this-goes-to-stderr 1>&2
+        """
+    )
+    process = Process(
+        argv=["/bin/bash", "-c", script],
+        description="check output capture works",
+        output_files=["capture-this-file", "will-not-capture-this-file"],
+        cache_scope=ProcessCacheScope.PER_SESSION,  # necessary to ensure result not cached from prior test runs
+    )
+    result3 = rule_runner.request(ProcessResult, [process])
+    assert result3.stdout.decode() == "this-goes-to-stdout\n"
+    assert result3.stderr.decode() == "this-goes-to-stderr\n"
+    snapshot = rule_runner.request(Snapshot, [result3.output_digest])
+    assert snapshot.files == ("capture-this-file",)
+
+
+@pytest.mark.parametrize(
+    "concurrency",
+    [
+        ProcessConcurrency.exactly(1),
+        ProcessConcurrency.exactly(2),
+        ProcessConcurrency.exclusive(),
+    ],
+)
+def test_concurrency(rule_runner: RuleRunner, concurrency: ProcessConcurrency) -> None:
+    test_description = f"concurrency-test-{concurrency.kind}-{concurrency.min}-{concurrency.max}"
+    process = Process(
+        argv=("/bin/echo", test_description),
+        concurrency=concurrency,
+        description=test_description,
+    )
+    result = rule_runner.request(ProcessResult, [process])
+    assert result.stdout.decode() == test_description + "\n"
+    assert result.stderr == b""
+
+
+@pytest.mark.parametrize(
+    "concurrency",
+    [
+        ProcessConcurrency.range(1, min=1),
+        ProcessConcurrency.range(max=2),
+        ProcessConcurrency.range(max=2, min=1),
+        # Values larger than num cores still work (they get clamped to num cores)
+        ProcessConcurrency.range(max=10000),
+        ProcessConcurrency.range(min=100, max=200),
+    ],
+)
+def test_concurrency_range(rule_runner: RuleRunner, concurrency: ProcessConcurrency) -> None:
+    test_description = f"concurrency-test-{concurrency.kind}-{concurrency.min}-{concurrency.max}"
+    process = Process(
+        # range concurrency must be templated with {pants_concurrency}
+        argv=("/bin/echo", test_description + " {pants_concurrency}"),
+        concurrency=concurrency,
+        description=test_description,
+    )
+    result = rule_runner.request(ProcessResult, [process])
+    assert result.stdout.decode().startswith(test_description)
+    assert result.stderr == b""
+
+
+def test_concurrency_templating(rule_runner: RuleRunner) -> None:
+    process = Process(
+        argv=("/bin/echo", "concurrency: {pants_concurrency}"),
+        concurrency=ProcessConcurrency.range(max=1),
+        description="concurrency-test",
+    )
+    result = rule_runner.request(ProcessResult, [process])
+    assert result.stdout == b"concurrency: 1\n"
+    assert result.stderr == b""
+
+
+def test_concurrency_enum():
+    exactly_one = ProcessConcurrency.exactly(1)
+    min_one = ProcessConcurrency.range(1, min=1)
+    max_one = ProcessConcurrency.range(max=1)
+    min_one_max_two = ProcessConcurrency.range(min=1, max=2)
+    exclusive = ProcessConcurrency.exclusive()
+
+    assert exactly_one.kind == "exactly"
+    assert exactly_one.min == 1
+    assert exactly_one.max == 1
+
+    up_to_two = ProcessConcurrency.range(2)
+    assert up_to_two.kind == "range"
+    assert up_to_two.min == 1
+    assert up_to_two.max == 2
+    assert up_to_two == min_one_max_two
+
+    assert min_one.kind == "range"
+    assert max_one.kind == "range"
+    assert min_one_max_two.kind == "range"
+    assert exclusive.kind == "exclusive"
+
+    assert min_one.min == 1
+    assert min_one.max == 1
+    assert max_one.min == 1
+    assert max_one.max == 1
+    assert min_one_max_two.min == 1
+    assert min_one_max_two.max == 2
+    assert exclusive.min is None
+    assert exclusive.max is None
+
+    assert exactly_one == ProcessConcurrency.exactly(1)
+    assert min_one == ProcessConcurrency.range(1, min=1)
+    assert max_one == ProcessConcurrency.range(max=1)
+    assert min_one_max_two == ProcessConcurrency.range(min=1, max=2)
+    assert exclusive == ProcessConcurrency.exclusive()
+    assert min_one == max_one
+    assert min_one != min_one_max_two
+    assert max_one != min_one_max_two
+    assert min_one != exclusive
+    assert max_one != exclusive
+    assert min_one_max_two != exclusive

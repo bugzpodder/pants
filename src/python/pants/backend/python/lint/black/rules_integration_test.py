@@ -13,7 +13,6 @@ from pants.backend.python.lint.black.rules import rules as black_rules
 from pants.backend.python.lint.black.subsystem import Black, BlackFieldSet
 from pants.backend.python.lint.black.subsystem import rules as black_subsystem_rules
 from pants.backend.python.target_types import PythonSourcesGeneratorTarget
-from pants.backend.python.util_rules.interpreter_constraints import InterpreterConstraints
 from pants.core.goals.fmt import FmtResult, Partitions
 from pants.core.util_rules import config_files, source_files
 from pants.core.util_rules.source_files import SourceFiles, SourceFilesRequest
@@ -22,10 +21,10 @@ from pants.engine.target import Target
 from pants.testutil.python_interpreter_selection import (
     all_major_minor_python_versions,
     skip_unless_python38_present,
-    skip_unless_python39_present,
 )
 from pants.testutil.python_rule_runner import PythonRuleRunner
 from pants.testutil.rule_runner import QueryRule
+from pants.util.resources import read_sibling_resource
 
 
 @pytest.fixture
@@ -76,6 +75,7 @@ def run_black(
         env_inherit={"PATH", "PYENV_ROOT", "HOME", "LANG", "LC_ALL"},
     )
     field_sets = [BlackFieldSet.create(tgt) for tgt in targets]
+
     input_sources = rule_runner.request(
         SourceFiles,
         [
@@ -90,7 +90,6 @@ def run_black(
     )
     assert len(partitions) == 1
     partition = partitions[0]
-    assert partition.metadata == InterpreterConstraints([expected_ics])
     fmt_result = rule_runner.request(
         FmtResult,
         [
@@ -111,16 +110,28 @@ def run_black(
     all_major_minor_python_versions(Black.default_interpreter_constraints),
 )
 def test_passing(rule_runner: PythonRuleRunner, major_minor_interpreter: str) -> None:
-    rule_runner.write_files({"f.py": GOOD_FILE, "BUILD": "python_sources(name='t')"})
-    tgt = rule_runner.get_target(Address("", target_name="t", relative_file_path="f.py"))
     interpreter_constraint = (
         ">=3.6.2,<3.7" if major_minor_interpreter == "3.6" else f"=={major_minor_interpreter}.*"
     )
+    extra_args = [f"--black-interpreter-constraints=['{interpreter_constraint}']"]
+
+    rule_runner.write_files({"f.py": GOOD_FILE, "BUILD": "python_sources(name='t')"})
+    if major_minor_interpreter == "3.8":
+        lockfile_content = read_sibling_resource(__name__, "black-py38-testing.lock")
+        rule_runner.write_files({"black-py38-testing.lock": lockfile_content})
+        extra_args.extend(
+            [
+                "--python-resolves={'black-py38-testing': 'black-py38-testing.lock'}",
+                "--black-install-from-resolve=black-py38-testing",
+            ]
+        )
+
+    tgt = rule_runner.get_target(Address("", target_name="t", relative_file_path="f.py"))
     fmt_result = run_black(
         rule_runner,
         [tgt],
         expected_ics=interpreter_constraint,
-        extra_args=[f"--black-interpreter-constraints=['{interpreter_constraint}']"],
+        extra_args=extra_args,
     )
     assert "1 file left unchanged" in fmt_result.stderr
     assert fmt_result.output == rule_runner.make_snapshot({"f.py": GOOD_FILE})
@@ -201,32 +212,24 @@ def test_works_with_python38(rule_runner: PythonRuleRunner) -> None:
             pass
         """
     )
+    lockfile_content = read_sibling_resource(__name__, "black-py38-testing.lock")
     rule_runner.write_files(
-        {"f.py": content, "BUILD": "python_sources(name='t', interpreter_constraints=['>=3.8'])"}
+        {
+            "f.py": content,
+            "BUILD": "python_sources(name='t', interpreter_constraints=['>=3.8'])",
+            "black-py38-testing.lock": lockfile_content,
+        }
     )
     tgt = rule_runner.get_target(Address("", target_name="t", relative_file_path="f.py"))
-    fmt_result = run_black(rule_runner, [tgt], expected_ics=">=3.8")
-    assert "1 file left unchanged" in fmt_result.stderr
-    assert fmt_result.output == rule_runner.make_snapshot({"f.py": content})
-    assert fmt_result.did_change is False
-
-
-@skip_unless_python39_present
-def test_works_with_python39(rule_runner: PythonRuleRunner) -> None:
-    """Black's typed-ast dependency does not understand Python 3.9, so we must instead run Black
-    with Python 3.9 when relevant."""
-    content = dedent(
-        """\
-        @lambda _: int
-        def replaced(x: bool) -> str:
-            return "42" if x is True else "1/137"
-        """
+    fmt_result = run_black(
+        rule_runner,
+        [tgt],
+        expected_ics=">=3.8",
+        extra_args=[
+            "--python-resolves={'black-py38-testing': 'black-py38-testing.lock'}",
+            "--black-install-from-resolve=black-py38-testing",
+        ],
     )
-    rule_runner.write_files(
-        {"f.py": content, "BUILD": "python_sources(name='t', interpreter_constraints=['>=3.9'])"}
-    )
-    tgt = rule_runner.get_target(Address("", target_name="t", relative_file_path="f.py"))
-    fmt_result = run_black(rule_runner, [tgt], expected_ics=">=3.9")
     assert "1 file left unchanged" in fmt_result.stderr
     assert fmt_result.output == rule_runner.make_snapshot({"f.py": content})
     assert fmt_result.did_change is False

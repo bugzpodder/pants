@@ -6,22 +6,26 @@ from __future__ import annotations
 import os
 import shlex
 import textwrap
+from collections.abc import Iterable
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import ClassVar, Iterable, Tuple
+from typing import ClassVar
 
+from pants.core.goals.resolves import ExportableTool
 from pants.core.util_rules import external_tool
 from pants.core.util_rules.adhoc_binaries import PythonBuildStandaloneBinary
 from pants.core.util_rules.external_tool import (
     DownloadedExternalTool,
-    ExternalToolRequest,
     TemplatedExternalTool,
+    download_external_tool,
 )
-from pants.core.util_rules.system_binaries import BashBinary
+from pants.core.util_rules.system_binaries import BashBinary, MkdirBinary
 from pants.engine.fs import CreateDigest, Digest, FileContent, MergeDigests
+from pants.engine.intrinsics import create_digest, merge_digests
 from pants.engine.platform import Platform
 from pants.engine.process import Process
-from pants.engine.rules import Get, MultiGet, collect_rules, rule
+from pants.engine.rules import collect_rules, concurrently, rule
+from pants.engine.unions import UnionRule
 from pants.option.option_types import StrListOption, StrOption
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
@@ -78,10 +82,10 @@ COURSIER_FETCH_WRAPPER_SCRIPT = textwrap.dedent(  # noqa: PNT20
     shift
 
     working_dir="$(pwd)"
-    "$coursier_exe" fetch {repos_args} \
+    "$coursier_exe" {jvm_options_args} fetch {repos_args} \
         --json-output-file="$json_output_file" \
         "${{@//{coursier_working_directory}/$working_dir}}"
-    /bin/mkdir -p classpath
+    {mkdir} -p classpath
     {python_path} {coursier_bin_dir}/coursier_post_processing_script.py "$json_output_file"
     """
 )
@@ -108,11 +112,15 @@ class CoursierSubsystem(TemplatedExternalTool):
     name = "coursier"
     help = "A dependency resolver for the Maven ecosystem. (https://get-coursier.io/)"
 
-    default_version = "v2.1.6"
+    default_version = "v2.1.24"
     default_known_versions = [
-        "v2.1.6|macos_arm64 |746b3e346fa2c0107fdbc8a627890d495cb09dee4f8dcc87146bdb45941088cf|20829782|https://github.com/VirtusLab/coursier-m1/releases/download/v2.1.6/cs-aarch64-apple-darwin.gz",
+        "v2.1.24|linux_arm64 |96b4c7580d253b6999a40e94413ca6c4a9bd2339ecce4754ac31a26d1a12fcbf|21534519|https://github.com/VirtusLab/coursier-m1/releases/download/v2.1.24/cs-aarch64-pc-linux.gz",
+        "v2.1.24|linux_x86_64|d2c0572a17fb6146ea65349b59dd216b38beff60ae22bce6e549867c6ed2eda6|23366878",
+        "v2.1.24|macos_arm64 |8f47594eb62dea25af913c8932d1f1d86a3a9c8e1262925b63852635390a3f43|21541383|https://github.com/VirtusLab/coursier-m1/releases/download/v2.1.24/cs-aarch64-apple-darwin.gz",
+        "v2.1.24|macos_x86_64|33913cd6b61658035d9e6fe971e919cb0ef1f659aa7bff7deeded963a2d36385|22442034",
         "v2.1.6|linux_arm64 |33330ca433781c9db9458e15d2d32e5d795de3437771647e26835e8b1391af82|20899290|https://github.com/VirtusLab/coursier-m1/releases/download/v2.1.6/cs-aarch64-pc-linux.gz",
         "v2.1.6|linux_x86_64|af7234f8802107f5e1130307ef8a5cc90262d392f16ddff7dce27a4ed0ddd292|20681688",
+        "v2.1.6|macos_arm64 |746b3e346fa2c0107fdbc8a627890d495cb09dee4f8dcc87146bdb45941088cf|20829782|https://github.com/VirtusLab/coursier-m1/releases/download/v2.1.6/cs-aarch64-apple-darwin.gz",
         "v2.1.6|macos_x86_64|36a5d42a0724be2ac39d0ebd8869b985e3d58ceb121bc60389ee2d6d7408dd56|20037412",
         "v2.1.0-M5-18-gfebf9838c|linux_arm64 |d4ad15ba711228041ad8a46d848c83c8fbc421d7b01c415d8022074dd609760f|19264005",
         "v2.1.0-M5-18-gfebf9838c|linux_x86_64|3e1a1ad1010d5582e9e43c5a26b273b0147baee5ebd27d3ac1ab61964041c90b|19551533",
@@ -168,6 +176,41 @@ class CoursierSubsystem(TemplatedExternalTool):
         ),
     )
 
+    jvm_options = StrListOption(
+        advanced=True,
+        help=softwrap(
+            """
+            Extra JVM options to pass to Coursier.
+
+            Coursier is distributed as a GraalVM native image. It bundles its own trust
+            store from build time and does not read the `HTTP_PROXY`/`HTTPS_PROXY`
+            environment variables, so a custom CA or proxy must be supplied as JVM system
+            properties on Coursier's own command line. Without this option there is no way
+            to do that, and Coursier fails to fetch artifacts and JDKs in environments
+            with a TLS-inspecting proxy or without direct internet access.
+
+            Each value is passed to Coursier prefixed with `-J`; the prefix is added
+            automatically if you omit it. For example, both
+            `-Djavax.net.ssl.trustStore=/etc/pki/java/cacerts` and
+            `-J-Djavax.net.ssl.trustStore=/etc/pki/java/cacerts` are passed to Coursier as
+            `-J-Djavax.net.ssl.trustStore=/etc/pki/java/cacerts`.
+
+            These options apply to every Coursier invocation, including JDK provisioning.
+            They are unrelated to `[jvm].global_options`, which applies to the JVM
+            processes Pants runs, not to Coursier itself.
+
+            See https://get-coursier.io/docs/other-proxy.
+            """
+        ),
+    )
+
+    @property
+    def normalized_jvm_options(self) -> tuple[str, ...]:
+        """`jvm_options` with the `-J` prefix Coursier requires, added where absent."""
+        return tuple(
+            option if option.startswith("-J") else f"-J{option}" for option in self.jvm_options
+        )
+
     def generate_exe(self, plat: Platform) -> str:
         tool_version = self.known_version(plat)
         url = (tool_version and tool_version.url_override) or self.generate_url(plat)
@@ -184,6 +227,7 @@ class Coursier:
     _digest: Digest
     repos: FrozenOrderedSet[str]
     jvm_index: str
+    jvm_options: tuple[str, ...]
     _append_only_caches: FrozenDict[str, str]
 
     bin_dir: ClassVar[str] = "__coursier"
@@ -195,10 +239,18 @@ class Coursier:
     working_directory_placeholder: ClassVar[str] = "___COURSIER_WORKING_DIRECTORY___"
 
     def args(self, args: Iterable[str], *, wrapper: Iterable[str] = ()) -> tuple[str, ...]:
+        # `jvm_options` must precede Coursier's subcommand, so it cannot simply be prepended
+        # to `args`. When a `wrapper` is used, the Coursier exe path is consumed by the
+        # wrapper script as a positional argument rather than being invoked directly here,
+        # so inserting the options at this point would shift the wrapper's own arguments.
+        # In that case the wrapper is responsible for passing them: they are templated into
+        # `COURSIER_FETCH_WRAPPER_SCRIPT` as `jvm_options_args`.
+        jvm_options = () if wrapper else self.jvm_options
         return (
             self.post_process_stderr,
             *wrapper,
             os.path.join(self.bin_dir, self.coursier.exe),
+            *jvm_options,
             *args,
         )
 
@@ -237,10 +289,10 @@ class Coursier:
 
 @dataclass(frozen=True)
 class CoursierFetchProcess:
-    args: Tuple[str, ...]
+    args: tuple[str, ...]
     input_digest: Digest
-    output_directories: Tuple[str, ...]
-    output_files: Tuple[str, ...]
+    output_directories: tuple[str, ...]
+    output_files: tuple[str, ...]
     description: str
 
 
@@ -271,26 +323,25 @@ async def setup_coursier(
     coursier_subsystem: CoursierSubsystem,
     python: PythonBuildStandaloneBinary,
     platform: Platform,
+    mkdir: MkdirBinary,
 ) -> Coursier:
     repos_args = (
         " ".join(f"-r={shlex.quote(repo)}" for repo in coursier_subsystem.repos) + " --no-default"
     )
+    jvm_options = coursier_subsystem.normalized_jvm_options
     coursier_wrapper_script = COURSIER_FETCH_WRAPPER_SCRIPT.format(
+        jvm_options_args=" ".join(shlex.quote(option) for option in jvm_options),
         repos_args=repos_args,
         coursier_working_directory=Coursier.working_directory_placeholder,
         python_path=shlex.quote(python.path),
         coursier_bin_dir=shlex.quote(Coursier.bin_dir),
+        mkdir=shlex.quote(mkdir.path),
     )
 
     post_process_stderr = POST_PROCESS_COURSIER_STDERR_SCRIPT.format(python_path=python.path)
 
-    downloaded_coursier_get = Get(
-        DownloadedExternalTool,
-        ExternalToolRequest,
-        coursier_subsystem.get_request(platform),
-    )
-    wrapper_scripts_digest_get = Get(
-        Digest,
+    downloaded_coursier_get = download_external_tool(coursier_subsystem.get_request(platform))
+    wrapper_scripts_digest_get = create_digest(
         CreateDigest(
             [
                 FileContent(
@@ -309,26 +360,26 @@ async def setup_coursier(
                     is_executable=True,
                 ),
             ]
-        ),
+        )
     )
 
-    downloaded_coursier, wrapper_scripts_digest = await MultiGet(
+    downloaded_coursier, wrapper_scripts_digest = await concurrently(
         downloaded_coursier_get, wrapper_scripts_digest_get
     )
 
     return Coursier(
         coursier=downloaded_coursier,
-        _digest=await Get(
-            Digest,
+        _digest=await merge_digests(
             MergeDigests(
                 [
                     downloaded_coursier.digest,
                     wrapper_scripts_digest,
                 ]
-            ),
+            )
         ),
         repos=FrozenOrderedSet(coursier_subsystem.repos),
         jvm_index=coursier_subsystem.jvm_index,
+        jvm_options=jvm_options,
         _append_only_caches=python.APPEND_ONLY_CACHES,
     )
 
@@ -337,4 +388,5 @@ def rules():
     return [
         *collect_rules(),
         *external_tool.rules(),
+        UnionRule(ExportableTool, CoursierSubsystem),
     ]

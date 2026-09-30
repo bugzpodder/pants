@@ -3,17 +3,19 @@
 
 from __future__ import annotations
 
-from pants.backend.go.util_rules.build_pkg import BuiltGoPackage
-from pants.backend.go.util_rules.build_pkg_target import BuildGoPackageRequestForStdlibRequest
+from pants.backend.go.util_rules.build_pkg import (
+    MergeBuiltGoPackageArchivesRequest,
+    merge_built_go_package_archives,
+    required_built_go_package,
+)
+from pants.backend.go.util_rules.build_pkg_stdlib import BuildGoPackageRequestForStdlibRequest
 from pants.backend.go.util_rules.link_defs import (
     ImplicitLinkerDependencies,
     ImplicitLinkerDependenciesHook,
 )
-from pants.engine.internals.native_engine import Digest, MergeDigests
-from pants.engine.internals.selectors import Get, MultiGet
-from pants.engine.rules import collect_rules, rule
+from pants.engine.internals.selectors import concurrently
+from pants.engine.rules import collect_rules, implicitly, rule
 from pants.engine.unions import UnionRule
-from pants.util.frozendict import FrozenDict
 
 
 class SdkImplicitLinkerDependenciesHook(ImplicitLinkerDependenciesHook):
@@ -37,25 +39,24 @@ async def provide_sdk_implicit_linker_dependencies(
         implicit_deps_import_paths.add("runtime/asan")
     # TODO: Building for coverage in Go 1.20+ forces an import of runtime/coverage.
 
-    built_implicit_linker_deps = await MultiGet(
-        Get(
-            BuiltGoPackage,
-            BuildGoPackageRequestForStdlibRequest(dep_import_path, build_opts=request.build_opts),
+    built_implicit_linker_deps = await concurrently(
+        required_built_go_package(
+            **implicitly(
+                BuildGoPackageRequestForStdlibRequest(
+                    dep_import_path, build_opts=request.build_opts
+                )
+            ),
         )
         for dep_import_path in implicit_deps_import_paths
     )
 
-    implicit_dep_digests = []
-    import_paths_to_pkg_a_files: dict[str, str] = {}
-    for built_implicit_linker_dep in built_implicit_linker_deps:
-        import_paths_to_pkg_a_files.update(built_implicit_linker_dep.import_paths_to_pkg_a_files)
-        implicit_dep_digests.append(built_implicit_linker_dep.digest)
-
-    digest = await Get(Digest, MergeDigests(implicit_dep_digests))
+    merged = await merge_built_go_package_archives(
+        MergeBuiltGoPackageArchivesRequest(tuple(built_implicit_linker_deps))
+    )
 
     return ImplicitLinkerDependencies(
-        digest=digest,
-        import_paths_to_pkg_a_files=FrozenDict(import_paths_to_pkg_a_files),
+        digest=merged.digest,
+        import_paths_to_pkg_a_files=merged.import_paths_to_pkg_a_files,
     )
 
 

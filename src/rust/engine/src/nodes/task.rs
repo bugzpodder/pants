@@ -2,24 +2,24 @@
 // Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 use std::fmt;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use deepsize::DeepSizeOf;
 use futures::future::{self, BoxFuture, FutureExt};
 use graph::CompoundNode;
 use internment::Intern;
-use pyo3::prelude::{PyErr, Python};
-use pyo3::types::{PyDict, PyTuple};
-use pyo3::{IntoPy, ToPyObject};
+use pyo3::prelude::{PyAnyMethods, PyErr, Python};
+use pyo3::types::{PyDict, PyDictMethods, PyTuple};
+use pyo3::{Bound, IntoPyObject};
 use rule_graph::DependencyKey;
-use workunit_store::{in_workunit, Level, RunningWorkunit};
+use workunit_store::{Level, RunningWorkunit, in_workunit};
 
-use super::{maybe_side_effecting, select, NodeKey, NodeResult, Params};
+use super::{NodeKey, NodeResult, Params, select, task_context};
 use crate::context::Context;
 use crate::externs::engine_aware::EngineAwareReturnType;
 use crate::externs::{self, GeneratorInput, GeneratorResponse};
-use crate::python::{throw, Failure, Key, TypeId, Value};
+use crate::python::{Failure, Key, TypeId, Value, throw};
 use crate::tasks::{self, Rule};
 
 #[derive(DeepSizeOf, Derivative, Clone)]
@@ -48,8 +48,25 @@ impl Task {
         call: externs::Call,
     ) -> NodeResult<Value> {
         let context = context.clone();
+        let implementation_rule = context
+            .core
+            .tasks
+            .vtable()
+            .get(&call.rule_id)
+            .and_then(|ve| {
+                call.inputs
+                    .iter()
+                    .map(|t| ve.get(t.type_id()))
+                    .find(Option::is_some)
+                    .flatten()
+            });
+
+        // If no implementation rule, use the base rule. Typically that will throw a
+        // relevant error, but could hypothetically provide a sensible default implementation.
+        let rule_id = implementation_rule.unwrap_or(&call.rule_id);
+
         let dependency_key =
-            DependencyKey::for_known_rule(call.rule_id.clone(), call.output_type, call.args_arity)
+            DependencyKey::for_known_rule(rule_id.clone(), call.output_type, call.args_arity)
                 .provided_params(call.inputs.iter().map(|t| *t.type_id()));
         params.extend(call.inputs.iter().cloned());
 
@@ -60,98 +77,108 @@ impl Task {
             .ok_or_else(|| throw(format!("No edges for task {entry:?} exist!")))?;
 
         // Find the entry for the Call.
-        let entry = edges.entry_for(&dependency_key).ok_or_else(|| {
-            // NB: The Python constructor for `Call()` will have already errored if
-            // `type(input) != input_type`.
-            throw(format!(
-                "{call} was not detected in your @rule body at rule compile time."
-            ))
-        })?;
-        select(context, call.args, call.args_arity, params, entry).await
-    }
-
-    // Handles the case where a generator produces a `Get` for an unknown `@rule`.
-    async fn gen_get(
-        context: &Context,
-        mut params: Params,
-        entry: Intern<rule_graph::Entry<Rule>>,
-        get: externs::Get,
-    ) -> NodeResult<Value> {
-        let dependency_key =
-            DependencyKey::new(get.output).provided_params(get.inputs.iter().map(|t| *t.type_id()));
-        params.extend(get.inputs.iter().cloned());
-
-        let edges = context
-            .core
-            .rule_graph
-            .edges_for_inner(&entry)
-            .ok_or_else(|| throw(format!("No edges for task {entry:?} exist!")))?;
-
-        // Find the entry for the Get.
         let entry = edges
             .entry_for(&dependency_key)
             .or_else(|| {
-                // The Get might have involved a @union: if so, include its in_scope types in the
+                // The Call might have involved a @union: if so, include its in_scope types in the
                 // lookup.
-                let in_scope_types = get
+                let in_scope_types = call
                     .input_types
                     .iter()
                     .find_map(|t| t.union_in_scope_types())?;
-                edges.entry_for(
-                    &DependencyKey::new(get.output)
-                        .provided_params(get.inputs.iter().map(|k| *k.type_id()))
-                        .in_scope_params(in_scope_types),
-                )
+                edges.entry_for(&dependency_key.in_scope_params(in_scope_types))
             })
             .ok_or_else(|| {
-                if get.input_types.iter().any(|t| t.is_union()) {
-                    throw(format!(
-            "Invalid Get. Because an input type for `{get}` was annotated with `@union`, \
-             the value for that type should be a member of that union. Did you \
-             intend to register a `UnionRule`? If not, you may be using the incorrect \
-             explicitly declared type.",
-          ))
-                } else {
-                    // NB: The Python constructor for `Get()` will have already errored if
-                    // `type(input) != input_type`.
-                    throw(format!(
-                        "{get} was not detected in your @rule body at rule compile time. \
-             Was the `Get` constructor called in a non async-function, or \
-             was it inside an async function defined after the @rule? \
-             Make sure the `Get` is defined before or inside the @rule body.",
-                    ))
-                }
+                // NB: The Python constructor for `Call()` will have already errored if
+                // `type(input) != input_type`.
+                throw(format!(
+                    "{call} was not detected in your @rule body at rule compile time. Make sure \
+                    the callee is defined before the @rule body."
+                ))
             })?;
-        select(context.clone(), None, 0, params, entry).await
+        select(context, call.args, call.args_arity, params, entry).await
     }
 
-    // Handles the case where a generator produces either a `Get` or a generator.
-    fn gen_get_or_generator(
+    // Handles the case where a generator produces a generator.
+    fn gen_generator(
         context: &Context,
         params: Params,
         entry: Intern<rule_graph::Entry<Rule>>,
-        gog: externs::GetOrGenerator,
-    ) -> BoxFuture<NodeResult<Value>> {
+        generator: Value,
+    ) -> BoxFuture<'_, NodeResult<Value>> {
         async move {
-            match gog {
-                externs::GetOrGenerator::Get(get) => {
-                    Self::gen_get(context, params, entry, get).await
+            // TODO: The generator may run concurrently with any other generators requested in an
+            // `All`/`concurrently` (due to `future::try_join_all`), and so it needs its own workunit.
+            // Should look into removing this constraint: possibly by running all generators from an
+            // `All` on a tokio `LocalSet`.
+            in_workunit!("generator", Level::Trace, |workunit| async move {
+                let (value, _type_id) =
+                    Self::generate(context, workunit, params, entry, generator).await?;
+                Ok(value)
+            })
+            .await
+        }
+        .boxed()
+    }
+
+    // Dispatches a single `AllItem` to its corresponding driver, recursing into nested
+    // `concurrently(..)` groups and returning their joined results as a tuple `Value`.
+    fn gen_all_item(
+        context: &Context,
+        params: Params,
+        entry: Intern<rule_graph::Entry<Rule>>,
+        item: externs::AllItem,
+    ) -> BoxFuture<'_, NodeResult<Value>> {
+        async move {
+            match item {
+                externs::AllItem::Generator(generator) => {
+                    Self::gen_generator(context, params, entry, generator).await
                 }
-                externs::GetOrGenerator::Generator(generator) => {
-                    // TODO: The generator may run concurrently with any other generators requested in an
-                    // `All`/`MultiGet` (due to `future::try_join_all`), and so it needs its own workunit.
-                    // Should look into removing this constraint: possibly by running all generators from an
-                    // `All` on a tokio `LocalSet`.
-                    in_workunit!("generator", Level::Trace, |workunit| async move {
-                        let (value, _type_id) =
-                            Self::generate(context, workunit, params, entry, generator).await?;
-                        Ok(value)
-                    })
-                    .await
+                externs::AllItem::Call(call) => Self::gen_call(context, params, entry, call).await,
+                externs::AllItem::Concurrent(items) => {
+                    let values = Self::gen_all(context, params, entry, items).await?;
+                    Python::attach(|py| externs::store_tuple(py, values))
+                        .map_err(|err| Python::attach(|py| Failure::from_py_err_with_gil(py, err)))
                 }
             }
         }
         .boxed()
+    }
+
+    // Concurrently drives every item in an `All`/`concurrently(..)`.
+    async fn gen_all(
+        context: &Context,
+        params: Params,
+        entry: Intern<rule_graph::Entry<Rule>>,
+        items: Vec<externs::AllItem>,
+    ) -> NodeResult<Vec<Value>> {
+        // NB: Use a semaphore rather than all at once: every eagerly requested item pins the futures
+        // of its entire in-flight subgraph in memory until it completes.
+        // The semaphore must be scoped to this call: a shared pool would deadlock when the
+        // items of nested `concurrently(..)` groups held permits while waiting for their children to acquire.
+        // TODO: The window and its multipliers are ad hoc, and per-call scoping admits up to
+        // window^depth items when nested. A dependency-aware semaphore with permit inheritance
+        // would give a global bound without deadlock: https://github.com/pantsbuild/pants/issues/23503
+        let window = std::cmp::max(
+            64,
+            std::cmp::max(
+                context.core.local_parallelism * 4,
+                context.core.remote_parallelism.unwrap_or(0) * 2,
+            ),
+        );
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(window));
+        let futures = items.into_iter().map(|item| {
+            let semaphore = semaphore.clone();
+            let params = params.clone();
+            async move {
+                let _permit = semaphore
+                    .acquire()
+                    .await
+                    .expect("The semaphore is never closed.");
+                Self::gen_all_item(context, params, entry, item).await
+            }
+        });
+        future::try_join_all(futures).await
     }
 
     ///
@@ -167,10 +194,21 @@ impl Task {
     ) -> NodeResult<(Value, TypeId)> {
         let mut input = GeneratorInput::Initial;
         loop {
-            let response = Python::with_gil(|py| {
-                externs::generator_send(py, &context.core.types.coroutine, &generator, input)
-            })?;
+            let response = Python::attach(|py| externs::generator_send(py, &generator, input))?;
             match response {
+                GeneratorResponse::NativeCall(call) => {
+                    let _blocking_token = workunit.blocking();
+                    let result = (call.call).await;
+                    match result {
+                        Ok(value) => {
+                            input = GeneratorInput::Arg(value);
+                        }
+                        Err(throw @ Failure::Throw { .. }) => {
+                            input = GeneratorInput::Err(PyErr::from(throw));
+                        }
+                        Err(failure) => break Err(failure),
+                    }
+                }
                 GeneratorResponse::Call(call) => {
                     let _blocking_token = workunit.blocking();
                     let result = Self::gen_call(context, params.clone(), entry, call).await;
@@ -184,30 +222,16 @@ impl Task {
                         Err(failure) => break Err(failure),
                     }
                 }
-                GeneratorResponse::Get(get) => {
+                GeneratorResponse::All(items) => {
                     let _blocking_token = workunit.blocking();
-                    let result = Self::gen_get(context, params.clone(), entry, get).await;
-                    match result {
-                        Ok(value) => {
-                            input = GeneratorInput::Arg(value);
-                        }
-                        Err(throw @ Failure::Throw { .. }) => {
-                            input = GeneratorInput::Err(PyErr::from(throw));
-                        }
-                        Err(failure) => break Err(failure),
-                    }
-                }
-                GeneratorResponse::All(gogs) => {
-                    let _blocking_token = workunit.blocking();
-                    let get_futures = gogs
-                        .into_iter()
-                        .map(|gog| Self::gen_get_or_generator(context, params.clone(), entry, gog))
-                        .collect::<Vec<_>>();
-                    match future::try_join_all(get_futures).await {
+                    match Self::gen_all(context, params.clone(), entry, items).await {
                         Ok(values) => {
-                            input = GeneratorInput::Arg(Python::with_gil(|py| {
-                                externs::store_tuple(py, values)
-                            }));
+                            let values_tuple_result =
+                                Python::attach(|py| externs::store_tuple(py, values));
+                            input = match values_tuple_result {
+                                Ok(t) => GeneratorInput::Arg(t),
+                                Err(err) => GeneratorInput::Err(err),
+                            }
                         }
                         Err(throw @ Failure::Throw { .. }) => {
                             input = GeneratorInput::Err(PyErr::from(throw));
@@ -257,37 +281,53 @@ impl Task {
 
         let args = self.args;
 
-        let (mut result_val, mut result_type) =
-            maybe_side_effecting(self.task.side_effecting, &self.side_effected, async move {
-                Python::with_gil(|py| {
-                    let func = (*self.task.func.0.value).as_ref(py);
+        let (mut result_val, mut result_type) = task_context(
+            context.clone(),
+            self.task.side_effecting,
+            &self.side_effected,
+            async move {
+                Python::attach(|py| {
+                    let func = self.task.func.0.value.bind(py);
 
                     // If there are explicit positional arguments, apply any computed arguments as
                     // keywords. Otherwise, apply computed arguments as positional.
                     let res = if let Some(args) = args {
-                        let args = args.value.extract::<&PyTuple>(py)?;
+                        let args = args
+                            .value
+                            .bind(py)
+                            .extract::<Bound<'_, PyTuple>>()
+                            .map_err(PyErr::from)?;
                         let kwargs = PyDict::new(py);
-                        for ((name, _), value) in self.task.args.iter().zip(deps.into_iter()) {
+                        for ((name, _), value) in
+                            self.task.args.iter().skip(self.args_arity.into()).zip(deps)
+                        {
                             kwargs.set_item(name, &value)?;
                         }
-                        func.call(args, Some(kwargs))
+                        func.call(args, Some(&kwargs))
                     } else {
-                        let args_tuple = PyTuple::new(py, deps.iter().map(|v| v.to_object(py)));
+                        let deps = deps
+                            .iter()
+                            .map(|v| v.into_pyobject(py))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| format!("Conversion error: {e:?}"))?;
+                        let args_tuple = PyTuple::new(py, deps)?;
                         func.call1(args_tuple)
                     };
 
                     res.map(|res| {
-                        let type_id = TypeId::new(res.get_type());
-                        let val = Value::new(res.into_py(py));
+                        let type_id = TypeId::new(&res.get_type().as_borrowed());
+                        let val = Value::from(&res);
                         (val, type_id)
                     })
                     .map_err(Failure::from)
                 })
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         if result_type == context.core.types.coroutine {
-            let (new_val, new_type) = maybe_side_effecting(
+            let (new_val, new_type) = task_context(
+                context.clone(),
                 self.task.side_effecting,
                 &self.side_effected,
                 Self::generate(&context, workunit, params, self.entry, result_val),
@@ -306,8 +346,8 @@ impl Task {
         }
 
         if self.task.engine_aware_return_type {
-            Python::with_gil(|py| {
-                EngineAwareReturnType::update_workunit(workunit, (*result_val).as_ref(py))
+            Python::attach(|py| {
+                EngineAwareReturnType::update_workunit(workunit, result_val.bind(py))
             })
         };
 

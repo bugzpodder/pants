@@ -19,6 +19,7 @@ from pants.util.strutil import help_text, softwrap
 _EXAMPLE = """\
 Consider a directory-layout:
 
+```
 ├── BUILD
 ├── src/
 │   ├── BUILD
@@ -27,10 +28,11 @@ Consider a directory-layout:
 │   │   └── index.test.js
 │   └── index.js
 └── package.json
+```
 
 where package.json contains
 
-# package.json
+```json title=\"package.json\"
 {
     ...
     "scripts": {
@@ -40,6 +42,7 @@ where package.json contains
         ...
     }
 }
+```
 """
 
 
@@ -97,7 +100,7 @@ class NodeJSTest(Subsystem):
         if len(addresses) == 1:
             target_spec = results_file_prefix
         else:
-            target_spec = f"batch-of-{results_file_prefix}+{len(addresses)-1}-files"
+            target_spec = f"batch-of-{results_file_prefix}+{len(addresses) - 1}-files"
         return PurePath(
             self.coverage_output_dir.format(distdir=distdir.relpath, target_spec=target_spec)
         )

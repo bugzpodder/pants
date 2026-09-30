@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import logging
 import shlex
+import time
+from pathlib import Path
 from textwrap import dedent
 
 import pytest
@@ -18,21 +20,26 @@ from pants.backend.shell.target_types import (
 from pants.backend.shell.util_rules.shell_command import (
     GenerateFilesFromShellCommandRequest,
     RunShellCommand,
+    RunShellCommandBuild,
     ShellCommandProcessFromTargetRequest,
 )
 from pants.backend.shell.util_rules.shell_command import rules as shell_command_rules
+from pants.core.environments.target_types import LocalWorkspaceEnvironmentTarget
 from pants.core.goals.run import RunRequest
 from pants.core.target_types import ArchiveTarget, FilesGeneratorTarget, FileSourceField
 from pants.core.target_types import rules as core_target_type_rules
 from pants.core.util_rules import archive, source_files
-from pants.core.util_rules.adhoc_process_support import AdhocProcessRequest
+from pants.core.util_rules.adhoc_process_support import (
+    AdhocProcessRequest,
+    PreparedAdhocProcessRequest,
+)
 from pants.core.util_rules.source_files import SourceFiles, SourceFilesRequest
 from pants.engine.addresses import Address
 from pants.engine.environment import EnvironmentName
 from pants.engine.fs import EMPTY_SNAPSHOT, DigestContents
 from pants.engine.internals.native_engine import IntrinsicError
 from pants.engine.internals.scheduler import ExecutionError
-from pants.engine.process import Process, ProcessExecutionFailure
+from pants.engine.process import ProcessExecutionFailure
 from pants.engine.target import (
     GeneratedSources,
     GenerateSourcesRequest,
@@ -52,9 +59,12 @@ def rule_runner() -> RuleRunner:
             *source_files.rules(),
             *core_target_type_rules(),
             QueryRule(GeneratedSources, [GenerateFilesFromShellCommandRequest]),
-            QueryRule(Process, [AdhocProcessRequest]),
-            QueryRule(Process, [EnvironmentName, ShellCommandProcessFromTargetRequest]),
+            QueryRule(PreparedAdhocProcessRequest, [AdhocProcessRequest]),
+            QueryRule(
+                PreparedAdhocProcessRequest, [EnvironmentName, ShellCommandProcessFromTargetRequest]
+            ),
             QueryRule(RunRequest, [RunShellCommand]),
+            QueryRule(RunRequest, [RunShellCommandBuild]),
             QueryRule(SourceFiles, [SourceFilesRequest]),
             QueryRule(TransitiveTargets, [TransitiveTargetsRequest]),
         ],
@@ -65,10 +75,21 @@ def rule_runner() -> RuleRunner:
             ShellSourcesGeneratorTarget,
             ArchiveTarget,
             FilesGeneratorTarget,
+            LocalWorkspaceEnvironmentTarget,
         ],
+        isolated_local_store=True,
     )
     rule_runner.set_options([], env_inherit={"PATH"})
     return rule_runner
+
+
+def execute_shell_command(
+    rule_runner: RuleRunner,
+    address: Address,
+) -> GeneratedSources:
+    generator_type: type[GenerateSourcesRequest] = GenerateFilesFromShellCommandRequest
+    target = rule_runner.get_target(address)
+    return rule_runner.request(GeneratedSources, [generator_type(EMPTY_SNAPSHOT, target)])
 
 
 def assert_shell_command_result(
@@ -76,9 +97,7 @@ def assert_shell_command_result(
     address: Address,
     expected_contents: dict[str, str],
 ) -> None:
-    generator_type: type[GenerateSourcesRequest] = GenerateFilesFromShellCommandRequest
-    target = rule_runner.get_target(address)
-    result = rule_runner.request(GeneratedSources, [generator_type(EMPTY_SNAPSHOT, target)])
+    result = execute_shell_command(rule_runner, address)
     assert result.snapshot.files == tuple(expected_contents)
     contents = rule_runner.request(DigestContents, [result.snapshot.digest])
     for fc in contents:
@@ -544,7 +563,7 @@ def test_run_shell_command_request(
 @pytest.mark.parametrize(
     ("tool_name", "should_succeed"),
     (
-        ("python3.8", True),
+        ("python3.11", True),
         ("cd", False),
         ("floop", False),
     ),
@@ -580,7 +599,7 @@ def test_path_populated_with_tools(
             raise exerr
 
     if should_succeed:
-        assert caplog.records[0].msg.strip().endswith("python3.8")
+        assert caplog.records[0].msg.strip().endswith("python3.11")
     else:
         # `which` is silent in `bash` when nothing is found
         assert not caplog.records
@@ -594,7 +613,7 @@ def test_shell_command_boot_script(rule_runner: RuleRunner) -> None:
                 shell_command(
                   name="boot-script-test",
                   tools=[
-                    "python3.8",
+                    "python3.11",
                   ],
                   command="./command.script",
                   workdir=".",
@@ -605,7 +624,10 @@ def test_shell_command_boot_script(rule_runner: RuleRunner) -> None:
     )
 
     tgt = rule_runner.get_target(Address("src", target_name="boot-script-test"))
-    res = rule_runner.request(Process, [ShellCommandProcessFromTargetRequest(tgt)])
+    prepred_request = rule_runner.request(
+        PreparedAdhocProcessRequest, [ShellCommandProcessFromTargetRequest(tgt)]
+    )
+    res = prepred_request.process
     assert "bash" in res.argv[0]
     assert res.argv[1] == "-c"
     assert res.argv[2].startswith("cd src &&")
@@ -623,7 +645,7 @@ def test_shell_command_boot_script_in_build_root(rule_runner: RuleRunner) -> Non
                 shell_command(
                   name="boot-script-test",
                   tools=[
-                    "python3.8",
+                    "python3.11",
                   ],
                   command="./command.script",
                 )
@@ -633,7 +655,10 @@ def test_shell_command_boot_script_in_build_root(rule_runner: RuleRunner) -> Non
     )
 
     tgt = rule_runner.get_target(Address("", target_name="boot-script-test"))
-    res = rule_runner.request(Process, [ShellCommandProcessFromTargetRequest(tgt)])
+    prepared_request = rule_runner.request(
+        PreparedAdhocProcessRequest, [ShellCommandProcessFromTargetRequest(tgt)]
+    )
+    res = prepared_request.process
     assert "bash" in res.argv[0]
     assert res.argv[1] == "-c"
     assert "bash -c" in res.argv[2]
@@ -837,3 +862,321 @@ def test_working_directory_special_values(
         Address("src", target_name="workdir"),
         expected_contents={"out.log": f"{expected_dir}\n"},
     )
+
+
+def test_shell_command_with_workspace_execution(rule_runner: RuleRunner) -> None:
+    rule_runner.write_files(
+        {
+            "BUILD": dedent(
+                """
+            shell_command(
+                name="make-file",
+                command="echo workspace > foo.txt && echo sandbox > {chroot}/out.log",
+                output_files=["out.log"],
+                environment="workspace",
+            )
+            experimental_workspace_environment(name="workspace")
+            """
+            )
+        }
+    )
+    rule_runner.set_options(
+        ["--environments-preview-names={'workspace': '//:workspace'}"],
+        env_inherit={"PATH"},
+    )
+
+    assert_shell_command_result(
+        rule_runner,
+        Address("", target_name="make-file"),
+        expected_contents={"out.log": "sandbox\n"},
+    )
+    workspace_output_path = Path(rule_runner.build_root).joinpath("foo.txt")
+    assert workspace_output_path.exists()
+    assert workspace_output_path.read_text().strip() == "workspace"
+
+
+def test_shell_command_workspace_invalidation_sources(rule_runner: RuleRunner) -> None:
+    rule_runner.write_files(
+        {
+            "src/BUILD": dedent(
+                """\
+            shell_command(
+              name="cmd",
+              # Use a random value so we can detect when re-execution occurs.
+              command='echo $RANDOM > out.log',
+              output_files=["out.log"],
+              workspace_invalidation_sources=['a-file'],
+            )
+            """
+            ),
+            "src/a-file": "",
+        }
+    )
+    address = Address("src", target_name="cmd")
+
+    # Re-executing the initial execution should be cached.
+    result1 = execute_shell_command(rule_runner, address)
+    result2 = execute_shell_command(rule_runner, address)
+    assert result1.snapshot == result2.snapshot
+
+    # Update the hash-only source file's content. The shell_command should be re-executed now.
+    (Path(rule_runner.build_root) / "src" / "a-file").write_text("xyzzy")
+    time.sleep(0.100)
+    result3 = execute_shell_command(rule_runner, address)
+    assert result1.snapshot != result3.snapshot
+
+
+def test_shell_command_workspace_output_capture_base(rule_runner: RuleRunner) -> None:
+    rule_runner.write_files(
+        {
+            "BUILD": dedent(
+                """
+            shell_command(
+                name="make-file",
+                tools=["cp"],
+                command="[ -r ./foo.txt ] && cp ./foo.txt {chroot}/bar.txt",
+                output_files=["bar.txt"],
+                environment="workspace",
+                workdir="subdir",
+            )
+            experimental_workspace_environment(name="workspace")
+            """
+            ),
+            "subdir/foo.txt": "xyzzy",
+        }
+    )
+    rule_runner.set_options(
+        ["--environments-preview-names={'workspace': '//:workspace'}"], env_inherit={"PATH"}
+    )
+
+    assert_shell_command_result(
+        rule_runner, Address("", target_name="make-file"), {"bar.txt": "xyzzy"}
+    )
+
+
+def test_shell_command_path_env_modify_mode(rule_runner: RuleRunner) -> None:
+    expected_path = "/bin:/usr/bin"
+    rule_runner.write_files(
+        {
+            "src/BUILD": dedent(
+                f"""\
+            shell_command(
+                name="shims_prepend",
+                tools=["echo"],
+                command="echo $PATH > path.txt",
+                extra_env_vars=["PATH={expected_path}"],
+                output_files=["path.txt"],
+                path_env_modify="prepend",
+            )
+            shell_command(
+                name="shims_append",
+                tools=["echo"],
+                command="echo $PATH > path.txt",
+                extra_env_vars=["PATH={expected_path}"],
+                output_files=["path.txt"],
+                path_env_modify="append",
+            )
+            shell_command(
+                name="shims_off",
+                tools=["echo"],
+                command="echo $PATH > path.txt",
+                extra_env_vars=["PATH={expected_path}"],
+                output_files=["path.txt"],
+                path_env_modify="off",
+            )
+            """
+            )
+        }
+    )
+
+    def run(target_name: str) -> str:
+        result = execute_shell_command(rule_runner, Address("src", target_name=target_name))
+        contents = rule_runner.request(DigestContents, [result.snapshot.digest])
+        assert len(contents) == 1
+        return contents[0].content.decode().strip()
+
+    path_prepend = run("shims_prepend")
+    assert path_prepend.endswith(expected_path)
+    assert len(path_prepend) > len(expected_path)
+
+    path_append = run("shims_append")
+    assert path_append.startswith(expected_path)
+    assert len(path_append) > len(expected_path)
+
+    path_off = run("shims_off")
+    assert path_off == expected_path
+
+
+def test_shell_command_check_outputs(rule_runner: RuleRunner) -> None:
+    rule_runner.write_files(
+        {
+            "BUILD": dedent(
+                """\
+            shell_command(
+                name="allow_empty",
+                command="true",
+                output_files=["non-existent-file"],
+                output_directories=["non-existent-dir"],
+                outputs_match_mode="allow_empty",
+            )
+            shell_command(
+                name="all_with_present_file",
+                command="touch some-file",
+                tools=["touch"],
+                output_files=["some-file"],
+                output_directories=["some-directory"],
+                outputs_match_mode="all",
+            )
+            shell_command(
+                name="all_with_present_directory",
+                command="mkdir some-directory",
+                tools=["mkdir"],
+                output_files=["some-file"],
+                output_directories=["some-directory"],
+                outputs_match_mode="all",
+            )
+            shell_command(
+                name="at_least_one_with_present_file",
+                command="touch some-file",
+                tools=["touch"],
+                output_files=["some-file"],
+                output_directories=["some-directory"],
+                outputs_match_mode="at_least_one",
+            )
+            shell_command(
+                name="at_least_one_with_present_directory",
+                command="mkdir some-directory && touch some-directory/foo.txt",
+                tools=["mkdir", "touch"],
+                output_files=["some-file"],
+                output_directories=["some-directory"],
+                outputs_match_mode="at_least_one",
+            )
+            """
+            )
+        }
+    )
+
+    assert_shell_command_result(rule_runner, Address("", target_name="allow_empty"), {})
+
+    with pytest.raises(ExecutionError) as exc_info:
+        execute_shell_command(rule_runner, Address("", target_name="all_with_present_file"))
+    assert "some-directory" in str(exc_info)
+
+    with pytest.raises(ExecutionError) as exc_info:
+        execute_shell_command(rule_runner, Address("", target_name="all_with_present_directory"))
+    assert "some-file" in str(exc_info)
+
+    assert_shell_command_result(
+        rule_runner, Address("", target_name="at_least_one_with_present_file"), {"some-file": ""}
+    )
+    assert_shell_command_result(
+        rule_runner,
+        Address("", target_name="at_least_one_with_present_directory"),
+        {"some-directory/foo.txt": ""},
+    )
+
+
+@pytest.mark.parametrize(
+    ("workdir", "expected_boot"),
+    [
+        (None, "cd src; "),
+        (".", "cd src; "),
+        ("/", ""),
+        ("src/with space'n quote", """cd 'src/with space'\"'\"'n quote'; """),
+        ("./with space'n quote", """cd 'src/with space'\"'\"'n quote'; """),
+    ],
+)
+def test_run_shell_command_build_request(
+    rule_runner: RuleRunner, workdir: None | str, expected_boot: str
+) -> None:
+    """Test that shell_command targets can generate RunRequest for the run goal."""
+    rule_runner.write_files(
+        {
+            "src/BUILD": dedent(
+                f"""\
+                shell_command(
+                  name="test",
+                  command="some cmd string",
+                  tools=["echo"],
+                  workdir={workdir!r},
+                )
+                """
+            ),
+        }
+    )
+
+    args = ("bash", "-c", expected_boot + "some cmd string", "pants run src:test --")
+
+    tgt = rule_runner.get_target(Address("src", target_name="test"))
+    run = RunShellCommandBuild.create(tgt)
+    request = rule_runner.request(RunRequest, [run])
+    assert len(args) == len(request.args)
+    # handle the binary name specially, because the path may differ
+    assert args[0] in request.args[0]
+    for arg, request_arg in zip(args[1:], request.args[1:]):
+        assert arg == request_arg
+
+
+def test_run_shell_command_build_with_tools(rule_runner: RuleRunner) -> None:
+    """Test that shell_command with tools field generates correct RunRequest."""
+    rule_runner.write_files(
+        {
+            "src/BUILD": dedent(
+                """\
+                shell_command(
+                  name="with-tools",
+                  command="echo hello",
+                  tools=["echo", "cat"],
+                )
+                """
+            ),
+        }
+    )
+
+    tgt = rule_runner.get_target(Address("src", target_name="with-tools"))
+    run = RunShellCommandBuild.create(tgt)
+    request = rule_runner.request(RunRequest, [run])
+
+    # Verify the command is properly formed
+    assert "bash" in request.args[0]
+    assert "-c" in request.args
+    assert "echo hello" in request.args[2]
+
+    # Verify that tools are included in immutable_input_digests
+    assert request.immutable_input_digests is not None
+
+
+def test_run_shell_command_build_with_dependencies(rule_runner: RuleRunner) -> None:
+    """Test that shell_command with execution_dependencies generates correct RunRequest."""
+    rule_runner.write_files(
+        {
+            "src/BUILD": dedent(
+                """\
+                shell_command(
+                  name="msg-gen",
+                  command="echo message > msg.txt",
+                  tools=["echo"],
+                  output_files=["msg.txt"],
+                )
+
+                shell_command(
+                  name="with-deps",
+                  command="cat msg.txt",
+                  tools=["cat"],
+                  execution_dependencies=[":msg-gen"],
+                )
+                """
+            ),
+        }
+    )
+
+    tgt = rule_runner.get_target(Address("src", target_name="with-deps"))
+    run = RunShellCommandBuild.create(tgt)
+    request = rule_runner.request(RunRequest, [run])
+
+    # Verify the command is properly formed
+    assert "bash" in request.args[0]
+    assert "cat msg.txt" in request.args[2]
+
+    # Verify that the digest contains dependencies
+    assert request.digest is not None

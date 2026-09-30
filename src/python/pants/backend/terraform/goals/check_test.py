@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import textwrap
-from typing import Dict, Sequence
+from collections.abc import Sequence
 
 import pytest
 
@@ -219,9 +219,9 @@ def test_conflicting_provider_versions(rule_runner: RuleRunner) -> None:
     If a large target glob is used (`::`), we get all the sources
     """
     target_name = "in_folder"
-    versions = ["3.2.1", "3.0.0"]
+    versions = ["3.2.1", "3.2.2"]
 
-    def make_terraform_module(version: str) -> Dict[str, str]:
+    def make_terraform_module(version: str) -> dict[str, str]:
         return {
             f"folder{version}/BUILD": textwrap.dedent(
                 f"""\

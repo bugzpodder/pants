@@ -3,18 +3,22 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 import itertools
 import logging
 import re
 import threading
-import tokenize
 import traceback
-from dataclasses import dataclass
+import typing
+from annotationlib import Format, ForwardRef, call_annotate_function
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import InitVar, dataclass, field
 from difflib import get_close_matches
-from io import StringIO
 from pathlib import PurePath
-from typing import Any, Callable, Iterable, Mapping, TypeVar
+from typing import Annotated, Any, TypeVar
+
+import typing_extensions
 
 from pants.base.deprecated import warn_or_error
 from pants.base.exceptions import MappingError
@@ -29,7 +33,7 @@ from pants.engine.unions import UnionMembership
 from pants.util.docutil import doc_url
 from pants.util.frozendict import FrozenDict
 from pants.util.memo import memoized_property
-from pants.util.strutil import docstring, softwrap
+from pants.util.strutil import docstring, softwrap, strval
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -63,9 +67,23 @@ class BuildFilePreludeSymbols(BuildFileSymbolsInfo):
 
     @classmethod
     def create(cls, ns: Mapping[str, Any], env_vars: Iterable[str]) -> BuildFilePreludeSymbols:
-        info = {}
-        for name, symb in ns.items():
-            info[name] = BuildFileSymbolInfo(name, symb)
+        annotations: dict[str, Any | ForwardRef] = {}
+        if annotation_function := ns.get("__annotate__"):
+            annotations = call_annotate_function(annotation_function, format=Format.FORWARDREF)
+
+        info = {
+            name: BuildFileSymbolInfo(
+                name,
+                symb,
+                # We only need type hints via `annotations` for top-level values which doesn't work with `inspect`.
+                type_hints=annotations.get(name),
+                # If the user has defined a _ symbol, we assume they don't want it in `pants help` output.
+                hide_from_help=name.startswith("_"),
+            )
+            for name, symb in ns.items()
+            if name not in ["__annotate__", "__annotations__", "__conditional_annotations__"]
+        }
+
         return cls(info=FrozenDict(info), referenced_env_vars=tuple(sorted(env_vars)))
 
 
@@ -73,20 +91,42 @@ class BuildFilePreludeSymbols(BuildFileSymbolsInfo):
 class BuildFileSymbolInfo:
     name: str
     value: Any
+    help: str | None = field(default=None, compare=False)
+    signature: str | None = field(default=None, compare=False, init=False)
+    type_hints: InitVar[Any] = None
 
-    @property
-    def help(self) -> str | None:
-        return inspect.getdoc(self.value) if hasattr(self.value, "__name__") else None
+    hide_from_help: bool = False
 
-    @property
-    def signature(self) -> str | None:
-        if not callable(self.value):
-            return None
-        else:
+    def __post_init__(self, type_hints: Any) -> None:
+        annotated_type: type = type(self.value)
+        help: str | None = self.help
+        signature: str | None = None
+
+        if type_hints is not None:
+            if typing.get_origin(type_hints) is Annotated:
+                annotated_type, *metadata = typing.get_args(type_hints)
+                for meta in metadata:
+                    if isinstance(meta, typing_extensions.Doc):
+                        help = meta.documentation
+                        break
+            else:
+                annotated_type = type_hints
+
+        if help is None:
+            if hasattr(self.value, "__name__"):
+                help = inspect.getdoc(self.value)
+
+        if self.help is None and isinstance(help, str):
+            object.__setattr__(self, "help", softwrap(help))
+
+        if callable(self.value):
             try:
-                return str(inspect.signature(self.value))
+                signature = str(inspect.signature(self.value))
             except ValueError:
-                return None
+                signature = None
+        else:
+            signature = f": {annotated_type.__name__}"
+        object.__setattr__(self, "signature", signature)
 
 
 class ParseError(Exception):
@@ -237,8 +277,13 @@ class RegistrarField:
 
 class Registrar:
     def __init__(
-        self, parse_state: ParseState, type_alias: str, field_types: tuple[type[Field], ...]
+        self,
+        parse_state: ParseState,
+        type_alias: str,
+        field_types: tuple[type[Field], ...],
+        help: str,
     ) -> None:
+        self.__doc__ = help
         self._parse_state = parse_state
         self._type_alias = type_alias
         for field_type in field_types:
@@ -337,14 +382,12 @@ class Parser:
         parse_state = ParseState()
 
         def create_registrar_for_target(alias: str) -> tuple[str, Registrar]:
+            target_cls = registered_target_types.aliases_to_types[alias]
             return alias, Registrar(
                 parse_state,
                 alias,
-                tuple(
-                    registered_target_types.aliases_to_types[alias].class_field_types(
-                        union_membership
-                    )
-                ),
+                tuple(target_cls.class_field_types(union_membership)),
+                strval(getattr(target_cls, "help", "")),
             )
 
         type_aliases = dict(map(create_registrar_for_target, registered_target_types.aliases))
@@ -356,7 +399,10 @@ class Parser:
 
         symbols_info = BuildFileSymbolsInfo.from_info(
             parse_state._symbols,
-            (BuildFileSymbolInfo(alias, registrar) for alias, registrar in type_aliases.items()),
+            (
+                BuildFileSymbolInfo(alias, registrar, help=registrar.__doc__)
+                for alias, registrar in type_aliases.items()
+            ),
             (BuildFileSymbolInfo(alias, value) for alias, value in object_aliases.objects.items()),
             (
                 BuildFileSymbolInfo(alias, object_factory(parse_context))
@@ -378,6 +424,7 @@ class Parser:
         self,
         filepath: str,
         build_file_content: str,
+        tree: ast.Module,
         extra_symbols: BuildFilePreludeSymbols,
         env_vars: EnvironmentVars,
         is_bootstrap: bool,
@@ -403,7 +450,7 @@ class Parser:
             defined_symbols = set()
             while True:
                 try:
-                    code = compile(build_file_content, filepath, "exec", dont_inherit=True)
+                    code = compile(tree, filepath, "exec", dont_inherit=True)
                     exec(code, global_symbols)
                 except NameError as e:
                     bad_symbol = _extract_symbol_from_name_error(e)
@@ -426,11 +473,11 @@ class Parser:
                     continue
                 break
 
-            error_on_imports(build_file_content, filepath)
+            error_on_imports(build_file_content, tree, filepath)
             return self._parse_state.parsed_targets()
 
         try:
-            code = compile(build_file_content, filepath, "exec", dont_inherit=True)
+            code = compile(tree, filepath, "exec", dont_inherit=True)
             exec(code, global_symbols)
         except NameError as e:
             frame = traceback.extract_tb(e.__traceback__, limit=-1)[0]
@@ -442,7 +489,7 @@ class Parser:
             help_str = softwrap(
                 f"""
                 If you expect to see more symbols activated in the below list, refer to
-                {doc_url('docs/using-pants/key-concepts/backends')} for all available backends to activate.
+                {doc_url("docs/using-pants/key-concepts/backends")} for all available backends to activate.
                 """
             )
             valid_symbols = sorted(s for s in global_symbols.keys() if s != "__builtins__")
@@ -459,28 +506,31 @@ class Parser:
                 f"{original}.\n\n{help_str}\n\nAll registered symbols: {valid_symbols}"
             )
 
-        error_on_imports(build_file_content, filepath)
+        error_on_imports(build_file_content, tree, filepath)
         return self._parse_state.parsed_targets()
 
 
-def error_on_imports(build_file_content: str, filepath: str) -> None:
+def error_on_imports(build_file_content: str, tree: ast.AST, filepath: str) -> None:
     # This is poor sandboxing; there are many ways to get around this. But it's sufficient to tell
     # users who aren't malicious that they're doing something wrong, and it has a low performance
     # overhead.
     if "import" not in build_file_content:
         return
-    io_wrapped_python = StringIO(build_file_content)
-    for token in tokenize.generate_tokens(io_wrapped_python.readline):
-        token_str = token[1]
-        lineno, _ = token[2]
-        if token_str != "import":
-            continue
-        raise ParseError(
-            f"Import used in {filepath} at line {lineno}. Import statements are banned in "
-            "BUILD files and macros (that act like a normal BUILD file) because they can easily "
-            "break Pants caching and lead to stale results. "
-            f"\n\nInstead, consider writing a plugin ({doc_url('docs/writing-plugins/overview')})."
-        )
+    first_import: ast.Import | ast.ImportFrom | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and (
+            first_import is None
+            or (node.lineno, node.col_offset) < (first_import.lineno, first_import.col_offset)
+        ):
+            first_import = node
+    if first_import is None:
+        return
+    raise ParseError(
+        f"Import used in {filepath} at line {first_import.lineno}. Import statements are banned in "
+        "BUILD files and macros (that act like a normal BUILD file) because they can easily "
+        "break Pants caching and lead to stale results. "
+        f"\n\nInstead, consider writing a plugin ({doc_url('docs/writing-plugins/overview')})."
+    )
 
 
 def _extract_symbol_from_name_error(err: NameError) -> str:

@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import os.path
 import re
+from hashlib import sha256
+from pathlib import Path
 from textwrap import dedent
 
 import pytest
@@ -24,7 +27,6 @@ from pants.backend.python.typecheck.mypy.rules import (
     MyPyPartition,
     MyPyPartitions,
     MyPyRequest,
-    determine_python_files,
 )
 from pants.backend.python.typecheck.mypy.rules import rules as mypy_rules
 from pants.backend.python.typecheck.mypy.subsystem import MyPy, MyPyFieldSet
@@ -39,10 +41,7 @@ from pants.engine.target import Target
 from pants.testutil.python_interpreter_selection import (
     all_major_minor_python_versions,
     skip_unless_all_pythons_present,
-    skip_unless_python27_and_python3_present,
-    skip_unless_python27_present,
     skip_unless_python38_present,
-    skip_unless_python39_present,
 )
 from pants.testutil.python_rule_runner import PythonRuleRunner
 from pants.util.resources import read_sibling_resource
@@ -235,6 +234,7 @@ def test_thirdparty_plugin(rule_runner: PythonRuleRunner) -> None:
     rule_runner.write_files(
         {
             "mypy.lock": read_sibling_resource(__name__, "mypy_with_django_stubs.lock"),
+            f"{PACKAGE}/__init__.py": "",
             f"{PACKAGE}/settings.py": dedent(
                 """\
                 from django.urls import URLPattern
@@ -255,7 +255,7 @@ def test_thirdparty_plugin(rule_runner: PythonRuleRunner) -> None:
             ),
             f"{PACKAGE}/BUILD": dedent(
                 """\
-                python_sources()
+                python_sources(interpreter_constraints=['>=3.11'])
 
                 python_requirement(
                     name="reqs", requirements=["django==3.2.19", "django-stubs==1.8.0"]
@@ -281,6 +281,7 @@ def test_thirdparty_plugin(rule_runner: PythonRuleRunner) -> None:
             rule_runner.get_target(Address(PACKAGE, relative_file_path="settings.py")),
         ],
         extra_args=[
+            "--source-root-patterns=['src/py']",
             "--python-resolves={'mypy':'mypy.lock'}",
             "--mypy-install-from-resolve=mypy",
         ],
@@ -330,71 +331,6 @@ def test_transitive_dependencies(rule_runner: PythonRuleRunner) -> None:
     assert f"{PACKAGE}/math/add.py:5" in result[0].stdout
 
 
-@skip_unless_python27_present
-def test_works_with_python27(rule_runner: PythonRuleRunner) -> None:
-    """A regression test that we can properly handle Python 2-only third-party dependencies.
-
-    There was a bug that this would cause the runner PEX to fail to execute because it did not have
-    Python 3 distributions of the requirements.
-
-    Also note that this Python 2 support should be automatic: Pants will tell MyPy to run with
-    `--py2` by detecting its use in interpreter constraints.
-    """
-    rule_runner.write_files(
-        {
-            "mypy.lock": read_sibling_resource(__name__, "older_mypy_for_testing.lock"),
-            "BUILD": dedent(
-                """\
-                # Both requirements are a) typed and b) compatible with Py2 and Py3. However, `x690`
-                # has a distinct wheel for Py2 vs. Py3, whereas libumi has a universal wheel. We expect
-                # both to be usable, even though libumi is not compatible with Py3.
-
-                python_requirement(
-                    name="libumi",
-                    requirements=["libumi==0.0.2"],
-                )
-
-                python_requirement(
-                    name="x690",
-                    requirements=["x690==0.2.0"],
-                )
-                """
-            ),
-            f"{PACKAGE}/f.py": dedent(
-                """\
-                from libumi import hello_world
-                from x690 import types
-
-                print "Blast from the past!"
-                print hello_world() - 21  # MyPy should fail. You can't subtract an `int` from `bytes`.
-                """
-            ),
-            f"{PACKAGE}/BUILD": "python_sources(interpreter_constraints=['==2.7.*'])",
-        }
-    )
-    tgt = rule_runner.get_target(Address(PACKAGE, relative_file_path="f.py"))
-    result = run_mypy(
-        rule_runner,
-        [tgt],
-        extra_args=[
-            "--python-resolves={'mypy':'mypy.lock'}",
-            "--mypy-install-from-resolve=mypy",
-        ],
-    )
-    assert len(result) == 1
-    assert result[0].exit_code == 1
-    assert f"{PACKAGE}/f.py:5: error: Unsupported operand types" in result[0].stdout
-    # Confirm original issues not showing up.
-    assert "Failed to execute PEX file" not in result[0].stderr
-    assert (
-        "Cannot find implementation or library stub for module named 'x690'" not in result[0].stdout
-    )
-    assert (
-        "Cannot find implementation or library stub for module named 'libumi'"
-        not in result[0].stdout
-    )
-
-
 @skip_unless_python38_present
 def test_works_with_python38(rule_runner: PythonRuleRunner) -> None:
     """MyPy's typed-ast dependency does not understand Python 3.8, so we must instead run MyPy with
@@ -409,93 +345,15 @@ def test_works_with_python38(rule_runner: PythonRuleRunner) -> None:
                 """
             ),
             f"{PACKAGE}/BUILD": "python_sources(interpreter_constraints=['>=3.8'])",
+            "mypy.lock": read_sibling_resource(__name__, "mypy_py38.lock"),
         }
     )
+    extra_args = [
+        "--python-resolves={'mypy':'mypy.lock'}",
+        "--mypy-install-from-resolve=mypy",
+    ]
     tgt = rule_runner.get_target(Address(PACKAGE, relative_file_path="f.py"))
-    assert_success(rule_runner, tgt)
-
-
-@skip_unless_python39_present
-def test_works_with_python39(rule_runner: PythonRuleRunner) -> None:
-    """MyPy's typed-ast dependency does not understand Python 3.9, so we must instead run MyPy with
-    Python 3.9 when relevant."""
-    rule_runner.write_files(
-        {
-            f"{PACKAGE}/f.py": dedent(
-                """\
-                @lambda _: int
-                def replaced(x: bool) -> str:
-                    return "42" if x is True else "1/137"
-                """
-            ),
-            f"{PACKAGE}/BUILD": "python_sources(interpreter_constraints=['>=3.9'])",
-        }
-    )
-    tgt = rule_runner.get_target(Address(PACKAGE, relative_file_path="f.py"))
-    assert_success(rule_runner, tgt)
-
-
-@skip_unless_python27_and_python3_present
-def test_uses_correct_python_version(rule_runner: PythonRuleRunner) -> None:
-    """We set `--python-version` automatically for the user, and also batch based on interpreter
-    constraints.
-
-    This batching must consider transitive dependencies, so we use a more complex setup where the
-    dependencies are what have specific constraints that influence the batching.
-    """
-    rule_runner.write_files(
-        {
-            "mypy.lock": read_sibling_resource(__name__, "older_mypy_for_testing.lock"),
-            f"{PACKAGE}/py2/__init__.py": dedent(
-                """\
-                def add(x, y):
-                    # type: (int, int) -> int
-                    return x + y
-                """
-            ),
-            f"{PACKAGE}/py2/BUILD": "python_sources(interpreter_constraints=['==2.7.*'])",
-            f"{PACKAGE}/py3/__init__.py": dedent(
-                """\
-                def add(x: int, y: int) -> int:
-                    return x + y
-                """
-            ),
-            f"{PACKAGE}/py3/BUILD": "python_sources(interpreter_constraints=['>=3.6'])",
-            f"{PACKAGE}/__init__.py": "",
-            f"{PACKAGE}/uses_py2.py": "from project.py2 import add\nassert add(2, 2) == 4\n",
-            f"{PACKAGE}/uses_py3.py": "from project.py3 import add\nassert add(2, 2) == 4\n",
-            f"{PACKAGE}/BUILD": dedent(
-                """python_sources(
-                overrides={
-                  'uses_py2.py': {'interpreter_constraints': ['==2.7.*']},
-                  'uses_py3.py': {'interpreter_constraints': ['>=3.6']},
-                }
-              )
-            """
-            ),
-        }
-    )
-    py2_tgt = rule_runner.get_target(Address(PACKAGE, relative_file_path="uses_py2.py"))
-    py3_tgt = rule_runner.get_target(Address(PACKAGE, relative_file_path="uses_py3.py"))
-
-    result = run_mypy(
-        rule_runner,
-        [py2_tgt, py3_tgt],
-        extra_args=[
-            "--python-resolves={'mypy':'mypy.lock'}",
-            "--mypy-install-from-resolve=mypy",
-        ],
-    )
-    assert len(result) == 2
-    py2_result, py3_result = sorted(result, key=lambda res: res.partition_description or "")
-
-    assert py2_result.exit_code == 0
-    assert py2_result.partition_description == "['CPython==2.7.*']"
-    assert "Success: no issues found" in py2_result.stdout
-
-    assert py3_result.exit_code == 0
-    assert py3_result.partition_description == "['CPython>=3.6']"
-    assert "Success: no issues found" in py3_result.stdout
+    assert_success(rule_runner, tgt, extra_args=extra_args)
 
 
 def test_run_only_on_specified_files(rule_runner: PythonRuleRunner) -> None:
@@ -558,9 +416,9 @@ def test_mypy_shadows_requirements(rule_runner: PythonRuleRunner) -> None:
     """
     rule_runner.write_files(
         {
-            "mypy.lock": read_sibling_resource(__name__, "mypy_shadowing_typed_ast.lock"),
-            "BUILD": "python_requirement(name='ta', requirements=['typed-ast==1.4.1'])",
-            f"{PACKAGE}/f.py": "import typed_ast",
+            "mypy.lock": read_sibling_resource(__name__, "mypy_shadowing_tomli.lock"),
+            "BUILD": "python_requirement(name='ta', requirements=['tomli==2.1.0'])",
+            f"{PACKAGE}/f.py": "import tomli",
             f"{PACKAGE}/BUILD": "python_sources()",
         }
     )
@@ -684,14 +542,15 @@ def test_source_plugin(rule_runner: PythonRuleRunner) -> None:
     assert "Success: no issues found in 1 source file" in result.stdout
 
 
-def test_protobuf_mypy(rule_runner: PythonRuleRunner) -> None:
+@pytest.mark.parametrize("protoc_type_stubs", (False, True), ids=("mypy_plugin", "protoc_direct"))
+def test_protobuf_mypy(rule_runner: PythonRuleRunner, protoc_type_stubs: bool) -> None:
     rule_runner = PythonRuleRunner(
         rules=[*rule_runner.rules, *protobuf_rules(), *protobuf_subsystem_rules()],
         target_types=[*rule_runner.target_types, ProtobufSourceTarget],
     )
     rule_runner.write_files(
         {
-            "BUILD": ("python_requirement(name='protobuf', requirements=['protobuf==3.13.0'])"),
+            "BUILD": ("python_requirement(name='protobuf', requirements=['protobuf==6.31.1'])"),
             f"{PACKAGE}/__init__.py": "",
             f"{PACKAGE}/proto.proto": dedent(
                 """\
@@ -724,12 +583,59 @@ def test_protobuf_mypy(rule_runner: PythonRuleRunner) -> None:
     result = run_mypy(
         rule_runner,
         [tgt],
-        extra_args=["--python-protobuf-mypy-plugin"],
+        extra_args=[
+            "--python-protobuf-generate-type-stubs"
+            if protoc_type_stubs
+            else "--python-protobuf-mypy-plugin"
+        ],
     )
     assert len(result) == 1
     assert 'Argument "name" to "Person" has incompatible type "int"' in result[0].stdout
     assert 'Argument "id" to "Person" has incompatible type "str"' in result[0].stdout
     assert result[0].exit_code == 1
+
+
+def test_cache_directory_per_resolve(rule_runner: PythonRuleRunner) -> None:
+    build_multiple_resolves = dedent(
+        """\
+        python_source(
+            name='f_from_a',
+            source='f.py',
+            resolve='a',
+        )
+        python_source(
+           name='f_from_b',
+           source='f.py',
+           resolve='b',
+        )
+        """
+    )
+    rule_runner.write_files(
+        {
+            f"{PACKAGE}/f.py": GOOD_FILE,
+            f"{PACKAGE}/BUILD": build_multiple_resolves,
+            "mypy.lock": read_sibling_resource(__name__, "mypy_with_django_stubs.lock"),
+        }
+    )
+    target_a = rule_runner.get_target(Address(PACKAGE, target_name="f_from_a"))
+    target_b = rule_runner.get_target(Address(PACKAGE, target_name="f_from_b"))
+
+    runner_options = [
+        "--python-resolves={'a': 'mypy.lock', 'b': 'mypy.lock'}",
+        "--python-enable-resolves",
+    ]
+    run_mypy(rule_runner, [target_a, target_b], extra_args=runner_options)
+
+    with rule_runner.pushd():
+        Path("BUILDROOT").touch()
+        bootstrap_options = rule_runner.options_bootstrapper.bootstrap_options.for_global_scope()
+    named_cache_dir = bootstrap_options.named_caches_dir
+    mypy_cache_dir = (
+        f"{named_cache_dir}/mypy_cache/{sha256(rule_runner.build_root.encode()).hexdigest()}"
+    )
+    for resolve in ["a", "b"]:
+        expected_cache_dir = f"{mypy_cache_dir}/{resolve}"
+        assert os.path.exists(expected_cache_dir)
 
 
 @skip_unless_all_pythons_present("3.8", "3.9")
@@ -818,15 +724,6 @@ def test_partition_targets(rule_runner: PythonRuleRunner) -> None:
     )
 
 
-def test_determine_python_files() -> None:
-    assert determine_python_files([]) == ()
-    assert determine_python_files(["f.py"]) == ("f.py",)
-    assert determine_python_files(["f.pyi"]) == ("f.pyi",)
-    assert determine_python_files(["f.py", "f.pyi"]) == ("f.pyi",)
-    assert determine_python_files(["f.pyi", "f.py"]) == ("f.pyi",)
-    assert determine_python_files(["f.json"]) == ()
-
-
 def test_colors_and_formatting(rule_runner: PythonRuleRunner) -> None:
     rule_runner.write_files(
         {
@@ -855,3 +752,16 @@ def test_colors_and_formatting(rule_runner: PythonRuleRunner) -> None:
     # at least one escape sequence that sets text color (red)
     assert "\033[31m" in result[0].stdout
     assert result[0].report == EMPTY_DIGEST
+
+
+def test_force(rule_runner: PythonRuleRunner) -> None:
+    rule_runner.write_files(
+        {
+            f"{PACKAGE}/f.py": GOOD_FILE,
+            f"{PACKAGE}/BUILD": "python_sources()",
+        }
+    )
+    tgt = rule_runner.get_target(Address(PACKAGE, relative_file_path="f.py"))
+    result = run_mypy(rule_runner, [tgt], extra_args=["--check-force"])
+    assert len(result) == 1
+    assert result[0].exit_code == 0

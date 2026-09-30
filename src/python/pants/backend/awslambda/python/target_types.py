@@ -5,21 +5,26 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import ClassVar, Match, Optional, Tuple, cast
+from enum import Enum
+from re import Match
+from typing import ClassVar, cast
 
 from pants.backend.python.target_types import PexCompletePlatformsField, PythonResolveField
 from pants.backend.python.util_rules.faas import (
+    FaaSArchitecture,
     PythonFaaSCompletePlatforms,
     PythonFaaSDependencies,
     PythonFaaSHandlerField,
     PythonFaaSKnownRuntime,
     PythonFaaSLayoutField,
     PythonFaaSPex3VenvCreateExtraArgsField,
+    PythonFaaSPexBuildExtraArgs,
     PythonFaaSRuntimeField,
+    PythonFaaSUvPlatforms,
 )
 from pants.backend.python.util_rules.faas import rules as faas_rules
+from pants.core.environments.target_types import EnvironmentField
 from pants.core.goals.package import OutputPathField
-from pants.core.util_rules.environments import EnvironmentField
 from pants.engine.addresses import Address
 from pants.engine.rules import collect_rules
 from pants.engine.target import (
@@ -27,6 +32,7 @@ from pants.engine.target import (
     BoolField,
     Field,
     InvalidFieldException,
+    StringField,
     Target,
 )
 from pants.util.docutil import doc_url
@@ -87,8 +93,99 @@ class PythonAwsLambdaIncludeSources(BoolField):
     )
 
 
+PYTHON_RUNTIME_REGEX = r"python(?P<major>\d)\.(?P<minor>\d+)"
+
+
+class PythonAwsLambdaFunctionRuntimes(Enum):
+    PYTHON_36 = "python3.6"
+    PYTHON_37 = "python3.7"
+    PYTHON_38 = "python3.8"
+    PYTHON_39 = "python3.9"
+    PYTHON_310 = "python3.10"
+    PYTHON_311 = "python3.11"
+    PYTHON_312 = "python3.12"
+    PYTHON_313 = "python3.13"
+    PYTHON_314 = "python3.14"
+
+    def to_interpreter_version(self) -> tuple[int, int]:
+        """Returns the Python version implied by the runtime, as (major, minor)."""
+        mo = cast(Match, re.match(PYTHON_RUNTIME_REGEX, self.value))
+        return int(mo.group("major")), int(mo.group("minor"))
+
+
+LAMBDA_DOCKER_REPO = "public.ecr.aws/lambda/python"
+
+
 class PythonAwsLambdaRuntime(PythonFaaSRuntimeField):
-    PYTHON_RUNTIME_REGEX = r"python(?P<major>\d)\.(?P<minor>\d+)"
+    # See https://docs.aws.amazon.com/powertools/python/latest/build_recipes/cross-platform/#manylinux-compatibility-tags
+    # Note: The 3.9-3.11 runtimes actually support glibc 2.24, but uv doesn't offer *-manylinux_2_24 as allowed
+    # values for the --python-platform option.
+    RUNTIME_TAG_MAPPING = {
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_36, FaaSArchitecture.X86_64): (
+            "3.6",
+            "manylinux_2_17",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_37, FaaSArchitecture.X86_64): (
+            "3.7",
+            "manylinux_2_17",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_38, FaaSArchitecture.X86_64): (
+            "3.8-x86_64",
+            "manylinux_2_17",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_38, FaaSArchitecture.ARM64): (
+            "3.8-arm64",
+            "manylinux_2_17",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_39, FaaSArchitecture.X86_64): (
+            "3.9-x86_64",
+            "manylinux_2_17",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_39, FaaSArchitecture.ARM64): (
+            "3.9-arm64",
+            "manylinux_2_17",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_310, FaaSArchitecture.X86_64): (
+            "3.10-x86_64",
+            "manylinux_2_17",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_310, FaaSArchitecture.ARM64): (
+            "3.10-arm64",
+            "manylinux_2_17",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_311, FaaSArchitecture.X86_64): (
+            "3.11-x86_64",
+            "manylinux_2_17",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_311, FaaSArchitecture.ARM64): (
+            "3.11-arm64",
+            "manylinux_2_17",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_312, FaaSArchitecture.X86_64): (
+            "3.12-x86_64",
+            "manylinux_2_34",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_312, FaaSArchitecture.ARM64): (
+            "3.12-arm64",
+            "manylinux_2_34",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_313, FaaSArchitecture.X86_64): (
+            "3.13-x86_64",
+            "manylinux_2_34",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_313, FaaSArchitecture.ARM64): (
+            "3.13-arm64",
+            "manylinux_2_34",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_314, FaaSArchitecture.X86_64): (
+            "3.14-x86_64",
+            "manylinux_2_34",
+        ),
+        (PythonAwsLambdaFunctionRuntimes.PYTHON_314, FaaSArchitecture.ARM64): (
+            "3.14-arm64",
+            "manylinux_2_34",
+        ),
+    }
 
     help = help_text(
         """
@@ -102,23 +199,25 @@ class PythonAwsLambdaRuntime(PythonFaaSRuntimeField):
         """
     )
 
-    # https://gallery.ecr.aws/lambda/python
-    known_runtimes_docker_repo = "public.ecr.aws/lambda/python"
-    known_runtimes = (
-        PythonFaaSKnownRuntime(3, 6, "3.6"),
-        PythonFaaSKnownRuntime(3, 7, "3.7"),
-        PythonFaaSKnownRuntime(3, 8, "3.8-x86_64"),
-        PythonFaaSKnownRuntime(3, 9, "3.9-x86_64"),
-        PythonFaaSKnownRuntime(3, 10, "3.10-x86_64"),
-        PythonFaaSKnownRuntime(3, 11, "3.11-x86_64"),
+    valid_choices = PythonAwsLambdaFunctionRuntimes
+    known_runtimes = tuple(
+        PythonFaaSKnownRuntime(
+            runtime.value,
+            *runtime.to_interpreter_version(),
+            docker_repo=LAMBDA_DOCKER_REPO,
+            tag=tag,
+            architecture=architecture,
+            manylinux=manylinux,
+        )
+        for (runtime, architecture), (tag, manylinux) in RUNTIME_TAG_MAPPING.items()
     )
 
     @classmethod
-    def compute_value(cls, raw_value: Optional[str], address: Address) -> Optional[str]:
+    def compute_value(cls, raw_value: str | None, address: Address) -> str | None:
         value = super().compute_value(raw_value, address)
         if value is None:
             return None
-        if not re.match(cls.PYTHON_RUNTIME_REGEX, value):
+        if not re.match(PYTHON_RUNTIME_REGEX, value):
             raise InvalidFieldException(
                 softwrap(
                     f"""
@@ -129,16 +228,29 @@ class PythonAwsLambdaRuntime(PythonFaaSRuntimeField):
             )
         return value
 
-    def to_interpreter_version(self) -> Optional[Tuple[int, int]]:
+    def to_interpreter_version(self) -> tuple[int, int] | None:
         """Returns the Python version implied by the runtime, as (major, minor)."""
         if self.value is None:
             return None
-        mo = cast(Match, re.match(self.PYTHON_RUNTIME_REGEX, self.value))
+        mo = cast(Match, re.match(PYTHON_RUNTIME_REGEX, self.value))
         return int(mo.group("major")), int(mo.group("minor"))
 
     @classmethod
     def from_interpreter_version(cls, py_major: int, py_minor: int) -> str:
         return f"python{py_major}.{py_minor}"
+
+
+class AWSLambdaArchitectureField(StringField):
+    alias = "architecture"
+    valid_choices = FaaSArchitecture
+    expected_type = str
+    default = FaaSArchitecture.X86_64.value
+    help = help_text(
+        """
+        The architecture of the AWS Lambda runtime to target (x86_64 or arm64).
+        See https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html.
+        """
+    )
 
 
 class PythonAwsLambdaLayerDependenciesField(PythonFaaSDependencies):
@@ -152,7 +264,9 @@ class _AWSLambdaBaseTarget(Target):
         PythonAwsLambdaIncludeRequirements,
         PythonAwsLambdaRuntime,
         PythonFaaSCompletePlatforms,
+        PythonFaaSUvPlatforms,
         PythonFaaSPex3VenvCreateExtraArgsField,
+        PythonFaaSPexBuildExtraArgs,
         PythonFaaSLayoutField,
         PythonResolveField,
         EnvironmentField,
@@ -185,12 +299,13 @@ class PythonAWSLambda(_AWSLambdaBaseTarget):
         *_AWSLambdaBaseTarget.core_fields,
         PythonFaaSDependencies,
         PythonAwsLambdaHandlerField,
+        AWSLambdaArchitectureField,
     )
     help = help_text(
         f"""
         A self-contained Python function suitable for uploading to AWS Lambda.
 
-        See {doc_url('docs/python/integrations/aws-lambda')}.
+        See {doc_url("docs/python/integrations/aws-lambda")}.
         """
     )
 
@@ -201,12 +316,13 @@ class PythonAWSLambdaLayer(_AWSLambdaBaseTarget):
         *_AWSLambdaBaseTarget.core_fields,
         PythonAwsLambdaIncludeSources,
         PythonAwsLambdaLayerDependenciesField,
+        AWSLambdaArchitectureField,
     )
     help = help_text(
         f"""
         A Python layer suitable for uploading to AWS Lambda.
 
-        See {doc_url('docs/python/integrations/aws-lambda')}.
+        See {doc_url("docs/python/integrations/aws-lambda")}.
         """
     )
 

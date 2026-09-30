@@ -5,6 +5,8 @@ python_sources()
 
 resource(name="test_lockfile", source="pytest_extra_output_test.lock")
 
+resources(name="coverage_py39_testing_lockfile", sources=["coverage-py39-testing.lock*"])
+
 python_test_utils(name="test_utils")
 
 python_tests(
@@ -12,6 +14,7 @@ python_tests(
     overrides={
         "coverage_py_test.py": {"timeout": 20},
         "coverage_py_integration_test.py": {
+            "dependencies": [":coverage_py39_testing_lockfile"],
             "tags": ["platform_specific_behavior"],
             "timeout": 540,
         },
@@ -20,7 +23,7 @@ python_tests(
         "lockfile_test.py": {"timeout": 120},
         "package_pex_binary_integration_test.py": {
             "dependencies": [":platforms"],
-            "timeout": 120,
+            "timeout": 600,
         },
         "pytest_runner_integration_test.py": {
             "dependencies": [":test_lockfile"],
@@ -32,7 +35,7 @@ python_tests(
             "timeout": 300,
         },
         "run_pex_binary_integration_test.py": {"timeout": 660},
-        "run_python_source_integration_test.py": {"timeout": 180},
+        "run_python_source_integration_test.py": {"timeout": 300},
         "package_dists_integration_test.py": {
             "dependencies": ["testprojects/src/python:native_directory"],
             "tags": ["platform_specific_behavior"],

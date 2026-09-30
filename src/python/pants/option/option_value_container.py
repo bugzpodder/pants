@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
 
 from pants.option.ranked_value import Rank, RankedValue, Value
 
@@ -61,6 +61,9 @@ class OptionValueContainer:
     """
 
     _value_map: dict[Key, RankedValue]
+
+    def get_keys(self) -> set[Key]:
+        return set(self._value_map.keys())
 
     def get_explicit_keys(self) -> list[Key]:
         """Returns the keys for any values that were set explicitly (via flag, config, or env
@@ -137,9 +140,12 @@ class OptionValueContainer:
     # so method and member access will be handled the normal way.
     def __getattr__(self, key: Key):
         if key == "_value_map":
-            # In case we get called in copy, which don't invoke the ctor.
+            # In case we get called in copy, which doesn't invoke the ctor.
             raise AttributeError(key)
         return self._get_underlying_value(key)
+
+    def __contains__(self, key: Key):
+        return key in self._value_map
 
     def __iter__(self) -> Iterator[Key]:
         """Returns an iterator over all option names, in lexicographical order."""

@@ -14,7 +14,12 @@ import pytest
 from pants.backend.python.goals.coverage_py import CoverageSubsystem
 from pants.base.build_environment import get_buildroot
 from pants.testutil.pants_integration_test import PantsResult, run_pants, setup_tmpdir
-from pants.testutil.python_interpreter_selection import all_major_minor_python_versions
+from pants.testutil.python_interpreter_selection import (
+    all_major_minor_python_versions,
+    skip_unless_python39_present,
+    skip_unless_python310_present,
+)
+from pants.util.resources import read_sibling_resource
 
 
 def sources(batched: bool) -> dict[str, str]:
@@ -63,7 +68,7 @@ def sources(batched: bool) -> dict[str, str]:
         python_tests(
             name="tests",
             dependencies=[":project"],
-            {'batch_compatibility_tag="default",' if batched else ''}
+            {'batch_compatibility_tag="default",' if batched else ""}
         )
         """
         ),
@@ -114,7 +119,7 @@ def sources(batched: bool) -> dict[str, str]:
            assert True is True
         """
         ),
-        "tests/python/project_test/no_src/BUILD.py": f"""python_tests({'batch_compatibility_tag="default"' if batched else ''})""",
+        "tests/python/project_test/no_src/BUILD.py": f"""python_tests({'batch_compatibility_tag="default"' if batched else ""})""",
     }
 
 
@@ -152,7 +157,9 @@ def run_coverage(tmpdir: str, *extra_args: str) -> PantsResult:
 def test_coverage(major_minor_interpreter: str) -> None:
     with setup_tmpdir(sources(False)) as tmpdir:
         result = run_coverage(
-            tmpdir, f"--coverage-py-interpreter-constraints=['=={major_minor_interpreter}.*']"
+            tmpdir,
+            f"--python-interpreter-constraints=['=={major_minor_interpreter}.*']",
+            f"--coverage-py-interpreter-constraints=['=={major_minor_interpreter}.*']",
         )
     assert (
         dedent(
@@ -184,7 +191,9 @@ def test_coverage(major_minor_interpreter: str) -> None:
 def test_coverage_batched(major_minor_interpreter: str) -> None:
     with setup_tmpdir(sources(True)) as tmpdir:
         result = run_coverage(
-            tmpdir, f"--coverage-py-interpreter-constraints=['=={major_minor_interpreter}.*']"
+            tmpdir,
+            f"--python-interpreter-constraints=['=={major_minor_interpreter}.*']",
+            f"--coverage-py-interpreter-constraints=['=={major_minor_interpreter}.*']",
         )
     assert (
         dedent(
@@ -364,7 +373,9 @@ def test_coverage_html_xml_json_lcov(batched: bool) -> None:
     assert json_coverage.exists() is True
 
 
-def test_default_coverage_issues_12390() -> None:
+def _assert_coverage_12390(
+    interpreter: str, pyside_version: str, tool_lock: str | None = None
+) -> None:
     # N.B.: This ~replicates the repo used to reproduce this issue at
     # https://github.com/alexey-tereshenkov-oxb/monorepo-coverage-pants.
     if platform.system() == "Darwin" and platform.machine() == "arm64":
@@ -372,7 +383,7 @@ def test_default_coverage_issues_12390() -> None:
     if platform.system() == "Linux" and platform.machine() == "aarch64":
         pytest.skip(reason="No PySide2 wheels available for Linux ARM")
     files = {
-        "requirements.txt": "PySide2==5.15.2",
+        "requirements.txt": f"PySide2=={pyside_version}",
         "BUILD": dedent(
             """\
             python_requirements(
@@ -396,14 +407,27 @@ def test_default_coverage_issues_12390() -> None:
         ),
         "minimalcov/minimalcov/tests/BUILD": "python_tests()",
     }
+    if tool_lock is not None:
+        lock_content = read_sibling_resource(__name__, tool_lock).decode()
+        files[tool_lock] = lock_content.replace("{", "{{").replace("}", "}}")
     with setup_tmpdir(files) as tmpdir:
+        extra_args: list[str] = []
+        if tool_lock is not None:
+            resolve = tool_lock.removesuffix(".lock")
+            extra_args = [
+                f"--python-resolves={{'{resolve}': '{tmpdir}/{tool_lock}'}}",
+                f"--pytest-install-from-resolve={resolve}",
+                f"--coverage-py-install-from-resolve={resolve}",
+            ]
         command = [
             "--backend-packages=pants.backend.python",
+            f"--python-interpreter-constraints=['=={interpreter}.*']",
             "test",
             "--use-coverage",
             "::",
             f"--source-root-patterns=['/{tmpdir}/minimalcov']",
             "--coverage-py-report=raw",
+            *extra_args,
         ]
         result = run_pants(command)
         result.assert_success()
@@ -417,6 +441,86 @@ def test_default_coverage_issues_12390() -> None:
             {tmpdir}/minimalcov/minimalcov/tests/test_foo.py       4      0   100%
             -------------------------------------------------------------------------
             TOTAL                                                     5      0   100%
+            """
+        )
+        in result.stderr
+    ), result.stderr
+
+
+# PySide2 5.15.2 supports <3.10, while the 5.15.2.1 post-release adds 3.10 but
+# nothing newer.
+@skip_unless_python39_present
+def test_default_coverage_issues_12390_py39() -> None:
+    _assert_coverage_12390("3.9", "5.15.2", tool_lock="coverage-py39-testing.lock")
+
+
+@skip_unless_python310_present
+def test_default_coverage_issues_12390_py310() -> None:
+    _assert_coverage_12390("3.10", "5.15.2.1")
+
+
+def test_coverage_filter_issue_18057() -> None:
+    files = {
+        # Coverage report should include all the files.
+        "minimalcov/minimalcov/tests/BUILD": "python_tests()",
+        "minimalcov/minimalcov/__init__.py": "",
+        "minimalcov/minimalcov/src/__init__.py": "",
+        "minimalcov/minimalcov/src/foo.py": 'print("In the foo module!")',
+        "minimalcov/minimalcov/src/foo_not_covered.py": 'print("No test coverage!")',
+        "minimalcov/minimalcov/src/BUILD": "python_sources()",
+        "minimalcov/minimalcov/tests/test_foo.py": dedent(
+            """\
+            import minimalcov.src.foo
+
+            def test_1():
+                assert True
+            """
+        ),
+        "minimalcov/minimalcov/tests/BUILD": "python_tests()",
+        # Coverage report should only include those files which are imported in a test module.
+        "minimalcov/minimalcov2/__init__.py": "",
+        "minimalcov/minimalcov2/src/__init__.py": "",
+        "minimalcov/minimalcov2/src/foo.py": 'print("In the foo module!")',
+        "minimalcov/minimalcov2/src/foo_not_covered.py": 'print("No test coverage!")',
+        "minimalcov/minimalcov2/src/BUILD": "python_sources()",
+        "minimalcov/minimalcov2/tests/test_foo.py": dedent(
+            """\
+            import minimalcov2.src.foo
+
+            def test_2():
+                assert True
+            """
+        ),
+        "minimalcov/minimalcov2/tests/BUILD": "python_tests()",
+    }
+
+    with setup_tmpdir(files) as tmpdir:
+        command = [
+            "--backend-packages=pants.backend.python",
+            "test",
+            "--use-coverage",
+            "::",
+            f"--source-root-patterns=['/{tmpdir}/minimalcov']",
+            f"--coverage-py-filter=['{tmpdir}/minimalcov/minimalcov', 'minimalcov2']",
+            "--coverage-py-report=raw",
+        ]
+        result = run_pants(command)
+        result.assert_success()
+    assert (
+        dedent(
+            f"""\
+            Name                                                       Stmts   Miss  Cover
+            ------------------------------------------------------------------------------
+            {tmpdir}/minimalcov/minimalcov2/__init__.py                 0      0   100%
+            {tmpdir}/minimalcov/minimalcov2/src/__init__.py             0      0   100%
+            {tmpdir}/minimalcov/minimalcov2/src/foo.py                  1      0   100%
+            {tmpdir}/minimalcov/minimalcov/__init__.py                  0      0   100%
+            {tmpdir}/minimalcov/minimalcov/src/__init__.py              0      0   100%
+            {tmpdir}/minimalcov/minimalcov/src/foo.py                   1      0   100%
+            {tmpdir}/minimalcov/minimalcov/src/foo_not_covered.py       1      1     0%
+            {tmpdir}/minimalcov/minimalcov/tests/test_foo.py            3      0   100%
+            ------------------------------------------------------------------------------
+            TOTAL                                                          6      1    83%
             """
         )
         in result.stderr

@@ -5,22 +5,25 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Mapping
+from typing import cast
 
 from pants.backend.docker.subsystems.docker_options import DockerOptions
 from pants.backend.docker.util_rules.docker_build_args import DockerBuildArgs
 from pants.core.util_rules.system_binaries import (
     BinaryPath,
     BinaryPathRequest,
-    BinaryPaths,
     BinaryPathTest,
     BinaryShims,
     BinaryShimsRequest,
+    create_binary_shims,
+    find_binary,
 )
 from pants.engine.fs import Digest
+from pants.engine.internals.selectors import concurrently
 from pants.engine.process import Process, ProcessCacheScope
-from pants.engine.rules import Get, collect_rules, rule
+from pants.engine.rules import collect_rules, implicitly, rule
 from pants.util.logging import LogLevel
 from pants.util.strutil import pluralize
 
@@ -71,6 +74,8 @@ class DockerBinary(BinaryPath):
         env: Mapping[str, str],
         use_buildx: bool,
         extra_args: tuple[str, ...] = (),
+        output_files: tuple[str, ...] = (),
+        output_directories: tuple[str, ...] = (),
     ) -> Process:
         if use_buildx:
             build_commands = ["buildx", "build"]
@@ -94,11 +99,13 @@ class DockerBinary(BinaryPath):
             argv=tuple(args),
             description=(
                 f"Building docker image {tags[0]}"
-                + (f" +{pluralize(len(tags)-1, 'additional tag')}." if len(tags) > 1 else "")
+                + (f" +{pluralize(len(tags) - 1, 'additional tag')}." if len(tags) > 1 else "")
             ),
             env=self._get_process_environment(env),
             input_digest=digest,
             immutable_input_digests=self.extra_input_digests,
+            output_files=output_files,
+            output_directories=output_directories,
             # We must run the docker build commands every time, even if nothing has changed,
             # in case the user ran `docker image rm` outside of Pants.
             cache_scope=ProcessCacheScope.PER_SESSION,
@@ -130,6 +137,62 @@ class DockerBinary(BinaryPath):
         )
 
 
+async def _get_docker_tools_shims(
+    *,
+    tools: Sequence[str],
+    optional_tools: Sequence[str],
+    search_path: Sequence[str],
+    rationale: str,
+) -> BinaryShims:
+    all_binary_first_paths: list[BinaryPath] = []
+
+    if tools:
+        tools_requests = [
+            BinaryPathRequest(binary_name=binary_name, search_path=search_path)
+            for binary_name in tools
+        ]
+
+        tools_paths = await concurrently(
+            find_binary(tools_request, **implicitly()) for tools_request in tools_requests
+        )
+
+        all_binary_first_paths.extend(
+            [
+                path.first_path_or_raise(request, rationale=rationale)
+                for request, path in zip(tools_requests, tools_paths)
+            ]
+        )
+
+    if optional_tools:
+        optional_tools_requests = [
+            BinaryPathRequest(binary_name=binary_name, search_path=search_path)
+            for binary_name in optional_tools
+        ]
+
+        optional_tools_paths = await concurrently(
+            find_binary(optional_tools_request, **implicitly())
+            for optional_tools_request in optional_tools_requests
+        )
+
+        all_binary_first_paths.extend(
+            [
+                cast(BinaryPath, path.first_path)  # safe since we check for non-empty paths below
+                for path in optional_tools_paths
+                if path.paths
+            ]
+        )
+
+    tools_shims = await create_binary_shims(
+        BinaryShimsRequest.for_paths(
+            *all_binary_first_paths,
+            rationale=rationale,
+        ),
+        **implicitly(),
+    )
+
+    return tools_shims
+
+
 @rule(desc="Finding the `docker` binary and related tooling", level=LogLevel.DEBUG)
 async def get_docker(
     docker_options: DockerOptions, docker_options_env_aware: DockerOptions.EnvironmentAware
@@ -146,7 +209,7 @@ async def get_docker(
             search_path=search_path,
             test=BinaryPathTest(args=["-v"]),
         )
-        paths = await Get(BinaryPaths, BinaryPathRequest, request)
+        paths = await find_binary(request, **implicitly())
         first_path = paths.first_path
         if first_path:
             is_podman = True
@@ -158,23 +221,21 @@ async def get_docker(
             search_path=search_path,
             test=BinaryPathTest(args=["-v"]),
         )
-        paths = await Get(BinaryPaths, BinaryPathRequest, request)
+        paths = await find_binary(request, **implicitly())
         first_path = paths.first_path_or_raise(request, rationale="interact with the docker daemon")
 
-    if not docker_options.tools:
+    if not docker_options.tools and not docker_options.optional_tools:
         return DockerBinary(first_path.path, first_path.fingerprint, is_podman=is_podman)
 
-    tools = await Get(
-        BinaryShims,
-        BinaryShimsRequest,
-        BinaryShimsRequest.for_binaries(
-            *docker_options.tools,
-            rationale="use docker",
-            search_path=search_path,
-        ),
+    tools_shims = await _get_docker_tools_shims(
+        tools=docker_options.tools,
+        optional_tools=docker_options.optional_tools,
+        search_path=search_path,
+        rationale="use docker",
     )
-    extra_env = {"PATH": tools.path_component}
-    extra_input_digests = tools.immutable_input_digests
+
+    extra_env = {"PATH": tools_shims.path_component}
+    extra_input_digests = tools_shims.immutable_input_digests
 
     return DockerBinary(
         first_path.path,

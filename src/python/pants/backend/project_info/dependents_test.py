@@ -2,7 +2,6 @@
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 import json
 from functools import partial
-from typing import Dict, List, Optional, Union
 
 import pytest
 
@@ -41,10 +40,10 @@ def rule_runner() -> RuleRunner:
 def assert_dependents(
     rule_runner: RuleRunner,
     *,
-    targets: List[str],
-    expected: Union[List[str], Dict[str, List[str]]],
+    targets: list[str],
+    expected: list[str] | dict[str, list[str]],
     transitive: bool = False,
-    output_file: Optional[str] = None,
+    output_file: str | None = None,
     closed: bool = False,
     output_format: DependentsOutputFormat = DependentsOutputFormat.text,
 ) -> None:
@@ -65,11 +64,12 @@ def assert_dependents(
             assert json.loads(result.stdout) == expected
     else:
         assert not result.stdout
-        with open(output_file) as f:
-            if output_format == DependentsOutputFormat.text:
-                assert f.read().splitlines() == expected
-            elif output_format == DependentsOutputFormat.json:
-                assert json.load(f) == expected
+        with rule_runner.pushd():
+            with open(output_file) as f:
+                if output_format == DependentsOutputFormat.text:
+                    assert f.read().splitlines() == expected
+                elif output_format == DependentsOutputFormat.json:
+                    assert json.load(f) == expected
 
 
 def test_no_targets(rule_runner: RuleRunner) -> None:

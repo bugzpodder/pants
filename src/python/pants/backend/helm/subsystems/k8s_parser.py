@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import pkgutil
 from dataclasses import dataclass
@@ -13,13 +14,22 @@ from pants.backend.helm.utils.yaml import YamlPath
 from pants.backend.python.subsystems.python_tool_base import PythonToolRequirementsBase
 from pants.backend.python.target_types import EntryPoint
 from pants.backend.python.util_rules import pex
-from pants.backend.python.util_rules.pex import PexRequest, VenvPex, VenvPexProcess
+from pants.backend.python.util_rules.pex import (
+    VenvPex,
+    VenvPexProcess,
+    VenvPexRequest,
+    create_venv_pex,
+)
+from pants.backend.python.util_rules.pex_environment import PexEnvironment
 from pants.engine.engine_aware import EngineAwareParameter, EngineAwareReturnType
-from pants.engine.fs import CreateDigest, Digest, FileContent, FileEntry
-from pants.engine.process import FallibleProcessResult
-from pants.engine.rules import Get, collect_rules, rule
+from pants.engine.fs import CreateDigest, FileContent, FileEntry
+from pants.engine.intrinsics import create_digest, execute_process
+from pants.engine.rules import collect_rules, implicitly, rule
+from pants.option.option_types import DictOption
 from pants.util.logging import LogLevel
 from pants.util.strutil import pluralize, softwrap
+
+# pants: infer-dep(k8s_parser.lock*)
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +39,32 @@ _HELM_K8S_PARSER_PACKAGE = "pants.backend.helm.subsystems"
 
 class HelmKubeParserSubsystem(PythonToolRequirementsBase):
     options_scope = "helm-k8s-parser"
-    help = "Analyses K8S manifests rendered by Helm."
+    help_short = "Analyses K8S manifests rendered by Helm."
 
-    default_requirements = ["hikaru>=0.11.0b,<1"]
+    default_requirements = [
+        "hikaru>=1.1.0",
+        "hikaru-model-28",
+        "hikaru-model-27",
+        "hikaru-model-26",
+        "hikaru-model-25",
+        "hikaru-model-24",
+        "hikaru-model-23",
+    ]
 
     register_interpreter_constraints = True
-    default_interpreter_constraints = ["CPython>=3.7,<3.10"]
+    crd = DictOption[str](
+        help=softwrap(
+            """
+            Additional custom resource definitions be made available to all Helm processes
+            or during value interpolation.
+            Example:
+                [helm-k8s-parser.crd]
+                "filename1"="classname1"
+                "filename2"="classname2"
+            """
+        ),
+        default={},
+    )
 
     default_lockfile_resource = (_HELM_K8S_PARSER_PACKAGE, "k8s_parser.lock")
 
@@ -42,11 +72,16 @@ class HelmKubeParserSubsystem(PythonToolRequirementsBase):
 @dataclass(frozen=True)
 class _HelmKubeParserTool:
     pex: VenvPex
+    crd: str
 
 
 @rule
-async def build_k8s_parser_tool(k8s_parser: HelmKubeParserSubsystem) -> _HelmKubeParserTool:
+async def build_k8s_parser_tool(
+    k8s_parser: HelmKubeParserSubsystem,
+    pex_environment: PexEnvironment,
+) -> _HelmKubeParserTool:
     parser_sources = pkgutil.get_data(_HELM_K8S_PARSER_PACKAGE, _HELM_K8S_PARSER_SOURCE)
+
     if not parser_sources:
         raise ValueError(
             f"Unable to find source to {_HELM_K8S_PARSER_SOURCE!r} in {_HELM_K8S_PARSER_PACKAGE}"
@@ -55,16 +90,43 @@ async def build_k8s_parser_tool(k8s_parser: HelmKubeParserSubsystem) -> _HelmKub
     parser_file_content = FileContent(
         path="__k8s_parser.py", content=parser_sources, is_executable=True
     )
-    parser_digest = await Get(Digest, CreateDigest([parser_file_content]))
 
-    parser_pex = await Get(
-        VenvPex,
-        PexRequest,
-        k8s_parser.to_pex_request(
-            main=EntryPoint(PurePath(parser_file_content.path).stem), sources=parser_digest
+    digest_sources = [parser_file_content]
+
+    modulename_classname = []
+    if k8s_parser.crd != {}:
+        for file, classname in k8s_parser.crd.items():
+            crd_sources = open(file, "rb").read()
+            if not crd_sources:
+                raise ValueError(
+                    f"Unable to find source to customer resource definition in {_HELM_K8S_PARSER_PACKAGE}"
+                )
+            unique_name = f"_crd_source_{hash(file)}"
+            parser_file_content_source = FileContent(
+                path=f"{unique_name}.py", content=crd_sources, is_executable=False
+            )
+            digest_sources.append(parser_file_content_source)
+            modulename_classname.append((unique_name, classname))
+    parser_digest = await create_digest(CreateDigest(digest_sources))
+
+    # We use copies of site packages because hikaru gets confused with symlinked packages
+    # The core hikaru package tries to load the packages containing the kubernetes-versioned models
+    # using the __path__ attribute of the core package,
+    # which doesn't work when the packages are symlinked from inside the namespace-handling dirs in the PEX
+    use_site_packages_copies = True
+
+    parser_pex = await create_venv_pex(
+        VenvPexRequest(
+            k8s_parser.to_pex_request(
+                main=EntryPoint(PurePath(parser_file_content.path).stem),
+                sources=parser_digest,
+            ),
+            pex_environment.in_sandbox(working_directory=None),
+            site_packages_copies=use_site_packages_copies,
         ),
+        **implicitly(),
     )
-    return _HelmKubeParserTool(parser_pex)
+    return _HelmKubeParserTool(parser_pex, json.dumps(modulename_classname))
 
 
 @dataclass(frozen=True)
@@ -107,17 +169,18 @@ class ParsedKubeManifest(EngineAwareReturnType):
 async def parse_kube_manifest(
     request: ParseKubeManifestRequest, tool: _HelmKubeParserTool
 ) -> ParsedKubeManifest:
-    file_digest = await Get(Digest, CreateDigest([request.file]))
+    file_digest = await create_digest(CreateDigest([request.file]))
 
-    result = await Get(
-        FallibleProcessResult,
-        VenvPexProcess(
-            tool.pex,
-            argv=[request.file.path],
-            input_digest=file_digest,
-            description=f"Analyzing Kubernetes manifest {request.file.path}",
-            level=LogLevel.DEBUG,
-        ),
+    result = await execute_process(
+        **implicitly(
+            VenvPexProcess(
+                tool.pex,
+                argv=[request.file.path, tool.crd],
+                input_digest=file_digest,
+                description=f"Analyzing Kubernetes manifest {request.file.path}",
+                level=LogLevel.DEBUG,
+            )
+        )
     )
 
     if result.exit_code == 0:

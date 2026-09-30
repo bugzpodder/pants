@@ -1,5 +1,7 @@
 # Pants Build System
 
+[![Coverage Status](https://coveralls.io/repos/github/pantsbuild/pants/badge.svg?branch=main)](https://coveralls.io/github/pantsbuild/pants?branch=main)
+
 Pants is a scalable build system for _monorepos_: codebases containing 
 multiple projects, often using multiple programming languages and frameworks, 
 in a single unified code repository.
@@ -18,11 +20,9 @@ Documentation: [www.pantsbuild.org](https://www.pantsbuild.org/).
 
 # Getting started
 
-See the [getting started](https://www.pantsbuild.org/docs/getting-started) documentation.
+See the [getting started](https://www.pantsbuild.org/stable/docs/getting-started) documentation.
 
 # Credits
-
-Linux ARM64 CI resources provided by [Works on ARM](https://www.arm.com/markets/computing-infrastructure/works-on-arm).
 
 macOS CI resources provided by [MacStadium](https://www.macstadium.com/).
 

@@ -6,31 +6,33 @@ from __future__ import annotations
 import logging
 import os
 from abc import ABCMeta
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
+from string import Template
 
+from pants.core.environments.rules import EnvironmentNameRequest, resolve_environment_name
 from pants.core.util_rules import distdir
 from pants.core.util_rules.distdir import DistDir
-from pants.core.util_rules.environments import EnvironmentNameRequest
 from pants.engine.addresses import Address
 from pants.engine.environment import EnvironmentName
 from pants.engine.fs import Digest, MergeDigests, Workspace
 from pants.engine.goal import Goal, GoalSubsystem
-from pants.engine.rules import Get, MultiGet, collect_rules, goal_rule, rule
+from pants.engine.internals.graph import find_valid_field_sets
+from pants.engine.internals.specs_rules import find_valid_field_sets_for_target_roots
+from pants.engine.intrinsics import merge_digests
+from pants.engine.rules import collect_rules, concurrently, goal_rule, implicitly, rule
 from pants.engine.target import (
     AllTargets,
     AsyncFieldMixin,
     Dependencies,
     DepsTraversalBehavior,
     FieldSet,
-    FieldSetsPerTarget,
     FieldSetsPerTargetRequest,
     NoApplicableTargetsBehavior,
     ShouldTraverseDepsPredicate,
     SpecialCasedDependencies,
     StringField,
     Target,
-    TargetRootsToFieldSets,
     TargetRootsToFieldSetsRequest,
     Targets,
 )
@@ -65,14 +67,36 @@ class BuiltPackage:
     artifacts: tuple[BuiltPackageArtifact, ...]
 
 
+@rule(polymorphic=True)
+async def build_package(
+    package_fieldset: PackageFieldSet,
+    environment_name: EnvironmentName,
+) -> BuiltPackage:
+    raise NotImplementedError()
+
+
 class OutputPathField(StringField, AsyncFieldMixin):
+    DEFAULT = "${spec_path_normalized}/${target_name_normalized}${file_suffix}"
+
     alias = "output_path"
+    default = DEFAULT
+
     help = help_text(
         f"""
         Where the built asset should be located.
 
+        This field supports the following template replacements:
+
+        - `${{spec_path_normalized}}`: The path to the target's directory ("spec path") with forward slashes replaced by dots.
+
+        - `${{target_name_normalized}}`: The target's name with paramaterizations escaped by replacing dots with underscores.
+
+        - `${{file_suffix}}`: For target's which produce single file artifacts, this is the file type suffix to use with a leading dot,
+          and is empty otherwise when not applicable.
+
         If undefined, this will use the path to the BUILD file, followed by the target name.
-        For example, `src/python/project:app` would be `src.python.project/app.ext`.
+        For example, `src/python/project:app` would be `src.python.project/app.ext`. This behavior corresponds to
+        the default template: `{DEFAULT}`
 
         When running `{bin_name()} package`, this path will be prefixed by `--distdir` (e.g. `dist/`).
 
@@ -80,23 +104,38 @@ class OutputPathField(StringField, AsyncFieldMixin):
         """
     )
 
-    def value_or_default(self, *, file_ending: str | None) -> str:
-        if self.value:
-            return self.value
+    def parameters(self, *, file_ending: str | None) -> dict[str, str]:
+        spec_path_normalized = self.address.spec_path.replace(os.sep, ".")
+        if not spec_path_normalized:
+            spec_path_normalized = "."
+
         target_name_part = (
             self.address.generated_name.replace(".", "_")
             if self.address.generated_name
             else self.address.target_name
         )
-        params_sanitized = self.address.parameters_repr.replace(".", "_")
-        file_prefix = f"{target_name_part}{params_sanitized}"
+        target_params_sanitized = self.address.parameters_repr.replace(".", "_")
+        target_name_normalized = f"{target_name_part}{target_params_sanitized}"
 
-        if file_ending is None:
-            file_name = file_prefix
-        else:
+        file_suffix = ""
+        if file_ending:
             assert not file_ending.startswith("."), "`file_ending` should not start with `.`"
-            file_name = f"{file_prefix}.{file_ending}"
-        return os.path.join(self.address.spec_path.replace(os.sep, "."), file_name)
+            file_suffix = f".{file_ending}"
+
+        return dict(
+            spec_path_normalized=spec_path_normalized,
+            target_name_normalized=target_name_normalized,
+            file_suffix=file_suffix,
+        )
+
+    def value_or_default(self, *, file_ending: str | None) -> str:
+        template_string = self.value
+        assert template_string is not None
+        template = Template(template_string)
+
+        params = self.parameters(file_ending=file_ending)
+        result = template.safe_substitute(params)
+        return os.path.normpath(result)
 
 
 @dataclass(frozen=True)
@@ -108,13 +147,11 @@ class EnvironmentAwarePackageRequest:
 
 @rule
 async def environment_aware_package(request: EnvironmentAwarePackageRequest) -> BuiltPackage:
-    environment_name = await Get(
-        EnvironmentName,
-        EnvironmentNameRequest,
-        EnvironmentNameRequest.from_field_set(request.field_set),
+    environment_name = await resolve_environment_name(
+        EnvironmentNameRequest.from_field_set(request.field_set), **implicitly()
     )
-    package = await Get(
-        BuiltPackage, {request.field_set: PackageFieldSet, environment_name: EnvironmentName}
+    package = await build_package(
+        **implicitly({request.field_set: PackageFieldSet, environment_name: EnvironmentName})
     )
     return package
 
@@ -139,8 +176,8 @@ class AllPackageableTargets(Targets):
 
 @rule(desc="Find all packageable targets in project", level=LogLevel.DEBUG)
 async def find_all_packageable_targets(all_targets: AllTargets) -> AllPackageableTargets:
-    fs_per_target = await Get(
-        FieldSetsPerTarget, FieldSetsPerTargetRequest(PackageFieldSet, all_targets)
+    fs_per_target = await find_valid_field_sets(
+        FieldSetsPerTargetRequest(PackageFieldSet, all_targets), **implicitly()
     )
     return AllPackageableTargets(
         target
@@ -151,23 +188,23 @@ async def find_all_packageable_targets(all_targets: AllTargets) -> AllPackageabl
 
 @goal_rule
 async def package_asset(workspace: Workspace, dist_dir: DistDir) -> Package:
-    target_roots_to_field_sets = await Get(
-        TargetRootsToFieldSets,
+    target_roots_to_field_sets = await find_valid_field_sets_for_target_roots(
         TargetRootsToFieldSetsRequest(
             PackageFieldSet,
             goal_description="the `package` goal",
             no_applicable_targets_behavior=NoApplicableTargetsBehavior.warn,
         ),
+        **implicitly(),
     )
     if not target_roots_to_field_sets.field_sets:
         return Package(exit_code=0)
 
-    packages = await MultiGet(
-        Get(BuiltPackage, EnvironmentAwarePackageRequest(field_set))
+    packages = await concurrently(
+        environment_aware_package(EnvironmentAwarePackageRequest(field_set))
         for field_set in target_roots_to_field_sets.field_sets
     )
 
-    merged_digest = await Get(Digest, MergeDigests(pkg.digest for pkg in packages))
+    merged_digest = await merge_digests(MergeDigests(pkg.digest for pkg in packages))
     all_relpaths = [
         artifact.relpath for pkg in packages for artifact in pkg.artifacts if artifact.relpath
     ]

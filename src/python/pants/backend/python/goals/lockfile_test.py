@@ -4,26 +4,37 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from textwrap import dedent
 
 import pytest
+from packaging.version import Version
 
 from pants.backend.python.goals.lockfile import (
-    GeneratePythonLockfile,
+    GeneratePexLockfile,
+    GenerateUvLockfile,
     RequestedPythonUserResolveNames,
+    setup_user_lockfile_requests,
 )
 from pants.backend.python.goals.lockfile import rules as lockfile_rules
-from pants.backend.python.goals.lockfile import setup_user_lockfile_requests
 from pants.backend.python.subsystems.setup import RESOLVE_OPTION_KEY__DEFAULT, PythonSetup
 from pants.backend.python.target_types import PythonRequirementTarget
 from pants.backend.python.util_rules import pex
 from pants.backend.python.util_rules.interpreter_constraints import InterpreterConstraints
+from pants.backend.python.util_rules.lockfile_metadata import LockfileFormat
 from pants.core.goals.generate_lockfiles import GenerateLockfileResult, UserGenerateLockfiles
 from pants.engine.fs import DigestContents
+from pants.engine.internals.native_engine import Digest
+from pants.engine.internals.scheduler import ExecutionError
 from pants.testutil.python_rule_runner import PythonRuleRunner
 from pants.testutil.rule_runner import PYTHON_BOOTSTRAP_ENV, QueryRule
 from pants.util.ordered_set import FrozenOrderedSet
 from pants.util.strutil import strip_prefix
+
+
+def assert_exactly_one_trailing_newline(content: bytes, description: str) -> None:
+    assert content.endswith(b"\n"), f"{description} does not end with a newline"
+    assert not content.endswith(b"\n\n"), f"{description} ends with more than one newline"
 
 
 @pytest.fixture
@@ -32,37 +43,55 @@ def rule_runner() -> PythonRuleRunner:
         rules=[
             *lockfile_rules(),
             *pex.rules(),
-            QueryRule(GenerateLockfileResult, [GeneratePythonLockfile]),
+            QueryRule(GenerateLockfileResult, [GeneratePexLockfile]),
+            QueryRule(GenerateLockfileResult, [GenerateUvLockfile]),
         ]
     )
     rule_runner.set_options([], env_inherit=PYTHON_BOOTSTRAP_ENV)
     return rule_runner
 
 
-def _generate(
+def _generate_and_check_metadata(
     *,
     rule_runner: PythonRuleRunner,
-    ansicolors_version: str = "==1.1.8",
+    separate_metadata_file: bool = False,
+    requirements_strings: list[str] | None = None,
+    no_binary: bool = False,
+    only_binary: bool = False,
     requirement_constraints_str: str = '//   "requirement_constraints": [],\n',
-    only_binary_and_no_binary_str: str = '//   "only_binary": [],\n//   "no_binary": []',
+    excludes_and_overrides_str: str = '//   "excludes": [],\n//   "overrides": [],\n',
+    sources_str: str = '//   "sources": []',
 ) -> str:
+    if requirements_strings is None:
+        requirements_strings = ["ansicolors==1.1.8"]
     result = rule_runner.request(
         GenerateLockfileResult,
         [
-            GeneratePythonLockfile(
-                requirements=FrozenOrderedSet([f"ansicolors{ansicolors_version}"]),
+            GeneratePexLockfile(
+                requirements=FrozenOrderedSet(requirements_strings),
                 find_links=FrozenOrderedSet([]),
                 interpreter_constraints=InterpreterConstraints(),
                 resolve_name="test",
                 lockfile_dest="test.lock",
                 diff=False,
+                lock_style="universal",
+                complete_platforms=(),
             )
         ],
     )
     digest_contents = rule_runner.request(DigestContents, [result.digest])
-    assert len(digest_contents) == 1
+    if separate_metadata_file:
+        assert len(digest_contents) == 2
+        metadata = json.loads(digest_contents[1].content.decode())
+    else:
+        assert len(digest_contents) == 1
+        metadata = None
     content = digest_contents[0].content.decode()
 
+    requirements_strings.sort()
+    requirements_header_formatting = ",\n".join(
+        f'            //     "{req}"' for req in requirements_strings
+    )
     pex_header = (
         dedent(
             f"""\
@@ -72,60 +101,131 @@ def _generate(
             //
             // --- BEGIN PANTS LOCKFILE METADATA: DO NOT EDIT OR REMOVE ---
             // {{
-            //   "version": 3,
+            //   "version": 8,
             //   "valid_for_interpreter_constraints": [],
             //   "generated_with_requirements": [
-            //     "ansicolors{ansicolors_version}"
+{requirements_header_formatting}
             //   ],
             //   "manylinux": "manylinux2014",
             """
         )
         + requirement_constraints_str
-        + only_binary_and_no_binary_str
-        + dedent(
+        + (
+            dedent(
+                """\
+            //   "only_binary": [
+            //     "ansicolors"
+            //   ],
             """
+            )
+            if only_binary
+            else '//   "only_binary": [],\n'
+        )
+        + (
+            dedent(
+                """\
+            //   "no_binary": [
+            //     "ansicolors"
+            //   ],
+            """
+            )
+            if no_binary
+            else '//   "no_binary": [],\n'
+        )
+        + excludes_and_overrides_str
+        + sources_str
+        + dedent(
+            """\
+            ,
+            //   "lock_style": "universal",
+            //   "complete_platforms": [],
+            //   "uploaded_prior_to": null,
+            //   "lockfile_format": "pex",
+            //   "resolve": "test"
             // }
             // --- END PANTS LOCKFILE METADATA ---
             """
         )
     )
-    assert content.startswith(pex_header)
-    return strip_prefix(content, pex_header)
+
+    if metadata:
+        assert metadata == {
+            "description": "This lockfile was generated by Pants. To regenerate, run: pants generate-lockfiles --resolve=test",
+            "version": 8,
+            "valid_for_interpreter_constraints": [],
+            "generated_with_requirements": requirements_strings,
+            "manylinux": "manylinux2014",
+            "excludes": [],
+            "no_binary": ["ansicolors"] if no_binary else [],
+            "only_binary": ["ansicolors"] if only_binary else [],
+            "overrides": [],
+            "sources": [],
+            "requirement_constraints": [],
+            "resolve": "test",
+            "lock_style": "universal",
+            "lockfile_format": "pex",
+            "complete_platforms": [],
+            "uploaded_prior_to": None,
+        }
+        return content
+    else:
+        assert content.startswith(pex_header)
+        return strip_prefix(content, pex_header)
+
+
+def _generate(rule_runner: PythonRuleRunner, **kwargs) -> str:
+    # Set defaults for new required fields
+    kwargs.setdefault("lock_style", "universal")
+    kwargs.setdefault("complete_platforms", ())
+
+    result = rule_runner.request(
+        GenerateLockfileResult,
+        [
+            GeneratePexLockfile(
+                resolve_name="test",
+                lockfile_dest="test.lock",
+                diff=False,
+                **kwargs,
+            )
+        ],
+    )
+    digest_contents = rule_runner.request(DigestContents, [result.digest])
+    content = digest_contents[0].content.decode()
+
+    return content
 
 
 @pytest.mark.parametrize(
-    ("no_binary", "only_binary"), ((False, False), (False, True), (True, False))
+    ("no_binary", "only_binary", "separate_metadata_file"),
+    (
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, False, True),
+    ),
 )
 def test_pex_lockfile_generation(
-    rule_runner: PythonRuleRunner, no_binary: bool, only_binary: bool
+    rule_runner: PythonRuleRunner,
+    no_binary: bool,
+    only_binary: bool,
+    separate_metadata_file: bool,
 ) -> None:
     args = ["--python-resolves={'test': 'foo.lock'}"]
-    only_binary_lock_str = '//   "only_binary": [],\n'
-    no_binary_lock_str = '//   "no_binary": []'
     no_binary_arg = f"{{'{RESOLVE_OPTION_KEY__DEFAULT}': ['ansicolors']}}"
     if no_binary:
-        no_binary_lock_str = dedent(
-            """\
-            //   "no_binary": [
-            //     "ansicolors"
-            //   ]"""
-        )
         args.append(f"--python-resolves-to-no-binary={no_binary_arg}")
     if only_binary:
-        only_binary_lock_str = dedent(
-            """\
-            //   "only_binary": [
-            //     "ansicolors"
-            //   ],
-            """
-        )
         args.append(f"--python-resolves-to-only-binary={no_binary_arg}")
+    if separate_metadata_file:
+        args.append("--python-separate-lockfile-metadata-file")
     rule_runner.set_options(args, env_inherit=PYTHON_BOOTSTRAP_ENV)
 
     lock_entry = json.loads(
-        _generate(
+        _generate_and_check_metadata(
             rule_runner=rule_runner,
-            only_binary_and_no_binary_str=only_binary_lock_str + no_binary_lock_str,
+            separate_metadata_file=separate_metadata_file,
+            no_binary=no_binary,
+            only_binary=only_binary,
         )
     )
     reqs = lock_entry["locked_resolves"][0]["locked_requirements"]
@@ -177,9 +277,9 @@ def test_constraints_file(rule_runner: PythonRuleRunner) -> None:
     )
 
     lock_entry = json.loads(
-        _generate(
+        _generate_and_check_metadata(
             rule_runner=rule_runner,
-            ansicolors_version=">=1.0",
+            requirements_strings=["ansicolors>=1.0"],
             requirement_constraints_str=dedent(
                 """\
                 //   "requirement_constraints": [
@@ -226,7 +326,7 @@ def test_multiple_resolves() -> None:
         [
             "--python-resolves={'a': 'a.lock', 'b': 'b.lock'}",
             # Override interpreter constraints for 'b', but use default for 'a'.
-            "--python-resolves-to-interpreter-constraints={'b': ['==3.7.*']}",
+            "--python-resolves-to-interpreter-constraints={'b': ['==3.9.*']}",
             "--python-enable-resolves",
         ],
         env_inherit=PYTHON_BOOTSTRAP_ENV,
@@ -235,20 +335,580 @@ def test_multiple_resolves() -> None:
         UserGenerateLockfiles, [RequestedPythonUserResolveNames(["a", "b"])]
     )
     assert set(result) == {
-        GeneratePythonLockfile(
+        GeneratePexLockfile(
             requirements=FrozenOrderedSet(["a"]),
             find_links=FrozenOrderedSet([]),
-            interpreter_constraints=InterpreterConstraints(["CPython>=3.7,<3.10"]),
+            interpreter_constraints=InterpreterConstraints(["CPython>=3.10,<3.15"]),
             resolve_name="a",
             lockfile_dest="a.lock",
             diff=False,
+            lock_style="universal",
+            complete_platforms=(),
         ),
-        GeneratePythonLockfile(
+        GeneratePexLockfile(
             requirements=FrozenOrderedSet(["b"]),
             find_links=FrozenOrderedSet([]),
-            interpreter_constraints=InterpreterConstraints(["==3.7.*"]),
+            interpreter_constraints=InterpreterConstraints(["==3.9.*"]),
             resolve_name="b",
             lockfile_dest="b.lock",
             diff=False,
+            lock_style="universal",
+            complete_platforms=(),
         ),
     }
+
+
+def test_find_links_scoped_to_resolve() -> None:
+    rule_runner = PythonRuleRunner(
+        rules=[
+            setup_user_lockfile_requests,
+            *PythonSetup.rules(),
+            QueryRule(UserGenerateLockfiles, [RequestedPythonUserResolveNames]),
+        ],
+        target_types=[PythonRequirementTarget],
+    )
+    rule_runner.write_files(
+        {
+            "BUILD": dedent(
+                """\
+                # Using the underscore field directly instead of pulling all of
+                # pants.backend.plugin_development into the test
+                python_requirement(
+                    name='a',
+                    requirements=['a'],
+                    resolve='a',
+                    _find_links=['https://example.com/wheels'],
+                )
+                python_requirement(
+                    name='b',
+                    requirements=['b'],
+                    resolve='b',
+                )
+                """
+            ),
+        }
+    )
+    rule_runner.set_options(
+        [
+            "--python-resolves={'a': 'a.lock', 'b': 'b.lock'}",
+            "--python-enable-resolves",
+        ],
+        env_inherit=PYTHON_BOOTSTRAP_ENV,
+    )
+    result = rule_runner.request(
+        UserGenerateLockfiles, [RequestedPythonUserResolveNames(["a", "b"])]
+    )
+    assert all(isinstance(r, GeneratePexLockfile) for r in result)
+    result_by_resolve = {r.resolve_name: r for r in result}
+    assert isinstance(result_by_resolve["a"], GeneratePexLockfile)
+    assert isinstance(result_by_resolve["b"], GeneratePexLockfile)
+
+    assert result_by_resolve["a"].requirements == FrozenOrderedSet(["a"])
+    assert result_by_resolve["b"].requirements == FrozenOrderedSet(["b"])
+
+    assert result_by_resolve["a"].find_links == FrozenOrderedSet(["https://example.com/wheels"])
+    assert result_by_resolve["b"].find_links == FrozenOrderedSet([])
+
+
+def test_sync_strips_embedded_metadata_header(rule_runner: PythonRuleRunner) -> None:
+    """Regression test for https://github.com/pantsbuild/pants/issues/23398."""
+    rule_runner.set_options(
+        [
+            "--python-resolves={'test': 'test.lock'}",
+            "--python-resolver=pex",
+            "--no-python-separate-lockfile-metadata-file",
+        ],
+        env_inherit=PYTHON_BOOTSTRAP_ENV,
+    )
+
+    result = rule_runner.request(
+        GenerateLockfileResult,
+        [
+            GeneratePexLockfile(
+                requirements=FrozenOrderedSet(["ansicolors==1.1.8"]),
+                find_links=FrozenOrderedSet([]),
+                interpreter_constraints=InterpreterConstraints(),
+                resolve_name="test",
+                lockfile_dest="test.lock",
+                diff=False,
+                lock_style="universal",
+                complete_platforms=(),
+            )
+        ],
+    )
+    rule_runner.write_digest(result.digest)
+
+    rule_runner.set_options(
+        [
+            "--python-resolves={'test': 'test.lock'}",
+            "--python-resolver=pex",
+            "--no-python-separate-lockfile-metadata-file",
+            "--generate-lockfiles-sync",
+        ],
+        env_inherit=PYTHON_BOOTSTRAP_ENV,
+    )
+    sync_result = rule_runner.request(
+        GenerateLockfileResult,
+        [
+            GeneratePexLockfile(
+                requirements=FrozenOrderedSet(["ansicolors==1.1.8"]),
+                find_links=FrozenOrderedSet([]),
+                interpreter_constraints=InterpreterConstraints(),
+                resolve_name="test",
+                lockfile_dest="test.lock",
+                diff=False,
+                lock_style="universal",
+                complete_platforms=(),
+            )
+        ],
+    )
+    sync_digest_contents = rule_runner.request(DigestContents, [sync_result.digest])
+    assert len(sync_digest_contents) == 1
+    content = sync_digest_contents[0].content.decode()
+    header, _, body = content.partition("\n\n")
+    assert header.strip() != ""
+    lock_content = json.loads(body)
+    reqs = lock_content["locked_resolves"][0]["locked_requirements"]
+    assert len(reqs) == 1
+    assert reqs[0]["project_name"] == "ansicolors"
+
+
+def test_empty_requirements(rule_runner: PythonRuleRunner) -> None:
+    with pytest.raises(ExecutionError) as excinfo:
+        json.loads(
+            _generate_and_check_metadata(
+                rule_runner=rule_runner,
+                requirements_strings=[],
+            )
+        )
+
+    assert (
+        "Cannot generate lockfile with no requirements. Please add some requirements to test."
+        in str(excinfo.value)
+    )
+
+
+def test_define_source_from_different_index(rule_runner: PythonRuleRunner) -> None:
+    args = [
+        "--python-resolves={'test': 'foo.lock'}",
+        "--python-repos-indexes=['https://pypi.org/simple/','test_pipy=https://test.pypi.org/simple/']",
+        "--python-resolves-to-sources={'test': ['test_pipy=cowsay']}",
+    ]
+    rule_runner.set_options(args, env_inherit=PYTHON_BOOTSTRAP_ENV)
+
+    lock_entry = json.loads(
+        _generate_and_check_metadata(
+            rule_runner=rule_runner,
+            requirements_strings=["cowsay==6.0", "ansicolors==1.1.8"],
+            sources_str=dedent(
+                """\
+                //   "sources": [
+                //     "test_pipy=cowsay"
+                //   ]"""
+            ),
+        )
+    )
+
+    reqs = lock_entry["locked_resolves"][0]["locked_requirements"]
+
+    assert len(reqs) == 2
+
+    # Ansicolors is from PyPI (https://files.pythonhosted.org)
+    assert reqs[0]["project_name"] == "ansicolors"
+    assert reqs[0]["version"] == "1.1.8"
+
+    wheel_ansicolors = {
+        "algorithm": "sha256",
+        "hash": "00d2dde5a675579325902536738dd27e4fac1fd68f773fe36c21044eb559e187",
+        "url": (
+            "https://files.pythonhosted.org/packages/53/18/"
+            + "a56e2fe47b259bb52201093a3a9d4a32014f9d85071ad07e9d60600890ca/"
+            + "ansicolors-1.1.8-py2.py3-none-any.whl"
+        ),
+    }
+    sdist_ansicolors = {
+        "algorithm": "sha256",
+        "hash": "99f94f5e3348a0bcd43c82e5fc4414013ccc19d70bd939ad71e0133ce9c372e0",
+        "url": (
+            "https://files.pythonhosted.org/packages/76/31/"
+            + "7faed52088732704523c259e24c26ce6f2f33fbeff2ff59274560c27628e/"
+            + "ansicolors-1.1.8.zip"
+        ),
+    }
+    artifacts = reqs[0]["artifacts"]
+    assert wheel_ansicolors in artifacts
+    assert sdist_ansicolors in artifacts
+
+    # Cowsay is from TestPyPI (https://test-files.pythonhosted.org)
+    assert reqs[1]["project_name"] == "cowsay"
+    assert reqs[1]["version"] == "6.0"
+
+    wheel_cowsay = {
+        "algorithm": "sha256",
+        "hash": "77b07c508af48aa300a90f3b3c5c013a12360a71fc5c87b1efb763fe2803a775",
+        "url": (
+            "https://test-files.pythonhosted.org/packages/73/56/"
+            + "7922bfc226ccd44221befb6b866aaa4da4170bc9d8b036ef0675ce0f1b53/"
+            + "cowsay-6.0-py2.py3-none-any.whl"
+        ),
+    }
+    sdist_cowsay = {
+        "algorithm": "sha256",
+        "hash": "47445cb273684618a1786db8e8d05ec9258455f7eb74893e5d0933daafeb44ba",
+        "url": (
+            "https://test-files.pythonhosted.org/packages/7e/b5/"
+            + "e8e802ddc7f5219417dc7d7953eec81ffe48ad129b793f3040361e4aff89/"
+            + "cowsay-6.0.tar.gz"
+        ),
+    }
+    artifacts = reqs[1]["artifacts"]
+    assert wheel_cowsay in artifacts
+    assert sdist_cowsay in artifacts
+
+
+def test_override_version(rule_runner: PythonRuleRunner) -> None:
+    args = [
+        "--python-resolves={'test': 'test.lock'}",
+        "--python-separate-lockfile-metadata-file",
+        "--python-resolves-to-overrides={'test': ['python-dateutil==2.6.0']}",
+    ]
+
+    rule_runner.set_options(args, env_inherit=PYTHON_BOOTSTRAP_ENV)
+
+    lock_entry = json.loads(
+        _generate(
+            rule_runner=rule_runner,
+            requirements=FrozenOrderedSet(["freezegun==1.2.1"]),
+            interpreter_constraints=InterpreterConstraints(),
+            find_links=FrozenOrderedSet(),
+        )
+    )
+
+    reqs = lock_entry["locked_resolves"][0]["locked_requirements"]
+    print(reqs)
+    assert reqs[0]["project_name"] == "freezegun"
+    assert reqs[1]["project_name"] == "python-dateutil"
+    # Without Override: python-dateutil>=2.7
+    assert reqs[1]["version"] == "2.6.0"
+
+
+def test_excluded_by_excludes(rule_runner: PythonRuleRunner) -> None:
+    args = [
+        "--python-resolves={'test': 'test.lock'}",
+        "--python-separate-lockfile-metadata-file",
+        "--python-resolves-to-excludes={'test': ['six']}",
+    ]
+
+    rule_runner.set_options(args, env_inherit=PYTHON_BOOTSTRAP_ENV)
+
+    lock_entry = json.loads(
+        _generate(
+            rule_runner=rule_runner,
+            requirements=FrozenOrderedSet(["fasteners==0.16.3"]),
+            interpreter_constraints=InterpreterConstraints(),
+            find_links=FrozenOrderedSet(),
+        )
+    )
+
+    reqs = lock_entry["locked_resolves"][0]["locked_requirements"]
+    print(reqs)
+
+    assert reqs[0]["project_name"] == "fasteners"
+    # Kept in in the metadata
+    assert "six" in reqs[0]["requires_dists"]
+    # But excluded as a project
+    assert "six" not in {req["project_name"]: req for req in reqs}
+
+
+def test_uploaded_prior_to(rule_runner: PythonRuleRunner) -> None:
+    args = [
+        "--python-resolves={'test': 'test.lock'}",
+        "--python-separate-lockfile-metadata-file",
+        "--python-pip-version=latest",
+        "--python-resolves-to-uploaded-prior-to={'test': '2023-09-20'}",
+    ]
+    rule_runner.set_options(args, env_inherit=PYTHON_BOOTSTRAP_ENV)
+
+    lock_entry = json.loads(
+        _generate(
+            rule_runner=rule_runner,
+            requirements=FrozenOrderedSet(["cowsay"]),
+            interpreter_constraints=InterpreterConstraints(),
+            find_links=FrozenOrderedSet(),
+        )
+    )
+
+    reqs = lock_entry["locked_resolves"][0]["locked_requirements"]
+    assert len(reqs) == 1
+    assert reqs[0]["project_name"] == "cowsay"
+    # cowsay 6.1 was released after 2023-09-20
+    assert Version(reqs[0]["version"]) < Version("6.1")
+
+
+@pytest.mark.parametrize(
+    ("no_binary", "only_binary"),
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+    ],
+)
+def test_uv_lockfile_generation(
+    rule_runner: PythonRuleRunner, no_binary: bool, only_binary: bool
+) -> None:
+    args = ["--python-resolves={'test': 'test.lock'}"]
+    no_binary_arg = "{'test': ['ansicolors']}"
+    if no_binary:
+        args.append(f"--python-resolves-to-no-binary={no_binary_arg}")
+    if only_binary:
+        args.append(f"--python-resolves-to-only-binary={no_binary_arg}")
+    rule_runner.set_options(args, env_inherit=PYTHON_BOOTSTRAP_ENV)
+
+    result = rule_runner.request(
+        GenerateLockfileResult,
+        [
+            GenerateUvLockfile(
+                requirements=FrozenOrderedSet(
+                    [
+                        "ansicolors==1.1.8",
+                        "cowsay @ git+https://github.com/VaasuDevanS/cowsay-python@dcf7236f0b5ece9ed56e91271486e560526049cf",
+                    ]
+                ),
+                find_links=FrozenOrderedSet([]),
+                interpreter_constraints=InterpreterConstraints(["CPython==3.14"]),
+                resolve_name="test",
+                lockfile_dest="test.lock",
+                diff=False,
+            )
+        ],
+    )
+    digest_contents = rule_runner.request(DigestContents, [result.digest])
+
+    # The result should be exactly two files: the lockfile and its sidecar metadata.
+    assert len(digest_contents) == 2
+    by_path = {fc.path: fc for fc in digest_contents}
+    assert "test.lock" in by_path
+    assert "test.lock.metadata" in by_path
+
+    # Verify the lockfile is valid TOML containing the expected package.
+    lock_data = tomllib.loads(by_path["test.lock"].content.decode())
+    packages = {pkg["name"]: pkg for pkg in lock_data.get("package", []) if "version" in pkg}
+    assert "ansicolors" in packages
+    pkg = packages["ansicolors"]
+    assert pkg["version"] == "1.1.8"
+
+    # uv records all available distributions in the lockfile regardless of
+    # --no-binary-package / --no-build-package; those flags only affect install time.
+    sdist = pkg.get("sdist", {})
+    assert sdist.get("url") == (
+        "https://files.pythonhosted.org/packages/76/31/"
+        "7faed52088732704523c259e24c26ce6f2f33fbeff2ff59274560c27628e/"
+        "ansicolors-1.1.8.zip"
+    )
+    assert sdist.get("hash") == (
+        "sha256:99f94f5e3348a0bcd43c82e5fc4414013ccc19d70bd939ad71e0133ce9c372e0"
+    )
+    wheels = pkg.get("wheels", [])
+    assert len(wheels) == 1
+    assert wheels[0].get("url") == (
+        "https://files.pythonhosted.org/packages/53/18/"
+        "a56e2fe47b259bb52201093a3a9d4a32014f9d85071ad07e9d60600890ca/"
+        "ansicolors-1.1.8-py2.py3-none-any.whl"
+    )
+    assert wheels[0].get("hash") == (
+        "sha256:00d2dde5a675579325902536738dd27e4fac1fd68f773fe36c21044eb559e187"
+    )
+
+    # Verify the sidecar metadata.
+    assert_exactly_one_trailing_newline(by_path["test.lock.metadata"].content, "test.lock.metadata")
+    metadata = json.loads(by_path["test.lock.metadata"].content.decode())
+    assert metadata["version"] == 8
+    assert metadata["lockfile_format"] == LockfileFormat.UV
+    assert metadata["valid_for_interpreter_constraints"] == ["CPython==3.14"]
+    assert metadata["generated_with_requirements"] == [
+        "ansicolors==1.1.8",
+        "cowsay @ git+https://github.com/VaasuDevanS/cowsay-python@dcf7236f0b5ece9ed56e91271486e560526049cf",
+    ]
+    expected_no_binary = ["ansicolors"] if no_binary else []
+    expected_only_binary = ["ansicolors"] if only_binary else []
+    assert sorted(metadata.get("no_binary", [])) == expected_no_binary
+    assert sorted(metadata.get("only_binary", [])) == expected_only_binary
+
+
+def test_uv_lockfile_generation_with_sources(rule_runner: PythonRuleRunner) -> None:
+    # Regression test for https://github.com/pantsbuild/pants/issues/23442.
+    rule_runner.set_options(
+        [
+            "--python-resolves={'test': 'test.lock'}",
+            "--python-repos-indexes=['alt=https://pypi.org/simple/', 'https://test.pypi.org/simple']",
+            "--python-resolves-to-sources={'test': ['alt=ansicolors>=1.0']}",
+        ],
+        env_inherit=PYTHON_BOOTSTRAP_ENV,
+    )
+
+    result = rule_runner.request(
+        GenerateLockfileResult,
+        [
+            GenerateUvLockfile(
+                requirements=FrozenOrderedSet(
+                    [
+                        "ansicolors==1.1.8",
+                        "pantsbuild-testpypi-only==0.0.1",  # Exists only on test.pypi.org, not on pypi.org
+                    ]
+                ),
+                find_links=FrozenOrderedSet([]),
+                interpreter_constraints=InterpreterConstraints(["CPython==3.14"]),
+                resolve_name="test",
+                lockfile_dest="test.lock",
+                diff=False,
+            )
+        ],
+    )
+    digest_contents = rule_runner.request(DigestContents, [result.digest])
+
+    by_path = {fc.path: fc for fc in digest_contents}
+    assert "test.lock" in by_path
+
+    lock_data = tomllib.loads(by_path["test.lock"].content.decode())
+    packages = {pkg["name"]: pkg for pkg in lock_data.get("package", []) if "version" in pkg}
+    assert "ansicolors" in packages
+    assert packages["ansicolors"]["version"] == "1.1.8"
+
+
+def test_pex_lockfile_sync(rule_runner: PythonRuleRunner) -> None:
+    # Pex's "sync" semantics are slightly different from uv's. Pex will update packages whose
+    # requirement strings have changed. So to test the pex case we constrain the initial `cowsay`
+    # version to 6.0 via a constraints file.
+    orig_requirements = FrozenOrderedSet(["ansicolors==1.1.7", "cowsay>=6.0,<=6.1"])
+    updated_requirements = FrozenOrderedSet(["ansicolors==1.1.8", "cowsay>=6.0,<=6.1"])
+
+    def generate(reqs: FrozenOrderedSet[str], sync: bool, with_constraints: bool = False) -> Digest:
+        # Generates a lockfile and returns its output digest.
+        sync_opt = "--generate-lockfiles-sync" if sync else "--no-generate-lockfiles-sync"
+        args = [
+            "--python-resolves={'test': 'test.lock'}",
+            "--python-separate-lockfile-metadata-file",
+            sync_opt,
+        ]
+        if with_constraints:
+            args.append("--python-resolves-to-constraints-file={'test': 'constraints.txt'}")
+        rule_runner.write_files({"constraints.txt": "cowsay==6.0"})
+        rule_runner.set_options(args, env_inherit=PYTHON_BOOTSTRAP_ENV)
+        req = GeneratePexLockfile(
+            requirements=reqs,
+            find_links=FrozenOrderedSet([]),
+            interpreter_constraints=InterpreterConstraints(["CPython==3.14.*"]),
+            lock_style="universal",
+            complete_platforms=tuple(),
+            resolve_name="test",
+            lockfile_dest="test.lock",
+            diff=False,
+        )
+
+        result = rule_runner.request(
+            GenerateLockfileResult,
+            [req],
+        )
+        return result.digest
+
+    def get_versions(digest: Digest) -> dict[str, str]:
+        # Returns a map of package names to versions from a lockfile in a digest.
+        digest_contents = rule_runner.request(DigestContents, [digest])
+        path_to_file_content = {fc.path: fc for fc in digest_contents}
+        assert "test.lock" in path_to_file_content
+        assert "test.lock.metadata" in path_to_file_content
+        assert_exactly_one_trailing_newline(
+            path_to_file_content["test.lock.metadata"].content, "test.lock.metadata"
+        )
+        lock_data = json.loads(path_to_file_content["test.lock"].content.decode())
+        package_to_version = {
+            pkg["project_name"]: pkg["version"]
+            for pkg in lock_data["locked_resolves"][0]["locked_requirements"]
+        }
+        return package_to_version
+
+    def generate_and_get_versions(reqs: FrozenOrderedSet[str], sync: bool) -> dict[str, str]:
+        # Generates a lockfile and returns a map of package names to versions.
+        return get_versions(generate(reqs, sync))
+
+    # Generate the initial lockfile and write its digest.
+    digest = generate(orig_requirements, False, with_constraints=True)
+    rule_runner.write_digest(digest)
+    versions = get_versions(digest)
+    assert {"ansicolors": "1.1.7", "cowsay": "6.0"} == versions
+
+    # Regenerate without --sync (note that we don't write the digest, so this updated lockfile
+    # does not affect the following call to generate_and_get_versions).
+    versions = generate_and_get_versions(updated_requirements, sync=False)
+    assert {"ansicolors": "1.1.8", "cowsay": "6.1"} == versions
+
+    # Regenerate with --sync.
+    versions = generate_and_get_versions(updated_requirements, sync=True)
+    assert {"ansicolors": "1.1.8", "cowsay": "6.0"} == versions
+
+
+def test_uv_lockfile_sync(rule_runner: PythonRuleRunner) -> None:
+    # uv's "sync" semantics are slightly different from pex's. uv will not update packages even
+    # if their requirement strings have changed, as long as the old version still is still valid.
+    # So we can constrain `cowsay` directly in the requirement string.
+    orig_requirements = FrozenOrderedSet(["ansicolors==1.1.7", "cowsay==6.0"])
+    updated_requirements = FrozenOrderedSet(["ansicolors==1.1.8", "cowsay>=6.0,<=6.1"])
+
+    def generate(reqs: FrozenOrderedSet[str], sync: bool) -> Digest:
+        # Generates a lockfile and returns its output digest.
+        sync_opt = "--generate-lockfiles-sync" if sync else "--no-generate-lockfiles-sync"
+        args = [
+            "--python-resolves={'test': 'test.lock'}",
+            "--python-separate-lockfile-metadata-file",
+            sync_opt,
+        ]
+        rule_runner.write_files({"constraints.txt": "cowsay==6.0"})
+        rule_runner.set_options(args, env_inherit=PYTHON_BOOTSTRAP_ENV)
+        req = GenerateUvLockfile(
+            requirements=reqs,
+            find_links=FrozenOrderedSet([]),
+            interpreter_constraints=InterpreterConstraints(["CPython==3.14"]),
+            resolve_name="test",
+            lockfile_dest="test.lock",
+            diff=False,
+        )
+
+        result = rule_runner.request(
+            GenerateLockfileResult,
+            [req],
+        )
+        return result.digest
+
+    def get_versions(digest: Digest) -> dict[str, str]:
+        # Returns a map of package names to versions from a lockfile in a digest.
+        digest_contents = rule_runner.request(DigestContents, [digest])
+        path_to_file_content = {fc.path: fc for fc in digest_contents}
+        assert "test.lock" in path_to_file_content
+        assert "test.lock.metadata" in path_to_file_content
+        assert_exactly_one_trailing_newline(
+            path_to_file_content["test.lock.metadata"].content, "test.lock.metadata"
+        )
+        lock_data = tomllib.loads(path_to_file_content["test.lock"].content.decode())
+        package_to_version = {pkg["name"]: pkg["version"] for pkg in lock_data.get("package", [])}
+        del package_to_version["pants-lockfile-for-test"]
+        return package_to_version
+
+    def generate_and_get_versions(reqs: FrozenOrderedSet[str], sync: bool) -> dict[str, str]:
+        # Generates a lockfile and returns a map of package names to versions.
+        return get_versions(generate(reqs, sync))
+
+    # Generate the initial lockfile and write its digest (we also test that `sync` works when
+    # there is no lockfile).
+    digest = generate(orig_requirements, True)
+    rule_runner.write_digest(digest)
+    versions = get_versions(digest)
+    assert {"ansicolors": "1.1.7", "cowsay": "6.0"} == versions
+
+    # Regenerate without --sync (note that we don't write the digest, so this updated lockfile
+    # does not affect the following call to generate_and_get_versions).
+    versions = generate_and_get_versions(updated_requirements, sync=False)
+    assert {"ansicolors": "1.1.8", "cowsay": "6.1"} == versions
+
+    # Regenerate with --sync.
+    versions = generate_and_get_versions(updated_requirements, sync=True)
+    assert {"ansicolors": "1.1.8", "cowsay": "6.0"} == versions

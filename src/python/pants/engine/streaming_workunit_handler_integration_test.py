@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import os
 import signal
-from typing import Mapping
+from collections.abc import Mapping
 
 import pytest
 from workunit_logger.register import FINISHED_SUCCESSFULLY
 
+from pants.pantsd.pantsd_integration_test_base import attempts, launch_waiter
 from pants.testutil.pants_integration_test import (
     PantsResult,
     run_pants,
@@ -17,7 +18,6 @@ from pants.testutil.pants_integration_test import (
     temporary_workdir,
 )
 from pants.util.dirutil import maybe_read_file
-from pants_test.pantsd.pantsd_integration_test_base import attempts, launch_waiter
 
 
 def workunit_logger_config(log_dest: str, *, pantsd: bool = True) -> Mapping:
@@ -27,7 +27,7 @@ def workunit_logger_config(log_dest: str, *, pantsd: bool = True) -> Mapping:
             "backend_packages.add": ["workunit_logger", "pants.backend.python"],
         },
         "workunit-logger": {"dest": log_dest},
-        "python": {"interpreter_constraints": "['>=3.7,<3.10']"},
+        "python": {"interpreter_constraints": "['>=3.8,<3.10']"},
     }
 
 

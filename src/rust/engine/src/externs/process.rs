@@ -4,19 +4,20 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use process_execution::{Platform, ProcessExecutionEnvironment, ProcessExecutionStrategy};
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::{PyAssertionError, PyValueError};
 use pyo3::prelude::*;
 
-use process_execution::{Platform, ProcessExecutionEnvironment, ProcessExecutionStrategy};
+use crate::python::PyComparedBool;
 
-pub(crate) fn register(m: &PyModule) -> PyResult<()> {
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyProcessExecutionEnvironment>()?;
 
     Ok(())
 }
 
-#[pyclass(name = "ProcessExecutionEnvironment")]
+#[pyclass(name = "ProcessExecutionEnvironment", from_py_object)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PyProcessExecutionEnvironment {
     pub environment: ProcessExecutionEnvironment,
@@ -25,29 +26,49 @@ pub struct PyProcessExecutionEnvironment {
 #[pymethods]
 impl PyProcessExecutionEnvironment {
     #[new]
+    #[pyo3(signature = (
+        *,
+        platform,
+        remote_execution,
+        remote_execution_extra_platform_properties,
+        execute_in_workspace,
+        environment_name,
+        docker_image,
+        keep_sandboxes,
+    ))]
     fn __new__(
         platform: String,
         remote_execution: bool,
         remote_execution_extra_platform_properties: Vec<(String, String)>,
+        execute_in_workspace: bool,
         environment_name: Option<String>,
         docker_image: Option<String>,
+        keep_sandboxes: String,
     ) -> PyResult<Self> {
         let platform = Platform::try_from(platform).map_err(PyValueError::new_err)?;
-        let strategy = match (docker_image, remote_execution) {
-            (None, true) => Ok(ProcessExecutionStrategy::RemoteExecution(
+        let strategy = match (docker_image, remote_execution, execute_in_workspace) {
+            (Some(_), _, true) | (_, true, true) => Err(PyAssertionError::new_err(
+                "workspace execution is only available locally",
+            )),
+            (None, true, _) => Ok(ProcessExecutionStrategy::RemoteExecution(
                 remote_execution_extra_platform_properties,
             )),
-            (None, false) => Ok(ProcessExecutionStrategy::Local),
-            (Some(image), false) => Ok(ProcessExecutionStrategy::Docker(image)),
-            (Some(_), true) => Err(PyAssertionError::new_err(
+            (None, false, false) => Ok(ProcessExecutionStrategy::Local),
+            (None, false, true) => Ok(ProcessExecutionStrategy::LocalInWorkspace),
+            (Some(image), false, _) => Ok(ProcessExecutionStrategy::Docker(image)),
+            (Some(_), true, _) => Err(PyAssertionError::new_err(
                 "docker_image cannot be set at the same time as remote_execution",
             )),
         }?;
+        let local_keep_sandboxes = keep_sandboxes
+            .parse()
+            .map_err(|e| PyValueError::new_err(format!("Failed to parse keep_sandboxes: {e}")))?;
         Ok(Self {
             environment: ProcessExecutionEnvironment {
                 name: environment_name,
                 platform,
                 strategy,
+                local_keep_sandboxes,
             },
         })
     }
@@ -67,15 +88,15 @@ impl PyProcessExecutionEnvironment {
 
     fn __richcmp__(
         &self,
-        other: &PyProcessExecutionEnvironment,
+        other: &Bound<'_, PyProcessExecutionEnvironment>,
         op: CompareOp,
-        py: Python,
-    ) -> PyObject {
-        match op {
-            CompareOp::Eq => (self == other).into_py(py),
-            CompareOp::Ne => (self != other).into_py(py),
-            _ => py.NotImplemented(),
-        }
+    ) -> PyComparedBool {
+        let other = other.borrow();
+        PyComparedBool(match op {
+            CompareOp::Eq => Some(*self == *other),
+            CompareOp::Ne => Some(*self != *other),
+            _ => None,
+        })
     }
 
     #[getter]

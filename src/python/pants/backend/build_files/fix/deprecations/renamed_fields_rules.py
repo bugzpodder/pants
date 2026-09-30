@@ -5,17 +5,18 @@ from __future__ import annotations
 
 import tokenize
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import DefaultDict, Mapping
+from typing import DefaultDict
 
 from pants.backend.build_files.fix.base import FixBuildFilesRequest
 from pants.backend.build_files.fix.deprecations.base import FixBUILDFileRequest, FixedBUILDFile
 from pants.backend.build_files.fix.deprecations.subsystem import BUILDDeprecationsFixer
 from pants.core.goals.fix import FixResult
-from pants.engine.fs import CreateDigest, DigestContents, FileContent
-from pants.engine.internals.native_engine import Digest, Snapshot
-from pants.engine.internals.selectors import Get, MultiGet
-from pants.engine.rules import collect_rules, rule
+from pants.engine.fs import CreateDigest, FileContent
+from pants.engine.internals.selectors import concurrently
+from pants.engine.intrinsics import digest_to_snapshot, get_digest_contents
+from pants.engine.rules import collect_rules, implicitly, rule
 from pants.engine.target import RegisteredTargetTypes, TargetGenerator
 from pants.engine.unions import UnionMembership
 from pants.util.frozendict import FrozenDict
@@ -23,7 +24,7 @@ from pants.util.logging import LogLevel
 
 
 class RenameFieldsInFilesRequest(FixBuildFilesRequest):
-    tool_subsystem = BUILDDeprecationsFixer
+    tool_subsystem = BUILDDeprecationsFixer  # type: ignore[assignment]
 
 
 class RenameFieldsInFileRequest(FixBUILDFileRequest):
@@ -49,7 +50,7 @@ class RenamedFieldTypes:
 
 
 @rule
-def determine_renamed_field_types(
+async def determine_renamed_field_types(
     target_types: RegisteredTargetTypes, union_membership: UnionMembership
 ) -> RenamedFieldTypes:
     target_field_renames: DefaultDict[str, dict[str, str]] = defaultdict(dict)
@@ -70,7 +71,7 @@ def determine_renamed_field_types(
 
 
 @rule
-def fix_single(
+async def fix_single(
     request: RenameFieldsInFileRequest,
     renamed_field_types: RenamedFieldTypes,
 ) -> FixedBUILDFile:
@@ -149,17 +150,18 @@ def fix_single(
 
 
 @rule(desc="Fix deprecated field names", level=LogLevel.DEBUG)
-async def fix(
-    request: RenameFieldsInFilesRequest.Batch,
-) -> FixResult:
-    digest_contents = await Get(DigestContents, Digest, request.snapshot.digest)
-    fixed_contents = await MultiGet(
-        Get(FixedBUILDFile, RenameFieldsInFileRequest(file_content.path, file_content.content))
+async def fix(request: RenameFieldsInFilesRequest.Batch) -> FixResult:
+    digest_contents = await get_digest_contents(request.snapshot.digest)
+    fixed_contents = await concurrently(
+        fix_single(
+            RenameFieldsInFileRequest(file_content.path, file_content.content), **implicitly()
+        )
         for file_content in digest_contents
     )
-    snapshot = await Get(
-        Snapshot,
-        CreateDigest(FileContent(content.path, content.content) for content in fixed_contents),
+    snapshot = await digest_to_snapshot(
+        **implicitly(
+            CreateDigest(FileContent(content.path, content.content) for content in fixed_contents)
+        )
     )
     return FixResult(
         request.snapshot, snapshot, "", "", tool_name=RenameFieldsInFilesRequest.tool_name

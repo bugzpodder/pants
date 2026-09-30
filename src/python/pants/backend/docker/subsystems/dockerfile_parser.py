@@ -3,96 +3,17 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import PurePath
 
 from pants.backend.docker.target_types import DockerImageSourceField
 from pants.backend.docker.util_rules.docker_build_args import DockerBuildArgs
-from pants.backend.python.subsystems.python_tool_base import PythonToolRequirementsBase
-from pants.backend.python.target_types import EntryPoint
-from pants.backend.python.util_rules import pex
-from pants.backend.python.util_rules.pex import PexRequest, VenvPex, VenvPexProcess
 from pants.engine.addresses import Address
-from pants.engine.fs import CreateDigest, Digest, FileContent
-from pants.engine.process import Process, ProcessResult
-from pants.engine.rules import Get, collect_rules, rule
-from pants.engine.target import (
-    HydratedSources,
-    HydrateSourcesRequest,
-    SourcesField,
-    WrappedTarget,
-    WrappedTargetRequest,
-)
-from pants.util.logging import LogLevel
-from pants.util.resources import read_resource
-
-_DOCKERFILE_SANDBOX_TOOL = "dockerfile_wrapper_script.py"
-_DOCKERFILE_PACKAGE = "pants.backend.docker.subsystems"
-
-
-class DockerfileParser(PythonToolRequirementsBase):
-    options_scope = "dockerfile-parser"
-    help = "Used to parse Dockerfile build specs to infer their dependencies."
-
-    default_requirements = ["dockerfile>=3.2.0,<4"]
-
-    register_interpreter_constraints = True
-
-    default_lockfile_resource = (_DOCKERFILE_PACKAGE, "dockerfile.lock")
-
-
-@dataclass(frozen=True)
-class ParserSetup:
-    pex: VenvPex
-
-
-@rule
-async def setup_parser(dockerfile_parser: DockerfileParser) -> ParserSetup:
-    parser_script_content = read_resource(_DOCKERFILE_PACKAGE, _DOCKERFILE_SANDBOX_TOOL)
-    if not parser_script_content:
-        raise ValueError(
-            f"Unable to find source to {_DOCKERFILE_SANDBOX_TOOL!r} in {_DOCKERFILE_PACKAGE}."
-        )
-
-    parser_content = FileContent(
-        path="__pants_df_parser.py",
-        content=parser_script_content,
-        is_executable=True,
-    )
-    parser_digest = await Get(Digest, CreateDigest([parser_content]))
-
-    parser_pex = await Get(
-        VenvPex,
-        PexRequest,
-        dockerfile_parser.to_pex_request(
-            main=EntryPoint(PurePath(parser_content.path).stem), sources=parser_digest
-        ),
-    )
-    return ParserSetup(parser_pex)
-
-
-@dataclass(frozen=True)
-class DockerfileParseRequest:
-    sources_digest: Digest
-    args: tuple[str, ...]
-
-
-@rule
-async def setup_process_for_parse_dockerfile(
-    request: DockerfileParseRequest, parser: ParserSetup
-) -> Process:
-    process = await Get(
-        Process,
-        VenvPexProcess(
-            parser.pex,
-            argv=request.args,
-            description="Parse Dockerfile.",
-            input_digest=request.sources_digest,
-            level=LogLevel.DEBUG,
-        ),
-    )
-    return process
+from pants.engine.fs import Digest
+from pants.engine.internals.graph import hydrate_sources, resolve_target
+from pants.engine.internals.native_engine import NativeDependenciesRequest
+from pants.engine.intrinsics import parse_dockerfile_info
+from pants.engine.rules import collect_rules, implicitly, rule
+from pants.engine.target import HydrateSourcesRequest, SourcesField, WrappedTargetRequest
 
 
 class DockerfileInfoError(Exception):
@@ -109,6 +30,7 @@ class DockerfileInfo:
     source: str
     build_args: DockerBuildArgs = DockerBuildArgs()
     copy_source_paths: tuple[str, ...] = ()
+    copy_build_args: DockerBuildArgs = DockerBuildArgs()
     from_image_build_args: DockerBuildArgs = DockerBuildArgs()
     version_tags: tuple[str, ...] = ()
 
@@ -120,17 +42,17 @@ class DockerfileInfoRequest:
 
 @rule
 async def parse_dockerfile(request: DockerfileInfoRequest) -> DockerfileInfo:
-    wrapped_target = await Get(
-        WrappedTarget, WrappedTargetRequest(request.address, description_of_origin="<infallible>")
+    wrapped_target = await resolve_target(
+        WrappedTargetRequest(request.address, description_of_origin="<infallible>"), **implicitly()
     )
     target = wrapped_target.target
-    sources = await Get(
-        HydratedSources,
+    sources = await hydrate_sources(
         HydrateSourcesRequest(
             target.get(SourcesField),
             for_sources_types=(DockerImageSourceField,),
             enable_codegen=True,
         ),
+        **implicitly(),
     )
 
     dockerfiles = sources.snapshot.files
@@ -139,47 +61,29 @@ async def parse_dockerfile(request: DockerfileInfoRequest) -> DockerfileInfo:
         f"got: {dockerfiles}."
     )
 
-    result = await Get(
-        ProcessResult,
-        DockerfileParseRequest(
-            sources.snapshot.digest,
-            dockerfiles,
-        ),
-    )
-
     try:
-        raw_output = result.stdout.decode("utf-8")
-        outputs = json.loads(raw_output)
-        assert len(outputs) == len(dockerfiles)
-    except Exception as e:
-        raise DockerfileInfoError(
-            f"Unexpected failure to parse Dockerfiles: {', '.join(dockerfiles)}, "
-            f"for the {request.address} target: {e}\nDockerfile parser output:\n{raw_output}"
-        ) from e
-
-    info = outputs[0]
-    try:
+        results = await parse_dockerfile_info(NativeDependenciesRequest(sources.snapshot.digest))
+        assert len(results.path_to_infos) == 1
+        result = next(iter(results.path_to_infos.values()))
         return DockerfileInfo(
-            address=request.address,
+            address=target.address,
             digest=sources.snapshot.digest,
-            source=info["source"],
-            build_args=DockerBuildArgs.from_strings(
-                *info["build_args"], duplicates_must_match=True
+            source=result.source,
+            build_args=DockerBuildArgs.from_strings(*result.build_args, duplicates_must_match=True),
+            copy_source_paths=tuple(result.copy_source_paths),
+            copy_build_args=DockerBuildArgs.from_strings(
+                *result.copy_build_args, duplicates_must_match=True
             ),
-            copy_source_paths=tuple(info["copy_source_paths"]),
             from_image_build_args=DockerBuildArgs.from_strings(
-                *info["from_image_build_args"], duplicates_must_match=True
+                *result.from_image_build_args, duplicates_must_match=True
             ),
-            version_tags=tuple(info["version_tags"]),
+            version_tags=tuple(result.version_tags),
         )
     except ValueError as e:
         raise DockerfileInfoError(
-            f"Error while parsing {info['source']} for the {request.address} target: {e}"
+            f"Error while parsing {dockerfiles[0]} for the {request.address} target: {e}"
         ) from e
 
 
 def rules():
-    return (
-        *collect_rules(),
-        *pex.rules(),
-    )
+    return collect_rules()

@@ -1,5 +1,7 @@
 # Copyright 2023 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 from textwrap import dedent  # noqa: PNT20
@@ -7,13 +9,19 @@ from textwrap import dedent  # noqa: PNT20
 import pytest
 
 from pants.backend.terraform import dependencies, dependency_inference, tool
-from pants.backend.terraform.dependencies import TerraformInitRequest, TerraformInitResponse
+from pants.backend.terraform.dependencies import (
+    TerraformDependenciesRequest,
+    TerraformDependenciesResponse,
+    TerraformInitRequest,
+    TerraformInvocationRequirements,
+)
 from pants.backend.terraform.goals.deploy import DeployTerraformFieldSet
 from pants.backend.terraform.goals.deploy import rules as terraform_deploy_rules
 from pants.backend.terraform.goals.lockfiles import rules as terraform_lockfile_rules
 from pants.backend.terraform.target_types import (
     TerraformBackendTarget,
     TerraformDeploymentTarget,
+    TerraformLockfileTarget,
     TerraformModuleTarget,
     TerraformVarFileTarget,
 )
@@ -22,20 +30,24 @@ from pants.core.goals.deploy import DeployProcess
 from pants.core.register import rules as core_rules
 from pants.core.util_rules import source_files
 from pants.engine import process
-from pants.engine.internals.native_engine import Address
+from pants.engine.fs import DigestEntries
+from pants.engine.internals.native_engine import Address, Digest
 from pants.engine.rules import QueryRule
 from pants.testutil.rule_runner import RuleRunner
+
+all_terraform_target_types = [
+    TerraformModuleTarget,
+    TerraformDeploymentTarget,
+    TerraformBackendTarget,
+    TerraformVarFileTarget,
+    TerraformLockfileTarget,
+]
 
 
 @pytest.fixture
 def rule_runner_with_auto_approve() -> RuleRunner:
     rule_runner = RuleRunner(
-        target_types=[
-            TerraformModuleTarget,
-            TerraformDeploymentTarget,
-            TerraformBackendTarget,
-            TerraformVarFileTarget,
-        ],
+        target_types=all_terraform_target_types,
         rules=[
             *dependency_inference.rules(),
             *dependencies.rules(),
@@ -47,7 +59,9 @@ def rule_runner_with_auto_approve() -> RuleRunner:
             *core_rules(),
             *process.rules(),
             QueryRule(DeployProcess, (DeployTerraformFieldSet,)),
-            QueryRule(TerraformInitResponse, (TerraformInitRequest,)),
+            QueryRule(DigestEntries, (Digest,)),
+            QueryRule(TerraformInvocationRequirements, (TerraformInitRequest,)),
+            QueryRule(TerraformDependenciesResponse, (TerraformDependenciesRequest,)),
         ],
         preserve_tmpdirs=True,
     )
@@ -61,6 +75,11 @@ class StandardDeployment:
     files: dict[str, str]
     state_file: Path
     target: Address = Address("src/tf", target_name="stg")
+
+    def with_added_files(self, files: dict[str, str]) -> StandardDeployment:
+        return StandardDeployment(
+            files={**self.files, **files}, state_file=self.state_file, target=self.target
+        )
 
 
 @pytest.fixture
@@ -133,6 +152,7 @@ provider "registry.terraform.io/hashicorp/null" {
   version     = "3.2.2"
   constraints = "~> 3.2.0, <= 3.2.2"
   hashes = [
+    "h1:Gef5VGfobY5uokA5nV/zFvWeMNR2Pmq79DH94QnNZPM=",
     "h1:zT1ZbegaAYHwQa+QwIFugArWikRJI9dqohj8xb0GY88=",
     "zh:3248aae6a2198f3ec8394218d05bd5e42be59f43a3a7c0b71c66ec0df08b69e7",
     "zh:32b1aaa1c3013d33c245493f4a65465eab9436b454d250102729321a44c8ab9a",

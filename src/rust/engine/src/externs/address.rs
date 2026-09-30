@@ -2,7 +2,7 @@
 // Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -11,10 +11,12 @@ use pyo3::basic::CompareOp;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyAssertionError, PyException};
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedStr;
 use pyo3::types::{PyDict, PyFrozenSet, PyType};
 
 use fnv::FnvHasher;
-use lazy_static::lazy_static;
+
+use crate::python::PyComparedBool;
 
 create_exception!(native_engine, AddressParseException, PyException);
 create_exception!(native_engine, InvalidAddressError, AddressParseException);
@@ -23,7 +25,7 @@ create_exception!(native_engine, InvalidTargetNameError, InvalidAddressError);
 create_exception!(native_engine, InvalidParametersError, InvalidAddressError);
 create_exception!(native_engine, UnsupportedWildcardError, InvalidAddressError);
 
-pub fn register(py: Python, m: &PyModule) -> PyResult<()> {
+pub fn register(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(address_spec_parse, m)?)?;
 
     m.add(
@@ -67,15 +69,10 @@ pub fn register(py: Python, m: &PyModule) -> PyResult<()> {
     Ok(())
 }
 
-lazy_static! {
-  // `:`, `#`, `@` are used as delimiters already. Others are reserved for possible future needs.
-  pub static ref BANNED_CHARS_IN_TARGET_NAME: HashSet<char> =
-    [':', '#', '!', '@', '?', '/', '\\', '='].into();
-  pub static ref BANNED_CHARS_IN_GENERATED_NAME: HashSet<char> =
-    [':', '#', '!', '@', '?', '='].into();
-  pub static ref BANNED_CHARS_IN_PARAMETERS: HashSet<char> =
-    [':', '#', '!', '@', '?', '=', ',', ' '].into();
-}
+// `:`, `#`, `@` are used as delimiters already. Others are reserved for possible future needs.
+pub static BANNED_CHARS_IN_TARGET_NAME: [char; 8] = [':', '#', '!', '@', '?', '/', '\\', '='];
+pub static BANNED_CHARS_IN_GENERATED_NAME: [char; 6] = [':', '#', '!', '@', '?', '='];
+pub static BANNED_CHARS_IN_PARAMETERS: [char; 8] = [':', '#', '!', '@', '?', '=', ',', ' '];
 
 #[pyclass(name = "AddressInput")]
 #[derive(Debug, Hash, Eq, PartialEq)]
@@ -91,6 +88,14 @@ pub struct AddressInput {
 #[pymethods]
 impl AddressInput {
     #[new]
+    #[pyo3(signature = (
+        original_spec,
+        path_component,
+        description_of_origin,
+        target_component=None,
+        generated_component=None,
+        parameters=None
+    ))]
     fn __new__(
         original_spec: String,
         path_component: PathBuf,
@@ -149,16 +154,31 @@ impl AddressInput {
     }
 
     #[classmethod]
+    #[pyo3(signature = (
+        spec,
+        *,
+        description_of_origin,
+        relative_to=None,
+        subproject_roots=None
+    ))]
     fn parse(
-        _cls: &PyType,
+        _cls: &Bound<'_, PyType>,
         spec: &str,
         description_of_origin: &str,
-        relative_to: Option<&str>,
-        subproject_roots: Option<Vec<&str>>,
+        relative_to: Option<PyBackedStr>,
+        subproject_roots: Option<Vec<PyBackedStr>>,
     ) -> PyResult<Self> {
-        let subproject_info = subproject_roots
-            .zip(relative_to)
-            .and_then(|(roots, relative_to)| split_on_longest_dir_prefix(relative_to, &roots));
+        let subproject_roots: Option<Vec<&str>> = subproject_roots
+            .as_deref()
+            .map(|roots| roots.iter().map(|s| s.as_ref()).collect());
+        let relative_to: Option<&str> = relative_to.as_deref();
+
+        let subproject_info = match (subproject_roots, relative_to) {
+            (Some(roots), Some(relative_to)) => {
+                split_on_longest_dir_prefix(relative_to, &roots[..])
+            }
+            _ => None,
+        };
 
         let parsed_spec =
             address::parse_address_spec(spec).map_err(AddressParseException::new_err)?;
@@ -229,8 +249,17 @@ impl AddressInput {
     }
 
     #[getter]
-    fn path_component(&self) -> &Path {
-        &self.path_component
+    fn path_component(&self) -> PyResult<String> {
+        self.path_component
+            .as_os_str()
+            .to_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                PyException::new_err(format!(
+                    "Could not convert AddressInput.path_component `{}` to UTF8.",
+                    self.path_component.display()
+                ))
+            })
     }
 
     #[getter]
@@ -277,13 +306,13 @@ impl AddressInput {
                     // AddressSpec constructor because we weren't sure if the path_spec referred to a file
                     // vs. a directory.
                     return Err(InvalidTargetNameError::new_err(format!(
-            "Addresses for generated first-party targets in the build root must include \
+                        "Addresses for generated first-party targets in the build root must include \
              which target generator they come from, such as `{}:original_target`. However, \
              `{}` from {} did not have a target name.",
-            self.path_component.display(),
-            self.original_spec,
-            self.description_of_origin,
-          )));
+                        self.path_component.display(),
+                        self.original_spec,
+                        self.description_of_origin,
+                    )));
                 }
             }
         };
@@ -382,12 +411,12 @@ impl AddressInput {
         format!("{self:?}")
     }
 
-    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python) -> PyObject {
-        match op {
-            CompareOp::Eq => (self == other).into_py(py),
-            CompareOp::Ne => (self != other).into_py(py),
-            _ => py.NotImplemented(),
-        }
+    fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyComparedBool {
+        PyComparedBool(match op {
+            CompareOp::Eq => Some(self == other),
+            CompareOp::Ne => Some(self != other),
+            _ => None,
+        })
     }
 }
 
@@ -398,17 +427,17 @@ fn split_on_longest_dir_prefix<'a, 'b>(
     let mut longest_match = 0;
     let mut matched = None;
     for prefix in prefixes {
-        if prefix.len() > longest_match {
-            if let Ok(stripped) = Path::new(path).strip_prefix(prefix) {
-                longest_match = prefix.len();
-                matched = Some((*prefix, stripped.to_str().unwrap()));
-            }
+        if prefix.len() > longest_match
+            && let Ok(stripped) = Path::new(path).strip_prefix(prefix)
+        {
+            longest_match = prefix.len();
+            matched = Some((*prefix, stripped.to_str().unwrap()));
         }
     }
     matched
 }
 
-#[pyclass(name = "Address")]
+#[pyclass(name = "Address", frozen, from_py_object)]
 #[derive(Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Address {
     // NB: Field ordering is deliberate, so that Ord will roughly match `self.spec`.
@@ -422,6 +451,14 @@ pub struct Address {
 #[pymethods]
 impl Address {
     #[new]
+    #[pyo3(signature = (
+        spec_path,
+        *,
+        target_name=None,
+        parameters=None,
+        generated_name=None,
+        relative_file_path=None
+    ))]
     fn __new__(
         spec_path: PathBuf,
         target_name: Option<String>,
@@ -444,12 +481,12 @@ impl Address {
                 .collect::<Vec<_>>();
             if !banned.is_empty() {
                 return Err(InvalidTargetNameError::new_err(format!(
-          "The generated name `{generated_name}` (defined in directory {}, the part after \
+                    "The generated name `{generated_name}` (defined in directory {}, the part after \
           `#`) contains banned characters (`{}`). Please replace \
            these characters with another separator character like `_`, `-`, or `/`.",
-          spec_path.display(),
-          banned.join(","),
-        )));
+                    spec_path.display(),
+                    banned.join(","),
+                )));
             }
         }
 
@@ -486,23 +523,32 @@ impl Address {
             relative_file_path,
         };
 
-        if let Some(file_name) = address.spec_path.file_name().and_then(|n| n.to_str()) {
-            if file_name.starts_with("BUILD") {
-                return Err(InvalidSpecPathError::new_err(format!(
-                    "The address {address} has {} as the last part of its \
+        if let Some(file_name) = address.spec_path.file_name().and_then(|n| n.to_str())
+            && file_name.starts_with("BUILD")
+        {
+            return Err(InvalidSpecPathError::new_err(format!(
+                "The address {address} has {} as the last part of its \
            path, but BUILD is a reserved name. Please make sure that you did not name any \
            directories BUILD.",
-                    Path::new(file_name).display(),
-                )));
-            }
+                Path::new(file_name).display(),
+            )));
         }
 
         Ok(address)
     }
 
     #[getter]
-    fn spec_path(&self) -> &Path {
-        &self.spec_path
+    fn spec_path(&self) -> PyResult<String> {
+        self.spec_path
+            .as_os_str()
+            .to_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                PyException::new_err(format!(
+                    "Could not convert Address.spec_path `{}` to UTF8.",
+                    self.spec_path.display()
+                ))
+            })
     }
 
     #[getter]
@@ -511,8 +557,21 @@ impl Address {
     }
 
     #[getter]
-    fn relative_file_path(&self) -> Option<&Path> {
-        self.relative_file_path.as_deref()
+    fn relative_file_path(&self) -> PyResult<Option<String>> {
+        match &self.relative_file_path {
+            Some(p) => Ok(Some(
+                p.as_os_str()
+                    .to_str()
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| {
+                        PyException::new_err(format!(
+                            "Could not convert Address.relative_file_path `{}` to UTF8.",
+                            self.relative_file_path.as_ref().unwrap().display()
+                        ))
+                    })?,
+            )),
+            None => Ok(None),
+        }
     }
 
     #[getter]
@@ -545,9 +604,19 @@ impl Address {
     }
 
     #[getter]
-    fn filename(&self) -> PyResult<PathBuf> {
+    fn filename(&self) -> PyResult<String> {
         if let Some(relative_file_path) = self.relative_file_path.as_ref() {
-            Ok(self.spec_path.join(relative_file_path))
+            let full_path = self.spec_path.join(relative_file_path);
+            full_path
+                .as_os_str()
+                .to_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    PyException::new_err(format!(
+                        "Could not convert Address.path_component `{}` to UTF8.",
+                        full_path.display()
+                    ))
+                })
         } else {
             Err(PyException::new_err(format!(
                 "Only a file Address (`self.is_file_target`) has a filename: {self}",
@@ -572,7 +641,7 @@ impl Address {
     }
 
     #[getter]
-    fn parameters_repr(&self) -> Cow<str> {
+    fn parameters_repr(&self) -> Cow<'_, str> {
         if self.parameters.is_empty() {
             return Cow::from("");
         }
@@ -680,9 +749,15 @@ impl Address {
         Ok(format!("{prefix}{path}{target}{generated}{params}"))
     }
 
-    fn parametrize(&self, parameters: BTreeMap<String, String>) -> Self {
-        let mut merged_parameters = self.parameters.clone();
-        merged_parameters.extend(parameters);
+    #[pyo3(signature = (parameters, replace=false))]
+    fn parametrize(&self, parameters: BTreeMap<String, String>, replace: bool) -> Self {
+        let merged_parameters = if replace {
+            parameters
+        } else {
+            let mut merged_parameters = parameters.clone();
+            merged_parameters.extend(parameters);
+            merged_parameters
+        };
 
         Self {
             spec_path: self.spec_path.clone(),
@@ -693,19 +768,21 @@ impl Address {
         }
     }
 
-    fn maybe_convert_to_target_generator(self_: PyRef<Self>, py: Python) -> PyObject {
+    fn maybe_convert_to_target_generator(self_: PyRef<Self>, py: Python) -> PyResult<Py<PyAny>> {
         if !self_.is_generated_target() && !self_.is_parametrized() {
-            return self_.into_py(py);
+            return Ok(self_.into_pyobject(py)?.into_any().unbind());
         }
 
-        Self {
+        Ok(Self {
             spec_path: self_.spec_path.clone(),
             target_name: self_.target_name.clone(),
             parameters: BTreeMap::default(),
             generated_name: None,
             relative_file_path: None,
         }
-        .into_py(py)
+        .into_pyobject(py)?
+        .into_any()
+        .unbind())
     }
 
     fn create_generated(&self, generated_name: String) -> PyResult<Self> {
@@ -744,7 +821,7 @@ impl Address {
         self.spec()
     }
 
-    fn metadata<'p>(&self, py: Python<'p>) -> PyResult<&'p PyDict> {
+    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
         dict.set_item(pyo3::intern!(py, "address"), self.spec())?;
         Ok(dict)
@@ -770,6 +847,10 @@ impl Address {
 }
 
 impl Address {
+    pub fn spec_path_str(&self) -> &str {
+        self.spec_path.to_str().unwrap_or("")
+    }
+
     fn equal_without_parameters(&self, other: &Address) -> bool {
         self.spec_path == other.spec_path
             && self.target_name == other.target_name
@@ -801,7 +882,7 @@ type ParsedSpec<'a> = (ParsedAddress<'a>, Option<&'a str>);
 
 /// Parses an "address spec" from the CLI.
 #[pyfunction]
-fn address_spec_parse(spec_str: &str) -> PyResult<ParsedSpec> {
+fn address_spec_parse(spec_str: &str) -> PyResult<ParsedSpec<'_>> {
     let spec = address::parse_address_spec(spec_str).map_err(AddressParseException::new_err)?;
     Ok((
         (

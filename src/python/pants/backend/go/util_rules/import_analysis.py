@@ -11,9 +11,8 @@ import ijson.backends.python as ijson
 from pants.backend.go.util_rules import go_mod
 from pants.backend.go.util_rules.cgo import CGoCompilerFlags
 from pants.backend.go.util_rules.sdk import GoSdkProcess
-from pants.engine.internals.selectors import Get
-from pants.engine.process import ProcessResult
-from pants.engine.rules import collect_rules, rule
+from pants.engine.process import execute_process_or_raise
+from pants.engine.rules import collect_rules, implicitly, rule
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
 
@@ -26,6 +25,7 @@ class GoStdLibPackage:
     import_path: str
     pkg_source_path: str
     imports: tuple[str, ...]
+    deps: tuple[str, ...]
     import_map: FrozenDict[str, str]
 
     # Analysis for when Pants is able to compile the SDK directly.
@@ -62,14 +62,14 @@ class GoStdLibPackagesRequest:
 @rule(desc="Analyze Go standard library packages.", level=LogLevel.DEBUG)
 async def analyze_go_stdlib_packages(request: GoStdLibPackagesRequest) -> GoStdLibPackages:
     maybe_race_arg = ["-race"] if request.with_race_detector else []
-    list_result = await Get(
-        ProcessResult,
-        GoSdkProcess(
-            # "-find" skips determining dependencies and imports for each package.
-            command=("list", *maybe_race_arg, "-json", "std"),
-            env={"CGO_ENABLED": "1" if request.cgo_enabled else "0"},
-            description="Ask Go for its available import paths",
-        ),
+    list_result = await execute_process_or_raise(
+        **implicitly(
+            GoSdkProcess(
+                command=("list", *maybe_race_arg, "-json", "std"),
+                env={"CGO_ENABLED": "1" if request.cgo_enabled else "0"},
+                description="Ask Go for its available import paths",
+            )
+        )
     )
     stdlib_packages = {}
     for pkg_json in ijson.items(list_result.stdout, "", multiple_values=True):
@@ -84,6 +84,7 @@ async def analyze_go_stdlib_packages(request: GoStdLibPackagesRequest) -> GoStdL
             import_path=import_path,
             pkg_source_path=pkg_source_path,
             imports=tuple(pkg_json.get("Imports", ())),
+            deps=tuple(pkg_json.get("Deps", ())),
             import_map=FrozenDict(pkg_json.get("ImportMap", {})),
             go_files=tuple(pkg_json.get("GoFiles", ())),
             cgo_files=tuple(pkg_json.get("CgoFiles", ())),

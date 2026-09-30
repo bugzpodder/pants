@@ -51,7 +51,10 @@ def rule_runner(package_manager: str) -> RuleRunner:
         ],
         objects=dict(package_json.build_file_aliases().objects),
     )
-    rule_runner.set_options([f"--nodejs-package-manager={package_manager}"], env_inherit={"PATH"})
+    rule_runner.set_options(
+        [f"--nodejs-package-manager={package_manager}"],
+        env_inherit={"PATH"},
+    )
     return rule_runner
 
 
@@ -92,7 +95,9 @@ def test_creates_tar_for_package_json(rule_runner: RuleRunner, package_manager: 
     rule_runner.write_digest(result.digest)
 
     archive_name = "ham-v0.0.1.tgz" if package_manager == "yarn" else "ham-0.0.1.tgz"
-    with tarfile.open(os.path.join(rule_runner.build_root, archive_name)) as tar:
+    with tarfile.open(
+        os.path.join(rule_runner.build_root, "src.js", "ham-dist", archive_name)
+    ) as tar:
         assert {member.name for member in tar.getmembers()}.issuperset(
             {
                 "package/package.json",
@@ -162,18 +167,18 @@ def workspace_files(package_manager: str) -> dict[str, str]:
         }
     if package_manager == "pnpm":
         return {
-            "src/js/pnpm-workspace.yaml": textwrap.dedent(
-                """\
-                packages:
-                """
+            "src/js/pnpm-workspace.yaml": json.dumps(
+                {
+                    "packages": ["a"],
+                }
             ),
             "src/js/pnpm-lock.yaml": json.dumps(
                 {
                     "importers": {
-                        ".": {"specifiers": {}},
-                        "a": {"specifiers": {}},
+                        ".": {},
+                        "a": {},
                     },
-                    "lockfileVersion": 5.3,
+                    "lockfileVersion": "9.0",
                 }
             ),
         }
@@ -192,13 +197,19 @@ def workspace_files(package_manager: str) -> dict[str, str]:
 
 
 def test_packages_files_as_resource_in_workspace(
-    rule_runner: RuleRunner, workspace_files: dict[str, str]
+    rule_runner: RuleRunner,
+    workspace_files: dict[str, str],
 ) -> None:
     rule_runner.write_files(
         {
             **workspace_files,
             "src/js/package.json": json.dumps(
-                {"name": "spam", "version": "0.0.1", "workspaces": ["a"], "private": True}
+                {
+                    "name": "spam",
+                    "version": "0.0.1",
+                    "workspaces": ["a"],
+                    "private": True,
+                }
             ),
             "src/js/BUILD": "package_json()",
             "src/js/a/BUILD": dedent(
@@ -237,6 +248,12 @@ def test_packages_files_as_resource_in_workspace(
 
 
 def test_extra_envs(rule_runner: RuleRunner) -> None:
+    rule_runner.set_options(
+        [
+            "--nodejs-extra-env-vars=['FROM_SUBSYSTEM=FIZZ']",
+        ],
+        env_inherit={"PATH"},
+    )
     rule_runner.write_files(
         {
             "src/js/BUILD": dedent(
@@ -244,7 +261,8 @@ def test_extra_envs(rule_runner: RuleRunner) -> None:
                 package_json(
                     scripts=[
                         node_build_script(entry_point="build", extra_env_vars=["FOO=BAR"], output_files=["dist/index.cjs"])
-                    ]
+                    ],
+                    extra_env_vars=["FROM_PACKAGE_JSON=BUZZ"]
                 )
                 """
             ),
@@ -253,7 +271,9 @@ def test_extra_envs(rule_runner: RuleRunner) -> None:
                     "name": "ham",
                     "version": "0.0.1",
                     "browser": "lib/index.mjs",
-                    "scripts": {"build": "mkdir dist && echo $FOO >> dist/index.cjs"},
+                    "scripts": {
+                        "build": "mkdir dist && echo $FOO >> dist/index.cjs && echo $FROM_SUBSYSTEM >> dist/index.cjs && echo $FROM_PACKAGE_JSON >> dist/index.cjs"
+                    },
                 }
             ),
             "src/js/package-lock.json": json.dumps({}),
@@ -272,4 +292,4 @@ def test_extra_envs(rule_runner: RuleRunner) -> None:
     )
     rule_runner.write_digest(result.snapshot.digest)
     with open(os.path.join(rule_runner.build_root, "src/js/dist/index.cjs")) as f:
-        assert f.read() == "BAR\n"
+        assert f.read() == "BAR\nFIZZ\nBUZZ\n"

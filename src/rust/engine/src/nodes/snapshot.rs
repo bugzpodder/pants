@@ -5,18 +5,18 @@ use std::path::Path;
 
 use deepsize::DeepSizeOf;
 use fs::{
-    self, DigestEntry, DirectoryDigest, FileContent, FileEntry, GlobExpansionConjunction,
-    GlobMatching, PathGlobs, PreparedPathGlobs, StrictGlobMatching, SymlinkBehavior, SymlinkEntry,
+    self, DigestEntry, DirectoryDigest, FileContent, FileEntry, GlobMatching, PathGlobs,
+    PreparedPathGlobs, SymlinkBehavior, SymlinkEntry,
 };
 use futures::TryFutureExt;
 use graph::CompoundNode;
-use pyo3::prelude::{Py, PyAny, Python};
-use pyo3::IntoPy;
+use pyo3::Bound;
+use pyo3::prelude::{Py, PyAny, PyAnyMethods, Python};
 
-use super::{unmatched_globs_additional_context, NodeKey, NodeOutput, NodeResult};
+use super::{NodeKey, NodeOutput, NodeResult, unmatched_globs_additional_context};
 use crate::context::Context;
 use crate::externs;
-use crate::python::{throw, Value};
+use crate::python::{Value, throw};
 
 ///
 /// A Node that captures an store::Snapshot for a PathGlobs subject.
@@ -31,34 +31,14 @@ impl Snapshot {
         Snapshot { path_globs }
     }
 
-    pub fn lift_path_globs(item: &PyAny) -> Result<PathGlobs, String> {
-        let globs: Vec<String> = externs::getattr(item, "globs")
-            .map_err(|e| format!("Failed to get `globs` for field: {e}"))?;
-
-        let description_of_origin =
-            externs::getattr_as_optional_string(item, "description_of_origin")
-                .map_err(|e| format!("Failed to get `description_of_origin` for field: {e}"))?;
-
-        let glob_match_error_behavior = externs::getattr(item, "glob_match_error_behavior")
-            .map_err(|e| format!("Failed to get `glob_match_error_behavior` for field: {e}"))?;
-
-        let failure_behavior: String = externs::getattr(glob_match_error_behavior, "value")
-            .map_err(|e| format!("Failed to get `value` for field: {e}"))?;
-
-        let strict_glob_matching =
-            StrictGlobMatching::create(failure_behavior.as_str(), description_of_origin)?;
-
-        let conjunction_obj = externs::getattr(item, "conjunction")
-            .map_err(|e| format!("Failed to get `conjunction` for field: {e}"))?;
-
-        let conjunction_string: String = externs::getattr(conjunction_obj, "value")
-            .map_err(|e| format!("Failed to get `value` for field: {e}"))?;
-
-        let conjunction = GlobExpansionConjunction::create(&conjunction_string)?;
-        Ok(PathGlobs::new(globs, strict_glob_matching, conjunction))
+    pub fn lift_path_globs(item: &Bound<'_, PyAny>) -> Result<PathGlobs, String> {
+        let py_path_globs: pyo3::PyRef<externs::fs::PyPathGlobs> = item
+            .extract()
+            .map_err(|e| format!("Expected a PathGlobs instance: {e}"))?;
+        Ok(PathGlobs::clone(&py_path_globs))
     }
 
-    pub fn lift_prepared_path_globs(item: &PyAny) -> Result<PreparedPathGlobs, String> {
+    pub fn lift_prepared_path_globs(item: &Bound<'_, PyAny>) -> Result<PreparedPathGlobs, String> {
         let path_globs = Snapshot::lift_path_globs(item)?;
         path_globs
             .parse()
@@ -67,18 +47,18 @@ impl Snapshot {
 
     pub fn store_directory_digest(py: Python, item: DirectoryDigest) -> Result<Value, String> {
         let py_digest = Py::new(py, externs::fs::PyDigest(item)).map_err(|e| format!("{e}"))?;
-        Ok(Value::new(py_digest.into_py(py)))
+        Ok(Value::new(py_digest.into_any()))
     }
 
     pub fn store_file_digest(py: Python, item: hashing::Digest) -> Result<Value, String> {
         let py_file_digest =
             Py::new(py, externs::fs::PyFileDigest(item)).map_err(|e| format!("{e}"))?;
-        Ok(Value::new(py_file_digest.into_py(py)))
+        Ok(Value::new(py_file_digest.into_any()))
     }
 
     pub fn store_snapshot(py: Python, item: store::Snapshot) -> Result<Value, String> {
         let py_snapshot = Py::new(py, externs::fs::PySnapshot(item)).map_err(|e| format!("{e}"))?;
-        Ok(Value::new(py_snapshot.into_py(py)))
+        Ok(Value::new(py_snapshot.into_any()))
     }
 
     pub fn store_path(py: Python, item: &Path) -> Result<Value, String> {
@@ -160,7 +140,8 @@ impl Snapshot {
         Ok(externs::unsafe_call(
             py,
             context.core.types.digest_contents,
-            &[externs::store_tuple(py, entries)],
+            &[externs::store_tuple(py, entries)
+                .map_err(|e| format!("PyTuple construction failure: {e:?}"))?],
         ))
     }
 
@@ -186,7 +167,8 @@ impl Snapshot {
         Ok(externs::unsafe_call(
             py,
             context.core.types.digest_entries,
-            &[externs::store_tuple(py, entries)],
+            &[externs::store_tuple(py, entries)
+                .map_err(|e| format!("PyTuple construction faiure: {e:?}"))?],
         ))
     }
 

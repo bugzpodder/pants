@@ -28,18 +28,19 @@ from pants.backend.python.target_types import (
     VersionTemplateField,
     VersionVersionSchemeField,
 )
-from pants.backend.python.util_rules.pex import PexRequest, VenvPex, VenvPexProcess
-from pants.core.util_rules.stripped_source_files import StrippedFileName, StrippedFileNameRequest
+from pants.backend.python.util_rules.pex import PexRequest, VenvPexProcess, create_venv_pex
+from pants.core.util_rules.stripped_source_files import StrippedFileNameRequest, strip_file_name
+from pants.engine.environment import ChosenLocalEnvironmentName, EnvironmentName
 from pants.engine.fs import CreateDigest, FileContent
-from pants.engine.internals.native_engine import Digest, Snapshot
-from pants.engine.internals.selectors import Get, MultiGet
-from pants.engine.process import ProcessCacheScope, ProcessResult
-from pants.engine.rules import collect_rules, rule
+from pants.engine.internals.selectors import concurrently
+from pants.engine.intrinsics import create_digest, digest_to_snapshot, execute_process
+from pants.engine.process import ProcessCacheScope
+from pants.engine.rules import collect_rules, implicitly, rule
 from pants.engine.target import AllTargets, GeneratedSources, GenerateSourcesRequest, Targets
 from pants.engine.unions import UnionRule
 from pants.util.logging import LogLevel
 from pants.util.strutil import softwrap
-from pants.vcs.git import GitWorktreeRequest, MaybeGitWorktree
+from pants.vcs.git import GitWorktreeRequest, get_git_worktree
 
 
 class VCSVersioningError(Exception):
@@ -57,17 +58,22 @@ class GeneratePythonFromSetuptoolsSCMRequest(GenerateSourcesRequest):
 async def generate_python_from_setuptools_scm(
     request: GeneratePythonFromSetuptoolsSCMRequest,
     setuptools_scm: SetuptoolsSCM,
+    local_environment_name: ChosenLocalEnvironmentName,
 ) -> GeneratedSources:
     # A MaybeGitWorktree is uncacheable, so this enclosing rule will run every time its result
     # is needed, and the process invocation below caches at session scope, meaning this rule
     # will always return a result based on the current underlying git state.
-    maybe_git_worktree = await Get(MaybeGitWorktree, GitWorktreeRequest())
+    maybe_git_worktree = await get_git_worktree(
+        **implicitly(
+            {GitWorktreeRequest(): GitWorktreeRequest, local_environment_name.val: EnvironmentName}
+        )
+    )
     if not maybe_git_worktree.git_worktree:
         raise VCSVersioningError(
             softwrap(
                 f"""
                 Trying to determine the version for the {request.protocol_target.address} target at
-                {request.protocol_target.address}, but you are not running in a git worktree.
+                {request.protocol_target.address}, but {maybe_git_worktree.failure_reason}.
                 """
             )
         )
@@ -88,37 +94,47 @@ async def generate_python_from_setuptools_scm(
         tool_config["local_scheme"] = local_scheme
     config_path = "pyproject.synthetic.toml"
 
-    input_digest_get = Get(
-        Digest,
+    input_digest_get = create_digest(
         CreateDigest(
             [
                 FileContent(config_path, toml.dumps(config).encode()),
             ]
-        ),
+        )
     )
 
-    setuptools_scm_pex_get = Get(VenvPex, PexRequest, setuptools_scm.to_pex_request())
-    setuptools_scm_pex, input_digest = await MultiGet(setuptools_scm_pex_get, input_digest_get)
+    setuptools_scm_pex_get = create_venv_pex(
+        **implicitly(
+            {
+                setuptools_scm.to_pex_request(): PexRequest,
+                local_environment_name.val: EnvironmentName,
+            }
+        )
+    )
+    setuptools_scm_pex, input_digest = await concurrently(setuptools_scm_pex_get, input_digest_get)
 
     argv = ["--root", str(maybe_git_worktree.git_worktree.worktree), "--config", config_path]
 
-    result = await Get(
-        ProcessResult,
-        VenvPexProcess(
-            setuptools_scm_pex,
-            argv=argv,
-            input_digest=input_digest,
-            description=f"Run setuptools_scm for {request.protocol_target.address.spec}",
-            level=LogLevel.INFO,
-            cache_scope=ProcessCacheScope.PER_SESSION,
+    result = await execute_process(
+        **implicitly(
+            {
+                VenvPexProcess(
+                    setuptools_scm_pex,
+                    argv=argv,
+                    input_digest=input_digest,
+                    description=f"Run setuptools_scm for {request.protocol_target.address.spec}",
+                    level=LogLevel.INFO,
+                    cache_scope=ProcessCacheScope.PER_SESSION,
+                ): VenvPexProcess,
+                local_environment_name.val: EnvironmentName,
+            }
         ),
     )
     version = result.stdout.decode().strip()
     write_to = cast(str, request.protocol_target[VersionGenerateToField].value)
     write_to_template = cast(str, request.protocol_target[VersionTemplateField].value)
     output_content = write_to_template.format(version=version)
-    output_snapshot = await Get(
-        Snapshot, CreateDigest([FileContent(write_to, output_content.encode())])
+    output_snapshot = await digest_to_snapshot(
+        **implicitly(CreateDigest([FileContent(write_to, output_content.encode())]))
     )
     return GeneratedSources(output_snapshot)
 
@@ -138,7 +154,7 @@ class AllVCSVersionTargets(Targets):
 
 
 @rule(desc="Find all vcs_version targets in project", level=LogLevel.DEBUG)
-def find_all_vcs_version_targets(targets: AllTargets) -> AllVCSVersionTargets:
+async def find_all_vcs_version_targets(targets: AllTargets) -> AllVCSVersionTargets:
     return AllVCSVersionTargets(tgt for tgt in targets if tgt.has_field(VersionGenerateToField))
 
 
@@ -155,8 +171,8 @@ async def map_to_python_modules(
         for tgt in vcs_version_targets
         if cast(str, tgt[VersionGenerateToField].value).endswith(suffix)
     ]
-    stripped_files = await MultiGet(
-        Get(StrippedFileName, StrippedFileNameRequest(cast(str, tgt[VersionGenerateToField].value)))
+    stripped_files = await concurrently(
+        strip_file_name(StrippedFileNameRequest(cast(str, tgt[VersionGenerateToField].value)))
         for tgt in targets
     )
     resolves_to_modules_to_providers: DefaultDict[

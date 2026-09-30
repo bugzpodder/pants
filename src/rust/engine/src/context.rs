@@ -4,41 +4,42 @@
 use std::cmp::max;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Into;
+use std::env;
 use std::io::Read;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::intrinsics::Intrinsics;
-use crate::nodes::{ExecuteProcess, NodeKey, NodeOutput, NodeResult};
-use crate::python::{throw, Failure};
-use crate::session::{Session, Sessions};
-use crate::tasks::{Rule, Tasks};
-use crate::types::Types;
-
 use cache::PersistentCache;
-use fs::{GitignoreStyleExcludes, PosixFS};
+use docker::docker;
+use fs::{FS, GitignoreStyleExcludes};
 use futures::FutureExt;
 use graph::{Graph, InvalidationResult};
 use hashing::Digest;
-use log::{log, Level};
+use log::{Level, debug, log};
 use parking_lot::Mutex;
-// use docker::docker::{self, DOCKER, IMAGE_PULL_CACHE};
-use docker::docker;
 use process_execution::switched::SwitchedCommandRunner;
 use process_execution::{
-    self, bounded, local, CacheContentBehavior, CommandRunner, NamedCaches,
-    ProcessExecutionStrategy,
+    self, CacheContentBehavior, CommandRunner, NamedCaches, ProcessExecutionStrategy, bounded,
+    local,
 };
 use regex::Regex;
 use remote::remote_cache::{RemoteCacheRunnerOptions, RemoteCacheWarningsBehavior};
 use remote::{self, remote_cache};
 use rule_graph::RuleGraph;
-use store::{self, ImmutableInputs, RemoteProvider, RemoteStoreOptions, Store};
+use sandboxer::Sandboxer;
+use store::{self, ImmutableInputs, RemoteProvider, RemoteStoreOptions, Store, StoreCliOpt};
 use task_executor::Executor;
+use tokio::sync::RwLock;
 use watch::{Invalidatable, InvalidateCaller, InvalidationWatcher};
 use workunit_store::{Metric, RunningWorkunit};
+
+use crate::nodes::{ExecuteProcess, NodeKey, NodeOutput, NodeResult, SubjectPath};
+use crate::python::{Failure, throw};
+use crate::session::{Session, Sessions};
+use crate::tasks::{Rule, Tasks};
+use crate::types::Types;
 
 // The reqwest crate has no support for ingesting multiple certificates in a single file,
 // and requires single PEM blocks. There is a crate (https://crates.io/crates/pem) that can decode
@@ -52,6 +53,13 @@ use workunit_store::{Metric, RunningWorkunit};
 const PEM_RE_STR: &str =
     r"(?s)-----BEGIN (?P<begin>.*?)-----\s*(?P<data>.*?)-----END (?P<end>.*?)-----\s*";
 
+fn get_sandboxer_binary() -> Result<PathBuf, String> {
+    let sandboxer_path_str = env::var("PANTS_SANDBOXER_BINARY_PATH").map_err(|e| e.to_string())?;
+    if sandboxer_path_str.is_empty() {
+        return Err("$PANTS_SANDBOXER_BINARY_PATH is empty".to_string());
+    }
+    Ok(PathBuf::from(sandboxer_path_str))
+}
 ///
 /// The core context shared (via Arc) between the Scheduler and the Context objects of
 /// all running Nodes.
@@ -61,19 +69,21 @@ pub struct Core {
     pub tasks: Tasks,
     pub rule_graph: RuleGraph<Rule>,
     pub types: Types,
-    pub intrinsics: Intrinsics,
     pub executor: Executor,
     store: Store,
+    sandboxer: Option<Sandboxer>,
     /// The CommandRunners to use for execution, in ascending order of reliability (for the purposes
     /// of backtracking). For performance reasons, caching `CommandRunners` might skip validation of
     /// their outputs, and so should be listed before uncached `CommandRunners`.
     pub command_runners: Vec<Arc<dyn CommandRunner>>,
     pub http_client: reqwest::Client,
     pub local_cache: PersistentCache,
-    pub vfs: PosixFS,
+    pub vfs: FS,
+    pub vfs_system: FS,
     pub watcher: Option<Arc<InvalidationWatcher>>,
     pub build_root: PathBuf,
     pub local_parallelism: usize,
+    pub remote_parallelism: Option<usize>,
     pub graceful_shutdown_timeout: Duration,
     pub sessions: Sessions,
     pub named_caches: NamedCaches,
@@ -98,6 +108,7 @@ pub struct RemotingOptions {
     pub store_rpc_concurrency: usize,
     pub store_rpc_timeout: Duration,
     pub store_batch_api_size_limit: usize,
+    pub store_batch_load_enabled: bool,
     pub cache_warnings_behavior: RemoteCacheWarningsBehavior,
     pub cache_content_behavior: CacheContentBehavior,
     pub cache_rpc_concurrency: usize,
@@ -130,6 +141,7 @@ impl RemotingOptions {
             retries: self.store_rpc_retries,
             concurrency_limit: self.store_rpc_concurrency,
             batch_api_size_limit: self.store_batch_api_size_limit,
+            batch_load_enabled: self.store_batch_load_enabled,
         })
     }
 }
@@ -138,7 +150,7 @@ impl RemotingOptions {
 pub struct ExecutionStrategyOptions {
     pub local_parallelism: usize,
     pub remote_parallelism: usize,
-    pub local_keep_sandboxes: local::KeepSandboxes,
+    pub use_sandboxer: bool,
     pub local_cache: bool,
     pub local_enable_nailgun: bool,
     pub remote_cache_read: bool,
@@ -200,7 +212,9 @@ impl Core {
     async fn make_leaf_runner(
         full_store: &Store,
         local_runner_store: &Store,
+        sandboxer: &Option<Sandboxer>,
         executor: &Executor,
+        build_root: &Path,
         local_execution_root_dir: &Path,
         immutable_inputs: &ImmutableInputs,
         named_caches: &NamedCaches,
@@ -210,14 +224,39 @@ impl Core {
         exec_strategy_opts: &ExecutionStrategyOptions,
         remoting_opts: &RemotingOptions,
     ) -> Result<Arc<dyn CommandRunner>, String> {
-        let local_command_runner = local::CommandRunner::new(
+        // Lock shared between `local::CommandRunner` and `workspace::CommandRunner` to protect concurrent spawning
+        // of subprocesses.
+        let spawn_lock = Arc::new(RwLock::new(()));
+
+        let local_sandbox_command_runner = local::CommandRunner::new(
             local_runner_store.clone(),
+            sandboxer.clone(),
             executor.clone(),
             local_execution_root_dir.to_path_buf(),
             named_caches.clone(),
             immutable_inputs.clone(),
-            exec_strategy_opts.local_keep_sandboxes,
+            spawn_lock.clone(),
         );
+
+        // TODO: Consider whether to limit parallel execution and/or concurrency of in-workspace executions. (For example,
+        // wrapping in a `process_execution::bounded::CommandRunner` could be used to limit the number of concurrent
+        // workspace executions, but is not the only solution.)
+        let local_workspace_command_runner = process_execution::workspace::CommandRunner::new(
+            local_runner_store.clone(),
+            sandboxer.clone(),
+            executor.clone(),
+            build_root.to_path_buf(),
+            local_execution_root_dir.to_path_buf(),
+            named_caches.clone(),
+            immutable_inputs.clone(),
+            spawn_lock,
+        );
+
+        let local_command_runner: Box<dyn CommandRunner> = Box::new(SwitchedCommandRunner::new(
+            local_workspace_command_runner,
+            local_sandbox_command_runner,
+            |req| req.execution_environment.strategy == ProcessExecutionStrategy::LocalInWorkspace,
+        ));
 
         let runner: Box<dyn CommandRunner> = if exec_strategy_opts.local_enable_nailgun {
             // We set the nailgun pool size to the number of instances that fit within the memory
@@ -236,6 +275,7 @@ impl Core {
             let nailgun_runner = pe_nailgun::CommandRunner::new(
                 local_execution_root_dir.to_path_buf(),
                 local_runner_store.clone(),
+                sandboxer.clone(),
                 executor.clone(),
                 named_caches.clone(),
                 immutable_inputs.clone(),
@@ -258,9 +298,9 @@ impl Core {
             executor.clone(),
             &docker::DOCKER,
             &docker::IMAGE_PULL_CACHE,
+            build_root.to_path_buf(),
             local_execution_root_dir.to_path_buf(),
             immutable_inputs.clone(),
-            exec_strategy_opts.local_keep_sandboxes,
         )?);
         let runner = Box::new(SwitchedCommandRunner::new(docker_runner, runner, |req| {
             matches!(
@@ -379,8 +419,10 @@ impl Core {
     async fn make_command_runners(
         full_store: &Store,
         local_runner_store: &Store,
+        sandboxer: &Option<Sandboxer>,
         executor: &Executor,
         local_cache: &PersistentCache,
+        build_root: &Path,
         local_execution_root_dir: &Path,
         immutable_inputs: &ImmutableInputs,
         named_caches: &NamedCaches,
@@ -393,7 +435,9 @@ impl Core {
         let leaf_runner = Self::make_leaf_runner(
             full_store,
             local_runner_store,
+            sandboxer,
             executor,
+            build_root,
             local_execution_root_dir,
             immutable_inputs,
             named_caches,
@@ -491,8 +535,8 @@ impl Core {
         executor: Executor,
         tasks: Tasks,
         types: Types,
-        intrinsics: Intrinsics,
         build_root: PathBuf,
+        pants_workdir: PathBuf,
         ignore_patterns: Vec<String>,
         use_gitignore: bool,
         watch_filesystem: bool,
@@ -594,13 +638,57 @@ impl Core {
             full_store.clone()
         };
 
+        // Create the CLI opts to pass to the sandboxer process so it can create an
+        // appropriately-configured Store.
+        let store_cli_opt = if store.is_local_only() {
+            StoreCliOpt::new_local_only(local_store_options.store_dir.to_owned())
+        } else {
+            StoreCliOpt {
+                local_store_path: Some(local_store_options.store_dir.clone()),
+                remote_instance_name: remoting_opts.instance_name.clone(),
+                cas_server: remoting_opts.store_address.clone(),
+                cas_root_ca_cert_file: remoting_opts.root_ca_certs_path.clone(),
+                cas_client_certs_file: remoting_opts.client_certs_path.clone(),
+                cas_client_key_file: remoting_opts.client_key_path.clone(),
+                cas_oauth_bearer_token_path: None, // This has already been injected into a header.
+                upload_chunk_bytes: remoting_opts.store_chunk_bytes,
+                store_rpc_retries: remoting_opts.store_rpc_retries,
+                store_rpc_concurrency: remoting_opts.store_rpc_concurrency,
+                store_batch_api_size_limit: remoting_opts.store_batch_api_size_limit,
+                store_batch_load_enabled: remoting_opts.store_batch_load_enabled,
+                header: remoting_opts
+                    .store_headers
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect(),
+            }
+        };
+
+        let sandboxer = if exec_strategy_opts.use_sandboxer {
+            let sandboxer_bin = get_sandboxer_binary()?;
+            debug!("Running against sandboxer at {:?}", sandboxer_bin);
+            Some(
+                Sandboxer::new(
+                    sandboxer_bin,
+                    pants_workdir.to_path_buf(),
+                    store_cli_opt.clone(),
+                )
+                .await?,
+            )
+        } else {
+            debug!("No sandboxer configured.");
+            None
+        };
+
         let immutable_inputs = ImmutableInputs::new(store.clone(), &local_execution_root_dir)?;
         let named_caches = NamedCaches::new_local(named_caches_dir);
         let command_runners = Self::make_command_runners(
             &full_store,
             &store,
+            &sandboxer,
             &executor,
             &local_cache,
+            &build_root,
             &local_execution_root_dir,
             &immutable_inputs,
             &named_caches,
@@ -613,7 +701,9 @@ impl Core {
         .await?;
         log::debug!("Using {command_runners:?} for process execution.");
 
-        let graph = Arc::new(InvalidatableGraph(Graph::new(executor.clone())));
+        let graph = Arc::new(InvalidatableGraph {
+            graph: Graph::new(executor.clone()),
+        });
 
         // These certs are for downloads, not to be confused with the ones used for remoting.
         let ca_certs = Self::load_certificates(ca_certs_path)?;
@@ -654,17 +744,22 @@ impl Core {
             tasks,
             rule_graph,
             types,
-            intrinsics,
             executor: executor.clone(),
             store,
+            sandboxer,
             command_runners,
             http_client,
             local_cache,
-            vfs: PosixFS::new(&build_root, ignorer, executor)
+            vfs: FS::new(&build_root, ignorer, executor.clone())
                 .map_err(|e| format!("Could not initialize Vfs: {e:?}"))?,
+            vfs_system: FS::new(Path::new("/"), GitignoreStyleExcludes::empty(), executor)
+                .map_err(|e| format!("Could not initialize Vfs for local system: {e:?}"))?,
             build_root,
             watcher,
             local_parallelism: exec_strategy_opts.local_parallelism,
+            remote_parallelism: remoting_opts
+                .execution_enable
+                .then_some(exec_strategy_opts.remote_parallelism),
             graceful_shutdown_timeout: exec_strategy_opts.graceful_shutdown_timeout,
             sessions,
             named_caches,
@@ -677,6 +772,10 @@ impl Core {
         self.store.clone()
     }
 
+    pub fn sandboxer(&self) -> Option<Sandboxer> {
+        self.sandboxer.clone()
+    }
+
     ///
     /// Shuts down this Core.
     ///
@@ -684,7 +783,7 @@ impl Core {
         // Shutdown the Sessions, which will prevent new work from starting and then await any ongoing
         // work.
         if let Err(msg) = self.sessions.shutdown(timeout).await {
-            log::warn!("During shutdown: {}", msg);
+            log::warn!("During shutdown: {msg}");
         }
         // Then clear the Graph to ensure that drop handlers run (particularly for running processes).
         self.graph.clear();
@@ -704,7 +803,9 @@ impl Core {
     }
 }
 
-pub struct InvalidatableGraph(Graph<NodeKey>);
+pub struct InvalidatableGraph {
+    graph: Graph<NodeKey>,
+}
 
 fn caller_to_logging_info(caller: InvalidateCaller) -> (Level, &'static str) {
     match caller {
@@ -723,7 +824,11 @@ impl Invalidatable for InvalidatableGraph {
         let InvalidationResult { cleared, dirtied } =
             self.invalidate_from_roots(false, move |node| {
                 if let Some(fs_subject) = node.fs_subject() {
-                    paths.contains(fs_subject)
+                    match fs_subject {
+                        SubjectPath::Workspace(relpath) => paths.contains(relpath.as_path()),
+                        // TODO: Invalidation not supported currently for local system paths.
+                        SubjectPath::LocalSystem(_) => false,
+                    }
                 } else {
                     false
                 }
@@ -731,11 +836,7 @@ impl Invalidatable for InvalidatableGraph {
         let (level, caller) = caller_to_logging_info(caller);
         log!(
             level,
-            "{} invalidation: cleared {} and dirtied {} nodes for: {:?}",
-            caller,
-            cleared,
-            dirtied,
-            paths
+            "{caller} invalidation: cleared {cleared} and dirtied {dirtied} nodes for: {paths:?}"
         );
         cleared + dirtied
     }
@@ -746,10 +847,7 @@ impl Invalidatable for InvalidatableGraph {
         let (level, caller) = caller_to_logging_info(caller);
         log!(
             level,
-            "{} invalidation: cleared {} and dirtied {} nodes for all paths",
-            caller,
-            cleared,
-            dirtied
+            "{caller} invalidation: cleared {cleared} and dirtied {dirtied} nodes for all paths"
         );
         cleared + dirtied
     }
@@ -759,7 +857,7 @@ impl Deref for InvalidatableGraph {
     type Target = Graph<NodeKey>;
 
     fn deref(&self) -> &Graph<NodeKey> {
-        &self.0
+        &self.graph
     }
 }
 
@@ -835,8 +933,14 @@ impl SessionCore {
             } else {
                 // There are no live or invalidated sources of this Digest. Directly fail.
                 return result.map_err(|e| {
+                    let suffix = if let Some(workunit_data) = workunit.workunit() {
+                        &format!(", with workunit: {workunit_data:?}")
+                    } else {
+                        ""
+                    };
+
                     throw(format!(
-                        "Could not identify a process to backtrack to for: {e}"
+                        "Could not identify a process to backtrack to for: {e}{suffix}"
                     ))
                 });
             }
@@ -872,9 +976,9 @@ impl SessionCore {
                     // TODO: This message should likely be at `info`, or eventually, debug.
                     //   see https://github.com/pantsbuild/pants/issues/15867
                     log::warn!(
-            "Making attempt {new_level} to backtrack and retry `{description}`, due to \
+                        "Making attempt {new_level} to backtrack and retry `{description}`, due to \
               missing digest {digest:?}."
-          );
+                    );
                     Some(root)
                 } else {
                     None

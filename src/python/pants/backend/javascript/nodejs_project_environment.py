@@ -9,19 +9,27 @@ from dataclasses import dataclass, field
 from pants.backend.javascript import package_json, resolve
 from pants.backend.javascript.nodejs_project import NodeJSProject
 from pants.backend.javascript.package_json import (
+    NodePackageExtraEnvVarsField,
     NodePackageNameField,
     OwningNodePackage,
     OwningNodePackageRequest,
+    find_owning_package,
 )
-from pants.backend.javascript.resolve import ChosenNodeResolve, RequestNodeResolve
+from pants.backend.javascript.resolve import (
+    ChosenNodeResolve,
+    RequestNodeResolve,
+    resolve_for_package,
+)
 from pants.backend.javascript.subsystems import nodejs
-from pants.backend.javascript.subsystems.nodejs import NodeJSToolProcess
+from pants.backend.javascript.subsystems.nodejs import NodeJSToolProcess, setup_node_tool_process
 from pants.build_graph.address import Address
-from pants.engine.fs import PathGlobs
+from pants.core.util_rules.env_vars import environment_vars_subset
+from pants.engine.env_vars import EnvironmentVarsRequest
 from pants.engine.internals.native_engine import EMPTY_DIGEST, Digest, MergeDigests
-from pants.engine.internals.selectors import Get, MultiGet
+from pants.engine.internals.selectors import concurrently
+from pants.engine.intrinsics import merge_digests, path_globs_to_digest
 from pants.engine.process import Process
-from pants.engine.rules import Rule, collect_rules, rule
+from pants.engine.rules import Rule, collect_rules, implicitly, rule
 from pants.engine.target import Target
 from pants.engine.unions import UnionRule
 from pants.util.dirutil import fast_relpath
@@ -53,9 +61,18 @@ class NodeJsProjectEnvironment:
 
     @property
     def node_modules_directories(self) -> Iterable[str]:
+        """node_modules paths to capture from the install Process.
+
+        In a project with workspaces enabled, the package manager may install deps under a
+        member's node_modules directory (pnpm does this by default). We capture those paths
+        too so the sandbox match what the package manager actually installs.
+        """
         yield "node_modules"
         if self.package and not self.project.single_workspace:
-            yield os.path.join(self.relative_workspace_directory(), "node_modules")
+            for workspace in self.project.workspaces:
+                if workspace.root_dir != self.project.root_dir:
+                    rel_dir = fast_relpath(workspace.root_dir, self.project.root_dir)
+                    yield os.path.join(rel_dir, "node_modules")
 
     @property
     def target(self) -> Target | None:
@@ -91,15 +108,31 @@ class NodeJsProjectEnvironmentProcess:
     output_files: tuple[str, ...] = ()
     output_directories: tuple[str, ...] = ()
     per_package_caches: FrozenDict[str, str] = field(default_factory=FrozenDict)
+    project_caches: FrozenDict[str, str] = field(default_factory=FrozenDict)
     timeout_seconds: int | None = None
     extra_env: FrozenDict[str, str] = field(default_factory=FrozenDict)
+
+    def targeted_args(self) -> tuple[str, ...]:
+        if (
+            not self.env.project.single_workspace
+            and self.env.target
+            and self.env.root_dir != self.env.package_dir()
+        ):
+            target = self.env.ensure_target()
+            return (
+                self.env.project.workspace_specifier_arg,
+                target[NodePackageNameField].value,
+                *self.args,
+            )
+        else:
+            return tuple(self.args)
 
 
 @rule(desc="Assembling nodejs project environment")
 async def get_nodejs_environment(req: NodeJSProjectEnvironmentRequest) -> NodeJsProjectEnvironment:
-    node_resolve, owning_tgt = await MultiGet(
-        Get(ChosenNodeResolve, RequestNodeResolve(req.address)),
-        Get(OwningNodePackage, OwningNodePackageRequest(req.address)),
+    node_resolve, owning_tgt = await concurrently(
+        resolve_for_package(RequestNodeResolve(req.address), **implicitly()),
+        find_owning_package(OwningNodePackageRequest(req.address)),
     )
     assert owning_tgt.target, f"Already ensured to exist by {ChosenNodeResolve.__name__}."
 
@@ -107,22 +140,23 @@ async def get_nodejs_environment(req: NodeJSProjectEnvironmentRequest) -> NodeJs
 
 
 @rule
-async def setup_nodejs_project_environment_process(req: NodeJsProjectEnvironmentProcess) -> Process:
-    lockfile_digest, project_digest = await MultiGet(
-        Get(Digest, PathGlobs, req.env.resolve.get_lockfile_glob()),
-        Get(Digest, MergeDigests, req.env.project.get_project_digest()),
+async def setup_nodejs_project_environment_process(
+    req: NodeJsProjectEnvironmentProcess,
+    nodejs: nodejs.NodeJS,
+) -> Process:
+    target_env_vars = (
+        req.env.target.get(NodePackageExtraEnvVarsField).value or () if req.env.target else ()
     )
-    merged = await Get(Digest, MergeDigests((req.input_digest, lockfile_digest, project_digest)))
 
-    if not req.env.project.single_workspace and req.env.target:
-        target = req.env.ensure_target()
-        args = (
-            req.env.project.workspace_specifier_arg,
-            target[NodePackageNameField].value,
-            *req.args,
-        )
-    else:
-        args = tuple(req.args)
+    lockfile_digest, project_digest, subsystem_env_vars, env_vars = await concurrently(
+        path_globs_to_digest(req.env.resolve.get_lockfile_glob()),
+        merge_digests(req.env.project.get_project_digest()),
+        environment_vars_subset(EnvironmentVarsRequest(nodejs.extra_env_vars), **implicitly()),
+        environment_vars_subset(EnvironmentVarsRequest(target_env_vars), **implicitly()),
+    )
+    merged = await merge_digests(MergeDigests((req.input_digest, lockfile_digest, project_digest)))
+
+    args = req.targeted_args()
     output_files = req.output_files
     output_directories = req.output_directories
     per_package_caches = FrozenDict(
@@ -131,24 +165,35 @@ async def setup_nodejs_project_environment_process(req: NodeJsProjectEnvironment
             for key, value in req.per_package_caches.items()
         }
     )
-    return await Get(
-        Process,
-        NodeJSToolProcess,
-        NodeJSToolProcess(
-            tool=req.env.project.package_manager,
-            tool_version=req.env.project.package_manager_version,
-            args=args,
-            description=req.description,
-            level=req.level,
-            input_digest=merged,
-            working_directory=req.env.root_dir,
-            output_files=output_files,
-            output_directories=output_directories,
-            append_only_caches=FrozenDict(**per_package_caches, **req.env.project.extra_caches()),
-            timeout_seconds=req.timeout_seconds,
-            project_digest=project_digest,
-            extra_env=FrozenDict(**req.extra_env, **req.env.project.extra_env()),
-        ),
+    append_only_caches: FrozenDict[str, str] = FrozenDict(
+        **per_package_caches, **req.project_caches, **req.env.project.extra_caches()
+    )
+
+    return await setup_node_tool_process(
+        **implicitly(
+            NodeJSToolProcess(
+                tool=req.env.project.package_manager.name,
+                tool_version=req.env.project.package_manager.version,
+                args=args,
+                description=req.description,
+                level=req.level,
+                input_digest=merged,
+                working_directory=req.env.root_dir,
+                output_files=output_files,
+                output_directories=output_directories,
+                append_only_caches=append_only_caches,
+                timeout_seconds=req.timeout_seconds,
+                project_digest=project_digest,
+                extra_env=FrozenDict(
+                    {
+                        **subsystem_env_vars,
+                        **env_vars,
+                        **req.extra_env,
+                        **req.env.project.extra_env(),
+                    }
+                ),
+            )
+        )
     )
 
 

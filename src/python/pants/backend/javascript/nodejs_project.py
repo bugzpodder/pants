@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import itertools
 import os.path
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import PurePath
-from typing import Iterable
-
-import nodesemver
 
 from pants.backend.javascript import package_json
 from pants.backend.javascript.package_json import (
@@ -17,13 +15,13 @@ from pants.backend.javascript.package_json import (
     PnpmWorkspaceGlobs,
     PnpmWorkspaces,
 )
+from pants.backend.javascript.package_manager import PackageManager
 from pants.backend.javascript.subsystems import nodejs
 from pants.backend.javascript.subsystems.nodejs import NodeJS, UserChosenNodeJSResolveAliases
 from pants.core.util_rules import stripped_source_files
-from pants.core.util_rules.stripped_source_files import StrippedFileName, StrippedFileNameRequest
+from pants.core.util_rules.stripped_source_files import StrippedFileNameRequest, strip_file_name
 from pants.engine.collection import Collection
 from pants.engine.internals.native_engine import MergeDigests
-from pants.engine.internals.selectors import Get
 from pants.engine.rules import Rule, collect_rules, rule
 from pants.engine.unions import UnionRule
 from pants.util.ordered_set import FrozenOrderedSet
@@ -56,66 +54,38 @@ class NodeJSProject:
     root_dir: str
     workspaces: FrozenOrderedSet[PackageJson]
     default_resolve_name: str
-    package_manager: str
-    package_manager_version: str | None = None
+    package_manager: PackageManager
     pnpm_workspace: PnpmWorkspaceGlobs | None = None
 
     @property
     def lockfile_name(self) -> str:
-        if self.package_manager == "pnpm":
-            return "pnpm-lock.yaml"
-        elif self.package_manager == "yarn":
-            return "yarn.lock"
-        return "package-lock.json"
+        return self.package_manager.lockfile_name
 
     @property
     def generate_lockfile_args(self) -> tuple[str, ...]:
-        if self.package_manager == "pnpm":
-            return ("install", "--lockfile-only")
-        elif self.package_manager == "yarn":
-            return ("install",)  # yarn does not provide a lockfile only mode.
-        return ("install", "--package-lock-only")
+        return self.package_manager.generate_lockfile_args
 
     @property
     def immutable_install_args(self) -> tuple[str, ...]:
-        if self.package_manager == "npm":
-            return ("clean-install",)
-        if self.package_manager == "pnpm":
-            return ("install", "--frozen-lockfile")
-        if self.package_manager == "yarn":
-            if nodesemver.satisfies(self.package_manager_version, "1.x"):
-                return ("install", "--frozen-lockfile")
-            return ("install", "--immutable")
-        raise ValueError(f"Unsupported package manager: {self.package_manager}")
+        return self.package_manager.immutable_install_args
 
     @property
     def workspace_specifier_arg(self) -> str:
-        if self.package_manager == "pnpm":
-            return "--filter"
-        elif self.package_manager == "yarn":
-            return "workspace"
-        return "--workspace"
+        return self.package_manager.workspace_specifier_arg
+
+    @property
+    def args_separator(self) -> tuple[str, ...]:
+        return self.package_manager.run_arg_separator
 
     def extra_env(self) -> dict[str, str]:
-        if self.package_manager == "pnpm":
-            return {"PNPM_HOME": "{chroot}/._pnpm_home"}
-        elif self.package_manager == "yarn":
-            return {"YARN_CACHE_FOLDER": "{chroot}/._yarn_cache"}
-        return {}
+        return dict(self.package_manager.extra_env)
 
     @property
     def pack_archive_format(self) -> str:
-        if self.package_manager == "yarn":
-            return "{}-v{}.tgz"
-        else:
-            return "{}-{}.tgz"
+        return self.package_manager.pack_archive_format
 
     def extra_caches(self) -> dict[str, str]:
-        if self.package_manager == "pnpm":
-            return {"pnpm_home": "._pnpm_home"}
-        elif self.package_manager == "yarn":
-            return {"yarn_cache": "._yarn_cache"}
-        return {}
+        return dict(self.package_manager.extra_caches)
 
     def get_project_digest(self) -> MergeDigests:
         return MergeDigests(
@@ -168,15 +138,12 @@ class NodeJSProject:
                             """
                         )
                     )
-        package_manager_command, *maybe_version = package_manager.split("@")
-        package_manager_version = maybe_version[0] if maybe_version else None
 
         return NodeJSProject(
             root_dir=project.root_dir,
             workspaces=project.workspaces,
             default_resolve_name=project.default_resolve_name or "nodejs-default",
-            package_manager=package_manager_command,
-            package_manager_version=package_manager_version,
+            package_manager=PackageManager.from_string(package_manager),
             pnpm_workspace=pnpm_workspaces.for_root(project.root_dir),
         )
 
@@ -211,7 +178,7 @@ class ProjectPaths:
 
 
 async def _get_default_resolve_name(path: str) -> str:
-    stripped = await Get(StrippedFileName, StrippedFileNameRequest(path))
+    stripped = await strip_file_name(StrippedFileNameRequest(path))
     return stripped.value.replace(os.path.sep, ".")
 
 
@@ -222,12 +189,20 @@ async def find_node_js_projects(
     nodejs: NodeJS,
     resolve_names: UserChosenNodeJSResolveAliases,
 ) -> AllNodeJSProjects:
-    project_paths = (
-        ProjectPaths(pkg.root_dir, ["", *pkg.workspaces])
-        if pkg not in pnpm_workspaces
-        else ProjectPaths(pkg.root_dir, ["", *pnpm_workspaces[pkg].packages])
-        for pkg in package_workspaces
-    )
+    project_paths = []
+    for pkg in package_workspaces:
+        package_manager = pkg.package_manager or nodejs.default_package_manager
+        if (
+            package_manager and PackageManager.from_string(package_manager).name == "pnpm"
+        ):  # case for pnpm
+            if pkg in pnpm_workspaces:
+                project_paths.append(
+                    ProjectPaths(pkg.root_dir, ["", *pnpm_workspaces[pkg].packages])
+                )
+            else:
+                project_paths.append(ProjectPaths(pkg.root_dir, [""]))
+        else:  # case for npm, yarn
+            project_paths.append(ProjectPaths(pkg.root_dir, ["", *pkg.workspaces]))
 
     node_js_projects = {
         _TentativeProject(
@@ -301,14 +276,14 @@ def _merge_workspaces(node_js_projects: set[_TentativeProject]) -> Iterable[_Ten
 
 
 def _ensure_one_parent(
-    project_to_parents: dict[_TentativeProject, list[_TentativeProject]]
+    project_to_parents: dict[_TentativeProject, list[_TentativeProject]],
 ) -> None:
     for project, parents in project_to_parents.items():
         if len(parents) > 1:
             raise ValueError(
                 softwrap(
                     f"""
-                    Nodejs projects {', '.join(parent.root_dir for parent in parents)}
+                    Nodejs projects {", ".join(parent.root_dir for parent in parents)}
                     are specifying {project.root_dir} to be part of their workspaces.
 
                     A package can only be part of one project.

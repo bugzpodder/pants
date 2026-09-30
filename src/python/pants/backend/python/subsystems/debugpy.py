@@ -9,11 +9,13 @@ from pants.core.subsystems.debug_adapter import DebugAdapterSubsystem
 from pants.engine.rules import collect_rules
 from pants.option.option_types import ArgsListOption
 
+# pants: infer-dep(debugpy.lock*)
+
 
 class DebugPy(PythonToolBase):
     options_scope = "debugpy"
     name = options_scope
-    help = "An implementation of the Debug Adapter Protocol for Python (https://github.com/microsoft/debugpy)."
+    help_short = "An implementation of the Debug Adapter Protocol for Python (https://github.com/microsoft/debugpy)."
 
     default_main = EntryPoint("debugpy")
     default_requirements = ["debugpy>=1.6.5,<1.7"]

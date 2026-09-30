@@ -9,23 +9,24 @@ from pants.core.util_rules.config_files import ConfigFilesRequest
 from pants.option.option_types import ArgsListOption, FileOption, SkipOption
 from pants.util.strutil import help_text, softwrap
 
+# pants: infer-dep(pytype.lock*)
+
 
 class Pytype(PythonToolBase):
     options_scope = "pytype"
     name = "Pytype"
-    help = help_text(
+    help_short = help_text(
         """
         The Pytype utility for typechecking Python code
         (https://github.com/google/pytype).
         """
     )
 
-    register_interpreter_constraints = True
-    default_interpreter_constraints = ["CPython>=3.7,<3.11"]
-
     default_main = ConsoleScript("pytype")
-    default_requirements = ["pytype==2023.6.16"]
-    default_version = "pytype@2023.6.16"
+    default_requirements = ["pytype==2024.9.13"]
+    default_version = "pytype@2024.9.13"
+
+    register_interpreter_constraints = True
 
     default_lockfile_resource = ("pants.backend.python.typecheck.pytype", "pytype.lock")
 

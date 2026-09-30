@@ -7,26 +7,25 @@ import inspect
 import itertools
 import logging
 import sys
+import threading
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from functools import partial
-from typing import Any, Callable, Iterator, List, Sequence, get_type_hints
+from dataclasses import dataclass
+from types import ModuleType
+from typing import Any, get_type_hints
 
 import typing_extensions
 
 from pants.base.exceptions import RuleTypeError
+from pants.engine.internals.native_engine import RuleCallTrampoline
 from pants.engine.internals.selectors import (
-    Awaitable,
     AwaitableConstraints,
-    Effect,
-    GetParseError,
-    MultiGet,
+    concurrently,
 )
 from pants.util.memo import memoized
 from pants.util.strutil import softwrap
-from pants.util.typing import patch_forward_ref
 
 logger = logging.getLogger(__name__)
-patch_forward_ref()
 
 
 def _get_starting_indent(source: str) -> int:
@@ -53,12 +52,115 @@ def _node_str(node: Any) -> str:
     return str(node)
 
 
+PANTS_RULE_SCAN_MODULE_KEY = "__pants_rule_scan__"
+_rule_descriptors_lock = threading.RLock()
+
+
+@dataclass(frozen=True)
+class RuleDescriptor:
+    """The data we glean about a rule by examining its AST.
+
+    This will be lazily invoked in the first `@rule` decorator in a module. Therefore it will parse
+    the AST *before* the module code is fully evaluated, and so the return type may not yet exist as
+    a parsed type. So we store it here as a str and look it up later.
+    """
+
+    module_name: str
+    rule_name: str
+    return_type: str
+
+    @property
+    def rule_id(self) -> str:
+        # TODO: Handle canonical_name/canonical_name_suffix?
+        return f"{self.module_name}.{self.rule_name}"
+
+
+def get_module_scope_rules(module: ModuleType) -> tuple[RuleDescriptor, ...]:
+    """Get descriptors for @rules defined at the top level of the given module.
+
+    We discover these top-level rules and rule helpers in the module by examining the AST.
+    This means that while executing the `@rule` decorator of a rule1(), the descriptor of a rule2()
+    defined later in the module is already known.  This allows rule1() and rule2() to be
+    mutually recursive.
+
+    Note that we don't support recursive rules defined dynamically in inner scopes.
+    """
+    with _rule_descriptors_lock:
+        descriptors, _ = _scan_module(module)
+        return descriptors
+
+
+_FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+_ModuleScan = tuple[tuple[RuleDescriptor, ...], dict[tuple[str, int], _FunctionNode]]
+
+
+def _scan_module(module: ModuleType) -> _ModuleScan:
+    """Parse the module source once, extracting rule descriptors and a function-node index."""
+    cached: _ModuleScan | None = getattr(module, PANTS_RULE_SCAN_MODULE_KEY, None)
+    if cached is not None:
+        return cached
+
+    tree = ast.parse(inspect.getsource(module))
+    index: dict[tuple[str, int], _FunctionNode] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, _FunctionNode):
+            # A code object's co_firstlineno points at the first decorator, if any.
+            first_lineno = node.decorator_list[0].lineno if node.decorator_list else node.lineno
+            index.setdefault((node.name, first_lineno), node)
+    descriptors = tuple(
+        RuleDescriptor(module.__name__, node.name, node.returns.id)
+        for node in ast.iter_child_nodes(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and isinstance(node.returns, ast.Name)
+    )
+    result: _ModuleScan = (descriptors, index)
+    setattr(module, PANTS_RULE_SCAN_MODULE_KEY, result)
+    return result
+
+
+def release_module_scans() -> None:
+    with _rule_descriptors_lock:
+        for module in list(sys.modules.values()):
+            if module is not None and hasattr(module, PANTS_RULE_SCAN_MODULE_KEY):
+                try:
+                    delattr(module, PANTS_RULE_SCAN_MODULE_KEY)
+                except AttributeError:
+                    pass
+
+
+def _get_function_node(func: Callable) -> _FunctionNode | None:
+    module = sys.modules.get(func.__module__)
+    if module is None:
+        return None
+    with _rule_descriptors_lock:
+        try:
+            _, index = _scan_module(module)
+        except (OSError, SyntaxError, TypeError):
+            return None
+    return index.get((func.__name__, func.__code__.co_firstlineno))
+
+
 class _TypeStack:
+    """The types and rules that a @rule can refer to in its input/outputs, or its awaitables.
+
+    We construct this data through a mix of inspection of types already parsed by Python,
+    and descriptors we infer from the AST. This allows us to support mutual recursion between
+    rules defined in the same module (the @rule descriptor of the earlier rule can know enough
+    about the later rule it calls to set up its own awaitables correctly).
+
+    This logic is necessarily heuristic. It works for well-behaved code, but may be defeated
+    by metaprogramming, aliasing, shadowing and so on.
+    """
+
     def __init__(self, func: Callable) -> None:
         self._stack: list[dict[str, Any]] = []
         self.root = sys.modules[func.__module__]
+
+        # We fall back to descriptors last, so that we get parsed objects whenever possible,
+        # as those are less susceptible to limitations of the heuristics.
+        self.push({descr.rule_name: descr for descr in get_module_scope_rules(self.root)})
         self.push(self.root)
         self._push_function_closures(func)
+        # Rule args will be pushed later, as we handle them.
 
     def __getitem__(self, name: str) -> Any:
         for ns in reversed(self._stack):
@@ -70,13 +172,14 @@ class _TypeStack:
         self._stack[-1][name] = value
 
     def _push_function_closures(self, func: Callable) -> None:
-        try:
-            closurevars = [c for c in inspect.getclosurevars(func) if isinstance(c, dict)]
-        except ValueError:
-            return
-
-        for closures in closurevars:
-            self.push(closures)
+        nonlocals = {}
+        for name, cell in zip(func.__code__.co_freevars, getattr(func, "__closure__", None) or ()):
+            try:
+                nonlocals[name] = cell.cell_contents
+            except ValueError:
+                continue
+        if nonlocals:
+            self.push(nonlocals)
 
     def push(self, frame: object) -> None:
         ns = dict(frame if isinstance(frame, dict) else frame.__dict__)
@@ -118,31 +221,36 @@ def _lookup_return_type(func: Callable, check: bool = False) -> Any:
     return ret
 
 
-def _returns_awaitable(func: Any) -> bool:
-    if not callable(func):
-        return False
-    ret = _lookup_return_type(func)
-    if not isinstance(ret, tuple):
-        ret = (ret,)
-    return any(issubclass(r, Awaitable) for r in ret if isinstance(r, type))
-
-
 class _AwaitableCollector(ast.NodeVisitor):
     def __init__(self, func: Callable):
+        # `func` may be a RuleCallTrampoline (the return value of an `@rule`-decorated
+        # function). `inspect.getsource` and friends only know about real Python functions,
+        # so follow `__wrapped__` to reach the underlying implementation.
+        if isinstance(func, RuleCallTrampoline):
+            func = func.__wrapped__
         self.func = func
-        source = inspect.getsource(func) or "<string>"
-        beginning_indent = _get_starting_indent(source)
-        if beginning_indent:
-            source = "\n".join(line[beginning_indent:] for line in source.split("\n"))
-
-        self.source_file = inspect.getsourcefile(func)
-
+        self.source_file = inspect.getsourcefile(func) or "<unknown>"
         self.types = _TypeStack(func)
-        self.awaitables: List[AwaitableConstraints] = []
-        self.visit(ast.parse(source))
+        self.awaitables: list[AwaitableConstraints] = []
+
+        node = _get_function_node(func)
+        if node is not None:
+            self._lineno_offset = 0
+            self.visit(node)
+        else:
+            # Fall back to per-function `inspect.getsource` when the function has no
+            # discoverable module source, e.g. it was built dynamically.
+            source = inspect.getsource(func) or "<string>"
+            beginning_indent = _get_starting_indent(source)
+            if beginning_indent:
+                source = "\n".join(line[beginning_indent:] for line in source.split("\n"))
+            self._lineno_offset = self.func.__code__.co_firstlineno - 1
+            self.visit(ast.parse(source))
 
     def _format(self, node: ast.AST, msg: str) -> str:
-        lineno = node.lineno + self.func.__code__.co_firstlineno - 1
+        lineno: str = "<unknown>"
+        if isinstance(node, (ast.expr, ast.stmt)):
+            lineno = str(node.lineno + self._lineno_offset)
         return f"{self.source_file}:{lineno}: {msg}"
 
     def _lookup(self, attr: ast.expr) -> Any:
@@ -193,7 +301,7 @@ class _AwaitableCollector(ast.NodeVisitor):
             )
         return resolved
 
-    def _get_inputs(self, input_nodes: Sequence[Any]) -> tuple[Sequence[Any], List[Any]]:
+    def _get_inputs(self, input_nodes: Sequence[Any]) -> tuple[Sequence[Any], list[Any]]:
         if not input_nodes:
             return input_nodes, []
         if len(input_nodes) != 1:
@@ -216,43 +324,15 @@ class _AwaitableCollector(ast.NodeVisitor):
         else:
             return input_nodes, [self._lookup(n) for n in input_nodes]
 
-    def _get_legacy_awaitable(self, call_node: ast.Call, is_effect: bool) -> AwaitableConstraints:
-        get_args = call_node.args
-        parse_error = partial(GetParseError, get_args=get_args, source_file_name=self.source_file)
-
-        if len(get_args) not in (1, 2, 3):
-            # TODO: fix parse error message formatting... (TODO: create ticket)
-            raise parse_error(
-                self._format(
-                    call_node,
-                    f"Expected one to three arguments, but got {len(get_args)} arguments.",
-                )
-            )
-
-        output_node = get_args[0]
-        output_type = self._lookup(output_node)
-
-        input_nodes, input_types = self._get_inputs(get_args[1:])
-
-        return AwaitableConstraints(
-            None,
-            self._check_constraint_arg_type(output_type, output_node),
-            0,
-            tuple(
-                self._check_constraint_arg_type(input_type, input_node)
-                for input_type, input_node in zip(input_types, input_nodes)
-            ),
-            is_effect,
-        )
-
     def _get_byname_awaitable(
-        self, rule_id: str, rule_func: Callable, call_node: ast.Call
+        self, rule_id: str, rule_func: Callable | RuleDescriptor, call_node: ast.Call
     ) -> AwaitableConstraints:
-        parse_error = partial(
-            GetParseError, get_args=call_node.args, source_file_name=self.source_file
-        )
-
-        output_type = _lookup_return_type(rule_func, check=True)
+        if isinstance(rule_func, RuleDescriptor):
+            # At this point we expect the return type to be defined, so its source code
+            # must precede that of the rule invoking the awaitable that returns it.
+            output_type = self.types[rule_func.return_type]
+        else:
+            output_type = _lookup_return_type(rule_func, check=True)
 
         # To support explicit positional arguments, we record the number passed positionally.
         # TODO: To support keyword arguments, we would additionally need to begin recording the
@@ -274,11 +354,12 @@ class _AwaitableCollector(ast.NodeVisitor):
                 for input_type, input_node in zip(input_type_nodes, input_nodes)
             )
         else:
-            raise parse_error(
-                self._format(
-                    call_node,
-                    "Expected an `**implicitly(..)` application as the only keyword input.",
-                )
+            explanation = self._format(
+                call_node,
+                "Expected an `**implicitly(..)` application as the only keyword input.",
+            )
+            raise ValueError(
+                f"Invalid call. {explanation} failed in a call to {rule_id} in {self.source_file}."
             )
 
         return AwaitableConstraints(
@@ -286,24 +367,17 @@ class _AwaitableCollector(ast.NodeVisitor):
             output_type,
             explicit_args_arity,
             input_types,
-            # TODO: Extract this from the callee? Currently only intrinsics can be Effects, so need
-            # to figure out their new syntax first.
-            is_effect=False,
         )
 
     def visit_Call(self, call_node: ast.Call) -> None:
         func = self._lookup(call_node.func)
         if func is not None:
-            if isinstance(func, type) and issubclass(func, Awaitable):
-                # Is a `Get`/`Effect`.
-                self.awaitables.append(
-                    self._get_legacy_awaitable(call_node, is_effect=issubclass(func, Effect))
-                )
-            elif inspect.isfunction(func) and (rule := getattr(func, "rule", None)) is not None:
+            if (
+                inspect.isfunction(func) or isinstance(func, (RuleDescriptor, RuleCallTrampoline))
+            ) and (rule_id := getattr(func, "rule_id", None)) is not None:
                 # Is a direct `@rule` call.
-                rule_id = rule.canonical_name
                 self.awaitables.append(self._get_byname_awaitable(rule_id, func, call_node))
-            elif inspect.iscoroutinefunction(func) or _returns_awaitable(func):
+            elif inspect.iscoroutinefunction(func):
                 # Is a call to a "rule helper".
                 self.awaitables.extend(collect_awaitables(func))
 
@@ -343,7 +417,7 @@ class _AwaitableCollector(ast.NodeVisitor):
                 continue
             if isinstance(node, ast.Call):
                 f = self._lookup(node.func)
-                if f is MultiGet:
+                if f is concurrently:
                     value = tuple(get.output_type for get in collected_awaitables)
                 elif f is not None:
                     value = _lookup_return_type(f)
@@ -381,5 +455,5 @@ class _AwaitableCollector(ast.NodeVisitor):
 
 
 @memoized
-def collect_awaitables(func: Callable) -> List[AwaitableConstraints]:
+def collect_awaitables(func: Callable) -> list[AwaitableConstraints]:
     return _AwaitableCollector(func).awaitables

@@ -9,20 +9,27 @@ from pants.base.build_root import BuildRoot
 from pants.bsp.protocol import BSPHandlerMapping
 from pants.bsp.spec.base import BuildTargetIdentifier
 from pants.bsp.util_rules.lifecycle import BSPLanguageSupport
+from pants.bsp.util_rules.queries import compute_handler_query_rules
 from pants.bsp.util_rules.targets import (
     BSPBuildTargetsMetadataRequest,
     BSPBuildTargetsMetadataResult,
     BSPCompileRequest,
     BSPCompileResult,
+    BSPDependencyModulesRequest,
+    BSPDependencyModulesResult,
+    BSPDependencySourcesRequest,
+    BSPDependencySourcesResult,
     BSPResourcesRequest,
     BSPResourcesResult,
 )
-from pants.engine.internals.selectors import Get, MultiGet
-from pants.engine.rules import collect_rules, rule
+from pants.engine.internals.selectors import concurrently
+from pants.engine.rules import collect_rules, implicitly, rule
 from pants.engine.target import FieldSet
 from pants.engine.unions import UnionRule
 from pants.jvm.bsp.compile import _jvm_bsp_compile, jvm_classes_directory
 from pants.jvm.bsp.compile import rules as jvm_compile_rules
+from pants.jvm.bsp.dependencies import _jvm_bsp_dependency_modules, _jvm_bsp_dependency_sources
+from pants.jvm.bsp.dependencies import rules as jvm_dependencies_rules
 from pants.jvm.bsp.resources import _jvm_bsp_resources
 from pants.jvm.bsp.resources import rules as jvm_resources_rules
 from pants.jvm.compile import ClasspathEntryRequestFactory
@@ -105,8 +112,9 @@ async def handle_bsp_java_options_request(
 
 @rule
 async def bsp_javac_options_request(request: JavacOptionsParams) -> JavacOptionsResult:
-    results = await MultiGet(
-        Get(HandleJavacOptionsResult, HandleJavacOptionsRequest(btgt)) for btgt in request.targets
+    results = await concurrently(
+        handle_bsp_java_options_request(HandleJavacOptionsRequest(btgt), **implicitly())
+        for btgt in request.targets
     )
     return JavacOptionsResult(items=tuple(result.item for result in results))
 
@@ -148,14 +156,49 @@ async def bsp_java_resources_request(
     return result
 
 
+# -----------------------------------------------------------------------------------------------
+# Dependency Modules / Sources
+# -----------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class JavaBSPDependencyModulesRequest(BSPDependencyModulesRequest):
+    field_set_type = JavaMetadataFieldSet
+
+
+@rule
+async def java_bsp_dependency_modules(
+    request: JavaBSPDependencyModulesRequest,
+    build_root: BuildRoot,
+) -> BSPDependencyModulesResult:
+    return await _jvm_bsp_dependency_modules(request, build_root)
+
+
+@dataclass(frozen=True)
+class JavaBSPDependencySourcesRequest(BSPDependencySourcesRequest):
+    field_set_type = JavaMetadataFieldSet
+
+
+@rule
+async def java_bsp_dependency_sources(
+    request: JavaBSPDependencySourcesRequest,
+    build_root: BuildRoot,
+) -> BSPDependencySourcesResult:
+    return await _jvm_bsp_dependency_sources(request, build_root)
+
+
 def rules():
-    return (
+    base_rules = (
         *collect_rules(),
         *jvm_compile_rules(),
+        *jvm_dependencies_rules(),
         *jvm_resources_rules(),
         UnionRule(BSPLanguageSupport, JavaBSPLanguageSupport),
         UnionRule(BSPBuildTargetsMetadataRequest, JavaBSPBuildTargetsMetadataRequest),
         UnionRule(BSPHandlerMapping, JavacOptionsHandlerMapping),
         UnionRule(BSPCompileRequest, JavaBSPCompileRequest),
         UnionRule(BSPResourcesRequest, JavaBSPResourcesRequest),
+        UnionRule(BSPDependencyModulesRequest, JavaBSPDependencyModulesRequest),
+        UnionRule(BSPDependencySourcesRequest, JavaBSPDependencySourcesRequest),
     )
+    return (*base_rules, *compute_handler_query_rules(base_rules))

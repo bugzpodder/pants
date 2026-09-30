@@ -7,9 +7,10 @@ import logging
 import os
 from abc import ABCMeta
 from collections import defaultdict, deque
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import ClassVar, Iterable, Iterator, Sequence
+from typing import ClassVar
 
 from pants.core.target_types import (
     FilesGeneratingSourcesField,
@@ -20,9 +21,8 @@ from pants.engine.collection import Collection
 from pants.engine.engine_aware import EngineAwareReturnType
 from pants.engine.environment import EnvironmentName
 from pants.engine.fs import Digest
-from pants.engine.internals.selectors import Get, MultiGet
 from pants.engine.process import FallibleProcessResult
-from pants.engine.rules import collect_rules, rule
+from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import (
     CoarsenedTarget,
     Field,
@@ -94,6 +94,14 @@ class ClasspathEntryRequest(metaclass=ABCMeta):
 class ClasspathEntryRequestFactory:
     impls: tuple[type[ClasspathEntryRequest], ...]
     generator_sources: FrozenDict[type[ClasspathEntryRequest], frozenset[type[SourcesField]]]
+    # Inverse of `generator_sources`: for each `SourcesField` that some codegen implementation
+    # generates from, the impls whose codegen consumes it. When more than one impl shares an
+    # input (e.g. both the Java and Scala protobuf codegen backends consume `ProtobufSourceField`),
+    # `classify_impl` uses this to tell that a target is only ambiguous in the abstract -- a
+    # concrete dependency edge can disambiguate by preferring whichever impl is doing the asking.
+    impls_by_generator_source: FrozenDict[
+        type[SourcesField], frozenset[type[ClasspathEntryRequest]]
+    ]
 
     def for_targets(
         self,
@@ -101,11 +109,17 @@ class ClasspathEntryRequestFactory:
         resolve: CoursierResolveKey,
         *,
         root: bool = False,
+        preferred_impl: type[ClasspathEntryRequest] | None = None,
     ) -> ClasspathEntryRequest:
         """Constructs a subclass compatible with the members of the CoarsenedTarget.
 
         If the CoarsenedTarget is a root of a compile graph, pass `root=True` to allow usage of
         request types which are marked `root_only`.
+
+        If this component is being resolved as the dependency of another JVM component (rather
+        than as a root), pass that component's own request type as `preferred_impl`: it lets an
+        otherwise-ambiguous codegen input (consumed by more than one JVM language's codegen) be
+        resolved unambiguously, by preferring whichever language is actually asking for it.
         """
 
         compatible = []
@@ -113,7 +127,7 @@ class ClasspathEntryRequestFactory:
         consume_only = []
         impls = self.impls
         for impl in impls:
-            classification = self.classify_impl(impl, component)
+            classification = self.classify_impl(impl, component, preferred_impl=preferred_impl)
             if classification == _ClasspathEntryRequestClassification.INCOMPATIBLE:
                 continue
             elif classification == _ClasspathEntryRequestClassification.COMPATIBLE:
@@ -138,8 +152,8 @@ class ClasspathEntryRequestFactory:
             if set(partial[0].field_sets).issubset(set(consume_only[0].field_sets_consume_only)):
                 return partial[0](component, resolve, consume_only[0](component, resolve, None))
 
-        impls_str = ", ".join(sorted(impl.__name__ for impl in impls))
         if compatible:
+            impls_str = ", ".join(sorted(impl.__name__ for impl in compatible))
             raise ClasspathSourceAmbiguity(
                 f"More than one JVM classpath provider ({impls_str}) was compatible with "
                 f"the inputs:\n{component.bullet_list()}"
@@ -148,16 +162,29 @@ class ClasspathEntryRequestFactory:
             # TODO: There is more subtlety of error messages possible here if there are multiple
             # partial providers, but can cross that bridge when we have them (multiple Scala or Java
             # compiler implementations, for example).
+            impls_str = ", ".join(sorted(impl.__name__ for impl in impls))
             raise ClasspathSourceMissing(
                 f"No JVM classpath providers (from: {impls_str}) were compatible with the "
                 f"combination of inputs:\n{component.bullet_list()}"
             )
 
     def classify_impl(
-        self, impl: type[ClasspathEntryRequest], component: CoarsenedTarget
+        self,
+        impl: type[ClasspathEntryRequest],
+        component: CoarsenedTarget,
+        *,
+        preferred_impl: type[ClasspathEntryRequest] | None = None,
     ) -> _ClasspathEntryRequestClassification:
         targets = component.members
         generator_sources = self.generator_sources.get(impl) or frozenset()
+
+        def is_claimed_by(field: type[SourcesField]) -> bool:
+            sharing_impls = self.impls_by_generator_source.get(field) or frozenset()
+            if preferred_impl is not None and impl in sharing_impls and len(sharing_impls) > 1:
+                # More than one impl's codegen can consume this field: only the preferred impl
+                # (i.e. the concrete dependent that is asking) claims it.
+                return impl == preferred_impl
+            return True
 
         def is_compatible(target: Target) -> bool:
             return (
@@ -165,13 +192,13 @@ class ClasspathEntryRequestFactory:
                 any(fs.is_applicable(target) for fs in impl.field_sets)
                 or
                 # Is applicable via generated sources.
-                any(target.has_field(g) for g in generator_sources)
+                any(target.has_field(g) and is_claimed_by(g) for g in generator_sources)
                 or
                 # Is applicable via a generator.
                 (
                     isinstance(target, TargetFilesGenerator)
                     and any(
-                        field in target.generated_target_cls.core_fields
+                        field in target.generated_target_cls.core_fields and is_claimed_by(field)
                         for field in generator_sources
                     )
                 )
@@ -192,7 +219,9 @@ class ClasspathEntryRequestFactory:
 
 
 @rule
-def calculate_jvm_request_types(union_membership: UnionMembership) -> ClasspathEntryRequestFactory:
+async def calculate_jvm_request_types(
+    union_membership: UnionMembership,
+) -> ClasspathEntryRequestFactory:
     cpe_impls = union_membership.get(ClasspathEntryRequest)
 
     impls_by_source: dict[type[Field], type[ClasspathEntryRequest]] = {}
@@ -203,17 +232,28 @@ def calculate_jvm_request_types(union_membership: UnionMembership) -> ClasspathE
                 # (note that subsequently, we only check for `SourceFields`, so no need to filter)
                 impls_by_source[field] = impl
 
-    # Classify code generator sources by their CPE impl
+    # Classify code generator sources by their CPE impl, and build the reverse mapping from a
+    # generator's input field to every impl whose codegen consumes it.
     sources_by_impl_: dict[type[ClasspathEntryRequest], list[type[SourcesField]]] = defaultdict(
         list
+    )
+    impls_by_generator_source_: dict[type[SourcesField], set[type[ClasspathEntryRequest]]] = (
+        defaultdict(set)
     )
 
     for g in union_membership.get(GenerateSourcesRequest):
         if g.output in impls_by_source:
-            sources_by_impl_[impls_by_source[g.output]].append(g.input)
+            impl = impls_by_source[g.output]
+            sources_by_impl_[impl].append(g.input)
+            impls_by_generator_source_[g.input].add(impl)
     sources_by_impl = FrozenDict((key, frozenset(value)) for key, value in sources_by_impl_.items())
+    impls_by_generator_source = FrozenDict(
+        (key, frozenset(value)) for key, value in impls_by_generator_source_.items()
+    )
 
-    return ClasspathEntryRequestFactory(tuple(cpe_impls), sources_by_impl)
+    return ClasspathEntryRequestFactory(
+        tuple(cpe_impls), sources_by_impl, impls_by_generator_source
+    )
 
 
 @dataclass(frozen=True)
@@ -380,6 +420,14 @@ class FallibleClasspathEntry(EngineAwareReturnType):
         return self.exit_code == 0
 
 
+@rule(polymorphic=True)
+async def get_fallible_classpath_entry(
+    req: ClasspathEntryRequest,
+    environment_name: EnvironmentName,
+) -> FallibleClasspathEntry:
+    raise NotImplementedError()
+
+
 class ClasspathEntryRequests(Collection[ClasspathEntryRequest]):
     pass
 
@@ -396,7 +444,7 @@ class ClasspathDependenciesRequest:
 
 
 @rule
-def required_classfiles(fallible_result: FallibleClasspathEntry) -> ClasspathEntry:
+async def required_classfiles(fallible_result: FallibleClasspathEntry) -> ClasspathEntry:
     if fallible_result.result == CompileResult.SUCCEEDED:
         assert fallible_result.output
         return fallible_result.output
@@ -407,7 +455,7 @@ def required_classfiles(fallible_result: FallibleClasspathEntry) -> ClasspathEnt
 
 
 @rule
-def classpath_dependency_requests(
+async def classpath_dependency_requests(
     classpath_entry_request: ClasspathEntryRequestFactory, request: ClasspathDependenciesRequest
 ) -> ClasspathEntryRequests:
     def ignore_because_generated(coarsened_dep: CoarsenedTarget) -> bool:
@@ -431,7 +479,9 @@ def classpath_dependency_requests(
 
     return ClasspathEntryRequests(
         classpath_entry_request.for_targets(
-            component=coarsened_dep, resolve=request.request.resolve
+            component=coarsened_dep,
+            resolve=request.request.resolve,
+            preferred_impl=type(request.request),
         )
         for coarsened_dep in request.request.component.dependencies
         if not ignore_because_generated(coarsened_dep) and not ignore_because_file(coarsened_dep)
@@ -441,8 +491,9 @@ def classpath_dependency_requests(
 @rule
 async def compile_classpath_entries(requests: ClasspathEntryRequests) -> FallibleClasspathEntries:
     return FallibleClasspathEntries(
-        await MultiGet(
-            Get(FallibleClasspathEntry, ClasspathEntryRequest, request) for request in requests
+        await concurrently(
+            get_fallible_classpath_entry(**implicitly({request: ClasspathEntryRequest}))
+            for request in requests
         )
     )
 

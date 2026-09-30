@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import functools
 from textwrap import dedent
 
@@ -37,19 +38,20 @@ def parse_address_map(build_file: str, *, ignore_unrecognized_symbols: bool = Fa
     parser = Parser(
         build_root="",
         registered_target_types=RegisteredTargetTypes({"thing": GenericTarget}),
-        union_membership=UnionMembership({}),
+        union_membership=UnionMembership.empty(),
         object_aliases=BuildFileAliases(),
         ignore_unrecognized_symbols=ignore_unrecognized_symbols,
     )
     address_map = AddressMap.parse(
         path,
         build_file,
+        ast.parse(build_file),
         parser,
         BuildFilePreludeSymbols(FrozenDict(), ()),
         EnvironmentVars({}),
         False,
         BuildFileDefaultsParserState.create(
-            "", BuildFileDefaults({}), RegisteredTargetTypes({}), UnionMembership({})
+            "", BuildFileDefaults({}), RegisteredTargetTypes({}), UnionMembership.empty()
         ),
         dependents_rules=None,
         dependencies_rules=None,
@@ -115,12 +117,12 @@ def test_address_family_create_single() -> None:
     address_family = AddressFamily.create(
         "",
         [
-            AddressMap(
+            AddressMap.create(
                 "0",
-                {
-                    "one": TargetAdaptor(type_alias="thing", name="one", age=42),
-                    "two": TargetAdaptor(type_alias="thing", name="two", age=37),
-                },
+                [
+                    TargetAdaptor(type_alias="thing", name="one", age=42),
+                    TargetAdaptor(type_alias="thing", name="two", age=37),
+                ],
             )
         ],
     )
@@ -135,11 +137,11 @@ def test_address_family_create_multiple() -> None:
     address_family = AddressFamily.create(
         "name/space",
         [
-            AddressMap(
-                "name/space/0", {"one": TargetAdaptor(type_alias="thing", name="one", age=42)}
+            AddressMap.create(
+                "name/space/0", [TargetAdaptor(type_alias="thing", name="one", age=42)]
             ),
-            AddressMap(
-                "name/space/1", {"two": TargetAdaptor(type_alias="thing", name="two", age=37)}
+            AddressMap.create(
+                "name/space/1", [TargetAdaptor(type_alias="thing", name="two", age=37)]
             ),
         ],
     )
@@ -165,7 +167,8 @@ def test_address_family_create_empty() -> None:
 def test_address_family_mismatching_paths() -> None:
     with pytest.raises(DifferingFamiliesError):
         AddressFamily.create(
-            "one", [AddressMap("/dev/null/one/0", {}), AddressMap("/dev/null/two/0", {})]
+            "one",
+            [AddressMap.create("/dev/null/one/0", []), AddressMap.create("/dev/null/two/0", [])],
         )
 
 
@@ -174,11 +177,11 @@ def test_address_family_duplicate_names() -> None:
         AddressFamily.create(
             "name/space",
             [
-                AddressMap(
-                    "name/space/0", {"one": TargetAdaptor(type_alias="thing", name="one", age=42)}
+                AddressMap.create(
+                    "name/space/0", [TargetAdaptor(type_alias="thing", name="one", age=42)]
                 ),
-                AddressMap(
-                    "name/space/1", {"one": TargetAdaptor(type_alias="thing", name="one", age=37)}
+                AddressMap.create(
+                    "name/space/1", [TargetAdaptor(type_alias="thing", name="one", age=37)]
                 ),
             ],
         )

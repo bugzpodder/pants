@@ -3,9 +3,27 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+from pants.engine.fs import FileDigest
+from pants.engine.process import ProcessCacheScope
+from pants.jvm.resolve.coordinate import Coordinate, InvalidCoordinateString
 from pants.option.option_types import BoolOption, DictOption, IntOption, StrListOption, StrOption
 from pants.option.subsystem import Subsystem
+from pants.util.memo import memoized_property
 from pants.util.strutil import help_text, softwrap
+
+
+@dataclass(frozen=True)
+class NailgunServer:
+    coordinate: Coordinate
+    main_class: str
+    file_digest: FileDigest
+
+    @property
+    def file_name(self) -> str:
+        c = self.coordinate
+        return f"{c.group}_{c.artifact}_{c.version}.jar"
 
 
 class JvmSubsystem(Subsystem):
@@ -100,6 +118,24 @@ class JvmSubsystem(Subsystem):
         ),
         advanced=True,
     )
+    deploy_jar_exclude_files = StrListOption(
+        default=[
+            # Signature files.
+            r"^META-INF/[^/]+\.SF$",
+            r"^META-INF/[^/]+\.DSA$",
+            r"^META-INF/[^/]+\.RSA$",
+            # interferes with Class-Path: see man jar for i option.
+            "META-INF/INDEX.LIST$",
+        ],
+        help=softwrap(
+            """
+            A list of patterns to exclude from all deploy jars.
+            An individual deploy_jar target can also exclude other files, in addition to these,
+            by setting its `exclude_files` field.
+            """
+        ),
+    )
+
     # See https://github.com/pantsbuild/pants/issues/14937 for discussion of one way to improve
     # our behavior around cancellation with nailgun.
     nailgun_remote_cache_speculation_delay = IntOption(
@@ -119,3 +155,114 @@ class JvmSubsystem(Subsystem):
         ),
         advanced=True,
     )
+
+    intermediate_jars_remote_cache = BoolOption(
+        default=False,
+        help=softwrap(
+            """
+            If intermediate jars produced by compiling jvm targets should be remote cached.
+
+            This is a trade off between forking short-lived processes for each compiled target
+            and remote cache overhead.
+            """
+        ),
+        advanced=True,
+    )
+
+    intermediate_jars_remote_cache_speculation_delay = IntOption(
+        default=100,
+        help=softwrap(
+            """
+            The time in milliseconds to delay speculation of creating intermediate jars while
+            reading from the remote cache.
+
+            Tuning this can allow for reducing the amount of short-lived processes forked for
+            each compiled target when they are cached remotely.
+            """
+        ),
+        advanced=True,
+    )
+
+    @property
+    def intermediate_jar_cache_scope(self) -> ProcessCacheScope:
+        return self.intermediate_jar_cache_scope_for(eligible=True)
+
+    def intermediate_jar_cache_scope_for(self, *, eligible: bool) -> ProcessCacheScope:
+        """Derives the correct cache scope based on global config and local eligibility."""
+        if eligible and self.intermediate_jars_remote_cache:
+            return ProcessCacheScope.SUCCESSFUL
+        return ProcessCacheScope.LOCAL_SUCCESSFUL
+
+    _nailgun_server = StrOption(
+        default="com.martiansoftware:nailgun-server:0.9.1#com.martiansoftware.nailgun.NGServer",
+        help=softwrap(
+            """
+            The Nailgun server artifact to run, as `group:artifact:version#main.class.Name`.
+
+            The portion before `#` is a standard Maven coordinate; the portion after `#`
+            is the fully-qualified main class used to start the server.
+            """
+        ),
+        advanced=True,
+    )
+
+    nailgun_jar_digest = StrOption(
+        default="4518faa6bf4bd26fccdc4d85e1625dc679381a08d56872d8ad12151dda9cef25:32927",
+        help=softwrap(
+            """
+            The digest of the Nailgun server JAR, as `sha256:length_in_bytes`,
+            used to verify the artifact fetched for `[jvm].nailgun_server`.
+            """
+        ),
+        advanced=True,
+    )
+
+    nailgun_enable_agent = BoolOption(
+        default=False,
+        help="If enabled, start the Nailgun server with itself as a Java Agent.",
+        advanced=True,
+    )
+
+    @memoized_property
+    def nailgun_server(self) -> NailgunServer:
+        raw = self._nailgun_server
+        coord_str, sep, main_class = raw.partition("#")
+        main_class = main_class.strip()
+        if not sep or not main_class:
+            raise ValueError(
+                softwrap(
+                    f"""
+                    The `[jvm].nailgun_server` option value {raw!r} is missing the main class.
+                    Expected the form `group:artifact:version#main.class.Name`.
+                    """
+                )
+            )
+        try:
+            coordinate = Coordinate.from_coord_str(coord_str)
+        except InvalidCoordinateString as e:
+            raise ValueError(
+                softwrap(
+                    f"""
+                    The `[jvm].nailgun_server` option value {raw!r} is invalid: {e}.
+                    Expected the form `group:artifact:version#main.class.Name`.
+                    """
+                )
+            ) from e
+
+        digest = self.nailgun_jar_digest
+        fingerprint, dsep, length = digest.partition(":")
+        if not fingerprint or not dsep or not length.isdigit():
+            raise ValueError(
+                softwrap(
+                    f"""
+                    The `[jvm].nailgun_jar_digest` option value {digest!r} is invalid.
+                    Expected the form `sha256:length_in_bytes`.
+                    """
+                )
+            )
+
+        return NailgunServer(
+            coordinate=coordinate,
+            main_class=main_class,
+            file_digest=FileDigest(fingerprint=fingerprint, serialized_bytes_length=int(length)),
+        )

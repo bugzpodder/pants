@@ -1,0 +1,466 @@
+// Copyright 2019 Pants project contributors (see CONTRIBUTORS.md).
+// Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures::future::FutureExt;
+use itertools::Itertools;
+use parking_lot::Mutex;
+use tokio::runtime::{Builder, Handle, Runtime};
+use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
+
+/// Tokio's own default. A conservative cap would stall clients rather than bound anything useful.
+const MAX_REQUEST_THREADS: usize = 512;
+
+/// Keeps the blocking pool under LMDB's 126-reader default so a run can't hit
+/// `MDB_READERS_FULL`, no matter how large `--rule-threads-core`/`--rule-threads-max` or the
+/// core count get. See https://github.com/pantsbuild/pants/issues/23652.
+const MAX_BLOCKING_THREADS_LMDB_SAFE: usize = 120;
+
+/// Copy our (thread-local or task-local) stdio destination and current workunit parent into
+/// the task. The former ensures that when a pantsd thread kicks off a future, any stdio done
+/// by it ends up in the pantsd log as we expect. The latter ensures that when a new workunit
+/// is created it has an accurate handle to its parent.
+fn future_with_correct_context<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let stdio_destination = stdio::get_destination();
+    let workunit_store_handle = workunit_store::get_workunit_store_handle();
+
+    // NB: It is important that the first portion of this method is synchronous (meaning that this
+    // method cannot be `async`), because that means that it will run on the thread that calls it.
+    // The second, async portion of the method will run in the spawned Task.
+
+    stdio::scope_task_destination(stdio_destination, async move {
+        workunit_store::scope_task_workunit_store_handle(workunit_store_handle, future).await
+    })
+}
+
+///
+/// Executors come in two flavors:
+/// * "borrowed"
+///     * Created with `Self::new()`, or `self::to_borrowed()`.
+///     * A borrowed Executor will not be shut down when all handles are dropped, and shutdown
+///       methods will have no impact.
+///     * Used when multiple runs of Pants will borrow a single Executor owned by `pantsd`, and in
+///       unit tests where the Runtime is created by macros.
+/// * "owned"
+///     * Created with `Self::new_owned()`.
+///     * When all handles of a owned Executor are dropped, its Runtime will be shut down.
+///       Additionally, the explicit shutdown methods can be used to shut down the Executor for all
+///       clones.
+///
+#[derive(Debug, Clone)]
+pub struct Executor {
+    runtime: Arc<Mutex<Option<Runtime>>>,
+    handle: Handle,
+    request_pool: Arc<Mutex<Option<Runtime>>>,
+    request_pool_handle: Option<Handle>,
+    /// Set by `new_owned`; `None` for `new()`, which borrows an ambient Runtime we don't size.
+    max_blocking_threads: Option<usize>,
+}
+
+impl Executor {
+    ///
+    /// Creates an Executor for an existing tokio::Runtime (generally provided by tokio's macros).
+    ///
+    /// The returned Executor will have a lifecycle independent of the Runtime, meaning that dropping
+    /// all clones of the Executor will not cause the Runtime to be shut down. Likewise, the owner of
+    /// the Runtime must ensure that it is kept alive longer than all Executor instances, because
+    /// existence of a Handle does not prevent a Runtime from shutting down. This is guaranteed by
+    /// the scope of the tokio::{test, main} macros.
+    ///
+    pub fn new() -> Executor {
+        Self {
+            runtime: Arc::new(Mutex::new(None)),
+            handle: Handle::current(),
+            request_pool: Arc::new(Mutex::new(None)),
+            request_pool_handle: None,
+            max_blocking_threads: None,
+        }
+    }
+
+    ///
+    /// Gets a reference to a global static Executor with an owned tokio::Runtime, initializing it
+    /// with the given thread configuration if this is the first usage.
+    ///
+    /// NB: The global static Executor eases lifecycle issues when consumed from Python, where we
+    /// need thread configurability, but also want to know reliably when the Runtime will shutdown
+    /// (which, because it is static, will only be at the entire process' exit).
+    ///
+    pub fn new_owned<F, G>(
+        num_worker_threads: usize,
+        max_threads: usize,
+        on_thread_start: F,
+        on_thread_stop: G,
+    ) -> Result<Executor, String>
+    where
+        F: Fn() + Send + Sync + 'static,
+        G: Fn() + Send + Sync + 'static,
+    {
+        let on_thread_start = Arc::new(on_thread_start);
+        let on_thread_stop = Arc::new(on_thread_stop);
+
+        let requested_blocking_threads = match max_threads.checked_sub(num_worker_threads) {
+            Some(n) if n > 0 => n,
+            _ => {
+                return Err(format!(
+                    "Invalid thread configuration: max_threads ({max_threads}) must be greater than num_worker_threads ({num_worker_threads})."
+                ));
+            }
+        };
+        let max_blocking_threads = requested_blocking_threads.min(MAX_BLOCKING_THREADS_LMDB_SAFE);
+
+        let mut runtime_builder = Builder::new_multi_thread();
+
+        runtime_builder
+            .worker_threads(num_worker_threads)
+            .max_blocking_threads(max_blocking_threads)
+            .enable_all();
+
+        // NB: These run on every runtime-managed thread, including blocking-pool threads, which
+        // tokio expires after an idle keep-alive and respawns on demand. Any per-thread state
+        // created in `on_thread_start` must be torn down in `on_thread_stop`: a leak here is per
+        // thread created, not per pool slot, and so grows without bound in a long-lived pantsd.
+        runtime_builder.on_thread_start({
+            let f = on_thread_start.clone();
+            move || f()
+        });
+        runtime_builder.on_thread_stop({
+            let f = on_thread_stop.clone();
+            move || f()
+        });
+
+        let runtime = runtime_builder
+            .build()
+            .map_err(|e| format!("Failed to start the runtime: {e}"))?;
+
+        // A pool reserved for client requests: see `spawn_request_blocking`. The current-thread
+        // flavor spawns no workers, so this runtime is only its blocking pool.
+        let mut request_pool_builder = Builder::new_current_thread();
+        request_pool_builder
+            .max_blocking_threads(MAX_REQUEST_THREADS)
+            .thread_name("pants-request");
+        request_pool_builder.on_thread_start({
+            let f = on_thread_start.clone();
+            move || f()
+        });
+        request_pool_builder.on_thread_stop({
+            let f = on_thread_stop.clone();
+            move || f()
+        });
+
+        let request_pool = request_pool_builder
+            .build()
+            .map_err(|e| format!("Failed to start the request pool: {e}"))?;
+
+        let handle = runtime.handle().clone();
+        let request_pool_handle = request_pool.handle().clone();
+        Ok(Executor {
+            runtime: Arc::new(Mutex::new(Some(runtime))),
+            handle,
+            request_pool: Arc::new(Mutex::new(Some(request_pool))),
+            request_pool_handle: Some(request_pool_handle),
+            max_blocking_threads: Some(max_blocking_threads),
+        })
+    }
+
+    ///
+    /// Creates a clone of this Executor which is disconnected from shutdown events. See the `Executor`
+    /// rustdoc.
+    ///
+    pub fn to_borrowed(&self) -> Executor {
+        Self {
+            runtime: Arc::new(Mutex::new(None)),
+            handle: self.handle.clone(),
+            request_pool: Arc::new(Mutex::new(None)),
+            request_pool_handle: self.request_pool_handle.clone(),
+            max_blocking_threads: self.max_blocking_threads,
+        }
+    }
+
+    /// The actual blocking-pool thread count, possibly capped below what was requested (see
+    /// `MAX_BLOCKING_THREADS_LMDB_SAFE`). `None` if this Executor wraps an ambient Runtime we
+    /// didn't size ourselves (see `new()`).
+    pub fn max_blocking_threads(&self) -> Option<usize> {
+        self.max_blocking_threads
+    }
+
+    ///
+    /// Enter the runtime context associated with this Executor. This should be used in situations
+    /// where threads not started by the runtime need access to it via task-local variables.
+    ///
+    pub fn enter<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _context = self.handle.enter();
+        f()
+    }
+
+    ///
+    /// Run a Future on a tokio Runtime as a new Task, and return a Future handle to it.
+    ///
+    /// If the background Task exits abnormally, the given closure will be called to recover: usually
+    /// it should convert the resulting Error to a relevant error type.
+    ///
+    /// If the returned Future is dropped, the computation will still continue to completion: see
+    /// <https://docs.rs/tokio/0.2.20/tokio/task/struct.JoinHandle.html>
+    ///
+    pub fn spawn<O: Send + 'static, F: Future<Output = O> + Send + 'static>(
+        &self,
+        future: F,
+        rescue_join_error: impl FnOnce(JoinError) -> O,
+    ) -> impl Future<Output = O> {
+        self.native_spawn(future).map(|res| match res {
+            Ok(o) => o,
+            Err(e) => rescue_join_error(e),
+        })
+    }
+
+    ///
+    /// Run a Future on a tokio Runtime as a new Task, and return a JoinHandle.
+    ///
+    pub fn native_spawn<O: Send + 'static, F: Future<Output = O> + Send + 'static>(
+        &self,
+        future: F,
+    ) -> JoinHandle<O> {
+        self.handle.spawn(future_with_correct_context(future))
+    }
+
+    ///
+    /// Run a Future and return its resolved Result.
+    ///
+    /// This should never be called from in a Future context, and should only ever be called in
+    /// something that resembles a main method.
+    ///
+    /// Even after this method returns, work `spawn`ed into the background may continue to run on the
+    /// threads owned by this Executor.
+    ///
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        // Make sure to copy our (thread-local) logging destination into the task.
+        // When a daemon thread kicks off a future, it should log like a daemon thread (and similarly
+        // for a user-facing thread).
+        self.handle.block_on(future_with_correct_context(future))
+    }
+
+    ///
+    /// Spawn a Future on threads specifically reserved for I/O tasks which are allowed to be
+    /// long-running and return a JoinHandle
+    ///
+    pub fn spawn_blocking<F: FnOnce() -> R + Send + 'static, R: Send + 'static>(
+        &self,
+        f: F,
+    ) -> JoinHandle<R> {
+        let stdio_destination = stdio::get_destination();
+        let workunit_store_handle = workunit_store::get_workunit_store_handle();
+        // NB: We unwrap here because the only thing that should cause an error in a spawned task is a
+        // panic, in which case we want to propagate that.
+        self.handle.spawn_blocking(move || {
+            stdio::set_thread_destination(stdio_destination);
+            workunit_store::set_thread_workunit_store_handle(workunit_store_handle);
+            f()
+        })
+    }
+
+    ///
+    /// Run a blocking function that hosts a client request on a pool reserved for them.
+    ///
+    /// On free-threaded CPython a thread retains the allocator heap it warmed until it exits, so
+    /// requests keep that heap off the long-lived blocking-pool threads.
+    ///
+    pub fn spawn_request_blocking<F: FnOnce() -> R + Send + 'static, R: Send + 'static>(
+        &self,
+        f: F,
+    ) -> JoinHandle<R> {
+        let stdio_destination = stdio::get_destination();
+        let workunit_store_handle = workunit_store::get_workunit_store_handle();
+        let main_handle = self.handle.clone();
+        let f = move || {
+            // This pool's runtime is driverless: resolve ambient tokio APIs to the main runtime.
+            let _main_runtime = main_handle.enter();
+            stdio::set_thread_destination(stdio_destination);
+            workunit_store::set_thread_workunit_store_handle(workunit_store_handle);
+            f()
+        };
+        match &self.request_pool_handle {
+            Some(handle) => handle.spawn_blocking(f),
+            None => self.handle.spawn_blocking(f),
+        }
+    }
+
+    /// Return a reference to this executor's runtime handle.
+    pub fn handle(&self) -> &Handle {
+        &self.handle
+    }
+
+    ///
+    /// A blocking call to shut down the Runtime associated with this "owned" Executor. If tasks do
+    /// not shut down within the given timeout, they are leaked.
+    ///
+    /// This method has no effect for "borrowed" Executors: see the `Executor` rustdoc.
+    ///
+    pub fn shutdown(&self, timeout: Duration) {
+        let Some(runtime) = self.runtime.lock().take() else {
+            return;
+        };
+
+        let start = Instant::now();
+        // The request pool first: an in-flight run needs the main runtime to complete.
+        if let Some(request_pool) = self.request_pool.lock().take() {
+            request_pool.shutdown_timeout(timeout + Duration::from_millis(250));
+        }
+        runtime.shutdown_timeout(timeout + Duration::from_millis(250));
+        if start.elapsed() > timeout {
+            // Leaked tasks could lead to panics in some cases (see #16105), so warn for them.
+            log::warn!("Executor shutdown took unexpectedly long: tasks were likely leaked!");
+        }
+    }
+
+    /// Returns true if `shutdown` has been called for this Executor. Always returns true for
+    /// borrowed Executors.
+    pub fn is_shutdown(&self) -> bool {
+        self.runtime.lock().is_none()
+    }
+}
+
+/// Store "tail" tasks which are async tasks that can execute concurrently with regular
+/// build actions. Tail tasks block completion of a session until all of them have been
+/// completed (subject to a timeout).
+#[derive(Clone)]
+pub struct TailTasks {
+    inner: Arc<Mutex<Option<TailTasksInner>>>,
+}
+
+struct TailTasksInner {
+    id_to_name: HashMap<Id, String>,
+    task_set: JoinSet<()>,
+}
+
+impl TailTasks {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Some(TailTasksInner {
+                id_to_name: HashMap::new(),
+                task_set: JoinSet::new(),
+            }))),
+        }
+    }
+
+    /// Spawn a tail task with the given name.
+    pub fn spawn_on<F>(&self, name: &str, handle: &Handle, task: F)
+    where
+        F: Future<Output = ()>,
+        F: Send + 'static,
+    {
+        let task = future_with_correct_context(task);
+        let mut guard = self.inner.lock();
+        let inner = match &mut *guard {
+            Some(inner) => inner,
+            None => {
+                log::warn!("Session end task `{name}` submitted after session completed.");
+                return;
+            }
+        };
+
+        let h = inner.task_set.spawn_on(task, handle);
+        inner.id_to_name.insert(h.id(), name.to_string());
+    }
+
+    /// Wait for all tail tasks to complete subject to the given timeout. If tasks
+    /// fail or do not complete, log that fact.
+    pub async fn wait(self, timeout: Duration) {
+        let mut inner = match self.inner.lock().take() {
+            Some(inner) => inner,
+            None => {
+                log::debug!("Session end tasks awaited multiple times!");
+                return;
+            }
+        };
+
+        if inner.task_set.is_empty() {
+            return;
+        }
+
+        log::debug!(
+            "waiting for {} session end task(s) to complete",
+            inner.task_set.len()
+        );
+
+        let mut timeout = tokio::time::sleep(timeout).boxed();
+
+        loop {
+            tokio::select! {
+              // Use biased mode to prefer an expired timeout over joining on remaining tasks.
+              biased;
+
+              // Exit monitoring loop if timeout expires.
+              _ = &mut timeout => break,
+
+              next_result = inner.task_set.join_next_with_id() => {
+                match next_result {
+                  Some(Ok((id, _))) => {
+                    if let Some(name) = inner.id_to_name.get(&id) {
+                      log::trace!("Session end task `{name}` completed successfully");
+                    } else {
+                      log::debug!("Session end task completed successfully but name not found.");
+                    }
+                    inner.id_to_name.remove(&id);
+                  },
+                  Some(Err(err)) => {
+                    let name = inner.id_to_name.get(&err.id());
+                    log::error!("Session end task `{name:?}` failed: {err:?}");
+                  }
+                  None => break,
+                }
+              }
+            }
+        }
+
+        if inner.task_set.is_empty() {
+            log::debug!("all session end tasks completed successfully");
+        } else {
+            log::debug!(
+                "{} session end task(s) failed to complete within timeout: {}",
+                inner.task_set.len(),
+                inner.id_to_name.values().join(", "),
+            );
+            inner.task_set.abort_all();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Executor, MAX_BLOCKING_THREADS_LMDB_SAFE};
+
+    #[test]
+    fn new_owned_caps_blocking_threads_at_lmdb_safe_limit() {
+        // `rule_threads_max` can exceed this on large-core machines (#23652).
+        let executor =
+            Executor::new_owned(4, 4 + 10 * MAX_BLOCKING_THREADS_LMDB_SAFE, || {}, || {}).unwrap();
+        assert_eq!(
+            executor.max_blocking_threads(),
+            Some(MAX_BLOCKING_THREADS_LMDB_SAFE)
+        );
+    }
+
+    #[test]
+    fn new_owned_does_not_cap_small_requests() {
+        let requested_blocking_threads = MAX_BLOCKING_THREADS_LMDB_SAFE - 1;
+        let executor =
+            Executor::new_owned(2, 2 + requested_blocking_threads, || {}, || {}).unwrap();
+        assert_eq!(
+            executor.max_blocking_threads(),
+            Some(requested_blocking_threads)
+        );
+    }
+
+    #[test]
+    fn new_owned_errors_rather_than_underflows() {
+        // Regression: this subtraction used to underflow instead of returning an error.
+        assert!(Executor::new_owned(4, 4, || {}, || {}).is_err());
+        assert!(Executor::new_owned(4, 3, || {}, || {}).is_err());
+    }
+}

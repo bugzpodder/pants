@@ -1,10 +1,11 @@
 # Copyright 2015 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
+import threading
+
 import pytest
 
-from pants.engine.unions import UnionMembership
-from pants.option.config import Config
+from pants.engine.unions import UnionMembership, UnionRule
 from pants.option.errors import OptionsError
 from pants.option.option_types import BoolOption, StrListOption
 from pants.option.option_value_container import OptionValueContainer
@@ -67,13 +68,12 @@ def test_register_options_blessed(caplog) -> None:
         options_scope = "good-to-go"
 
     options = Options.create(
-        env={},
-        config=Config.load([]),
-        known_scope_infos=[GoodToGo.get_scope_info()],
         args=["./pants"],
-        bootstrap_option_values=None,
+        env={},
+        config_sources=[],
+        known_scope_infos=[GoodToGo.get_scope_info()],
     )
-    GoodToGo.register_options_on_scope(options, UnionMembership({}))
+    GoodToGo.register_options_on_scope(options, UnionMembership.empty())
 
     assert not caplog.records, "The current blessed means of registering options should never warn."
 
@@ -89,17 +89,54 @@ def test_register_plugin_options() -> None:
         contents = StrListOption(help="brrrrr")
 
     options = Options.create(
-        env={},
-        config=Config.load([]),
-        known_scope_infos=[Electrical.get_scope_info()],
         args=["./pants"],
-        bootstrap_option_values=None,
+        env={},
+        config_sources=[],
+        known_scope_infos=[Electrical.get_scope_info()],
     )
     Electrical.register_options_on_scope(
         options,
-        UnionMembership({Electrical.PluginOption: [LampPlugin, Blender]}),
+        UnionMembership.from_rules(
+            {
+                UnionRule(Electrical.PluginOption, LampPlugin),
+                UnionRule(Electrical.PluginOption, Blender),
+            }
+        ),
     )
 
     electrical_subsystem = Electrical(options.for_scope(Electrical.options_scope))
     assert not electrical_subsystem.options.is_on
     assert electrical_subsystem.options.contents == []
+
+
+def test_rules_memo_is_published_once_under_concurrency() -> None:
+    class Concurrent(Subsystem):
+        options_scope = "concurrent"
+        help = "Racing rules()."
+
+    entered = threading.Event()
+    resume = threading.Event()
+    original = Concurrent._construct_subsystem_rule
+    gated: list[threading.Thread] = []
+    gated_rules: list[object] = []
+
+    def gated_construct_subsystem_rule():
+        if threading.current_thread() is gated[0]:
+            entered.set()
+            assert resume.wait(timeout=60)
+        return original()
+
+    Concurrent._construct_subsystem_rule = gated_construct_subsystem_rule  # type: ignore[method-assign]
+    gated.append(threading.Thread(target=lambda: gated_rules.append(Concurrent.rules())))
+
+    try:
+        gated[0].start()
+        assert entered.wait(timeout=60)
+        # The gated thread is parked past its `_rules is None` check, so this call races it.
+        published = Concurrent.rules()
+    finally:
+        resume.set()
+        gated[0].join(timeout=60)
+
+    assert gated_rules[0] is published
+    assert Concurrent.rules() is published

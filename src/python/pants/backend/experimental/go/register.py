@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 from pants.backend.go import target_type_rules
+from pants.backend.go.dependency_inference import rules as dep_inference_rules
 from pants.backend.go.go_sources import load_go_binary
 from pants.backend.go.goals import check, generate, package_binary, run_binary, tailor, test
 from pants.backend.go.lint.gofmt import skip_field as gofmt_skip_field
@@ -11,6 +12,7 @@ from pants.backend.go.target_types import (
     GoModTarget,
     GoPackageSourcesField,
     GoPackageTarget,
+    GoThirdPartyModuleTarget,
     GoThirdPartyPackageTarget,
 )
 from pants.backend.go.util_rules import (
@@ -45,6 +47,7 @@ def target_types():
         GoPackageTarget,
         GoModTarget,
         GoThirdPartyPackageTarget,
+        GoThirdPartyModuleTarget,
         GoBinaryTarget,
         *wrap_golang.target_types,
     ]
@@ -61,6 +64,7 @@ def rules():
         *coverage.rules(),
         *coverage_output.rules(),
         *cgo.rules(),
+        *dep_inference_rules(),
         *third_party_pkg.rules(),
         *generate.rules(),
         *go_bootstrap.rules(),
